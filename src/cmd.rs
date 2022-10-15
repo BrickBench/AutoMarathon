@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, time::Duration};
 
 use crate::{user::Player, state::Project};
 
@@ -7,7 +7,8 @@ use crate::{user::Player, state::Project};
 pub enum Command<'a> {
     Toggle(&'a Player),
     Swap(&'a Player, &'a Player),
-    Set(Vec<&'a Player>),
+    SetPlayers(Vec<&'a Player>),
+    SetScore(&'a Player, Duration),
     Refresh(Vec<&'a Player>)
 }
 
@@ -15,7 +16,8 @@ pub enum Command<'a> {
 pub enum CommandError{
     InvalidPlayer(String),
     InvalidCommand(String),
-    UnknownCommand(String)
+    UnknownCommand(String),
+    InvalidTime(String)
 }
 
 impl Display for CommandError {
@@ -23,7 +25,8 @@ impl Display for CommandError {
        match self {
             CommandError::InvalidPlayer(player) => write!(f, "Unknown player {}", player),
             CommandError::UnknownCommand(cmd) => write!(f, "Unknown command {}", cmd),
-            CommandError::InvalidCommand(cmd) => write!(f, "Invalid command {}", cmd)
+            CommandError::InvalidCommand(cmd) => write!(f, "Invalid command {}", cmd),
+            CommandError::InvalidTime(cmd) => write!(f, "Invalid time {}", cmd)
         } 
     }
 }
@@ -32,11 +35,17 @@ fn find_or_err<'a>(user: &'_ str, project: &'a Project) -> Result<&'a Player, Co
     project.find_by_nick(user).ok_or(CommandError::InvalidPlayer(user.to_owned()))
 }
 
+pub fn parse_cmds<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Vec<Command<'a>>, CommandError> {
+    full_cmd.split("\n")
+        .filter(|c| !c.is_empty())
+        .map(|c| parse_cmd(c, project))
+        .collect::<Result<Vec<Command>, CommandError>>()
+}
+
 pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Command<'a>, CommandError> {
     let mut elements = full_cmd.split(" ");
     match elements.next() {
         Some(cmd) => {
-
             let args: _ = elements.collect::<Vec<&str>>();
             let args_iter = args.iter();
             match cmd.to_lowercase().replace("!", "").as_str() {
@@ -57,14 +66,21 @@ pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Command<
                     args_iter
                         .map(|e| find_or_err(e, project))
                         .into_iter()
-                        .collect::<Result<Vec<&'a Player>, CommandError>>()
-                        .map(|ps| Command::Set(ps))
+                        .collect::<Result<Vec<&Player>, CommandError>>()
+                        .map(|ps| Command::SetPlayers(ps))
+                }
+                "record" => {
+                    let player = find_or_err(args[0], project)?;
+                    let duration = Duration::from_millis(
+                        args[1].parse::<u64>().map_err(|e| CommandError::InvalidTime(args[1].to_owned()))?);
+
+                    Ok(Command::SetScore(player, duration))
                 }
                 "refresh" if args.len() != 0 => {
                     args_iter
                         .map(|e| find_or_err(e, project))
                         .into_iter()
-                        .collect::<Result<Vec<&'a Player>, CommandError>>()
+                        .collect::<Result<Vec<&Player>, CommandError>>()
                         .map(|ps| Command::Refresh(ps))
                 }
                 "refresh" if args.len() == 0  => {

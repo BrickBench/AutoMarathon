@@ -1,4 +1,6 @@
-#[derive(PartialEq, Eq, Hash, Debug)]
+use serde::{Serialize, Deserialize};
+
+#[derive(PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct Player {
     pub name: String,
     pub nicks: Vec<String>,
