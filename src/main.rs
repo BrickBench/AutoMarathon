@@ -1,11 +1,14 @@
-use std::{io, path::{Path, PathBuf}, fs::{File, read_to_string, self}, collections::HashMap};
+use std::{path::PathBuf, fs::{File, read_to_string, self}, collections::{HashMap, HashSet}, sync::Arc, future::Future, pin::Pin};
 
 use clap::{Parser, Subcommand};
-use cmd::parse_cmds;
+
+use futures::{FutureExt, future::BoxFuture};
+use serenity::{async_trait, prelude::{EventHandler, Context, GatewayIntents, TypeMapKey}, model::{prelude::Message, user::{User, CurrentUser}}, Client, framework::StandardFramework, http::Http};
 use state::{Project, ProjectType, ProjectState, ProjectStateSerializer};
+use tokio::{sync::mpsc::{self, UnboundedSender, UnboundedReceiver}, runtime::Handle};
 use user::Player;
 
-use crate::state::ProjectTypeState;
+use crate::{state::{ProjectTypeState, ProjectTypeStateSerializer}, cmd::parse_cmds};
 
 mod user;
 mod cmd;
@@ -43,11 +46,106 @@ enum RunType {
         #[arg(short, long)]
         save_file: PathBuf,
 
+        /// File containing the token to access the discord bot that will be used.
+        #[arg(short, long)]
+        token_file: PathBuf,
+
         project_file: PathBuf,
     }
 }
 
-fn main() -> Result<(), String> {
+struct Handler; 
+
+#[async_trait]
+impl EventHandler for Handler {
+    async fn message(&self, context: Context, msg: Message) {
+       let channel = match msg.channel_id.to_channel(&context).await {
+            Ok(channel) => channel.guild().unwrap(),
+            Err(why) => {
+                println!("Err w/ channel {}", why);
+                
+                return;
+            }
+        };
+
+
+        let mut data = context.data.write().await;
+        let user = data.get::<UserStore>().unwrap();
+
+        if channel.name().contains("nsfw") && msg.author.id != user.id {
+            let channel = data.get_mut::<MessageStore>().unwrap();
+
+            let context = context.clone();
+            let res = channel.send((
+                msg.content.to_owned(),
+                Box::new(move |e: String| async move {
+                    if e.is_empty() {
+                        if let Err(why) = msg.react(&context, '\u{1F44D}').await {
+                            println!("Failed to react: {}", why);
+                        }
+                    } else {
+                        println!("{}", e);
+                        if let Err(why) = msg.reply(&context, e).await {
+                            println!("Failed to reply: {}", why);
+                        }
+                    } 
+                }.boxed())
+            ));
+        }
+    }
+}
+
+type CommandMessage = (String, Box<dyn Send + Sync + FnOnce(String) -> BoxFuture<'static, ()>>);
+
+struct MessageStore;
+impl TypeMapKey for MessageStore {
+    type Value = UnboundedSender<CommandMessage>;
+} 
+
+struct UserStore;
+impl TypeMapKey for UserStore {
+    type Value = Arc<CurrentUser>;
+}
+
+async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, state_file: PathBuf, mut rx: UnboundedReceiver<CommandMessage>) {
+    let mut state = ProjectState::from_save_state(&state_src, &project).unwrap();
+
+    loop {
+        let (msg, resp) = rx.recv().await.unwrap();
+
+        if msg.starts_with("exit") {
+            break;
+        }
+
+        let cmd = parse_cmds(&msg, &project);
+
+        match &cmd {
+            Ok(cmd) => {
+                let state_res = state.apply_cmds(cmd);
+                match state_res {
+                    Ok(new_state) => {
+                        state = new_state;
+                        resp("".to_owned()).await;
+
+                        let state_save = serde_json::to_string_pretty(&state.to_save_state()).unwrap();
+                        fs::write(&state_file, state_save).expect("Failed to save file.");
+                    }
+                    Err(err) => {
+                        println!("State applying error: {}", err.to_string());
+                        resp(err.to_string()).await;
+                    }
+                }
+            },
+            Err(err) => {
+                println!("Command error: {}", err.to_string());
+                resp(err.to_string()).await;
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
 
     let args = Args::parse();
     
@@ -58,7 +156,7 @@ fn main() -> Result<(), String> {
                 players: players.iter().map(|p| Player {
                     name: p.to_owned(),
                     nicks: vec!(),
-                    twitch: "".to_owned(),
+                    twitch: "FILL_THIS".to_owned(),
                 }).collect()
             };
 
@@ -68,7 +166,15 @@ fn main() -> Result<(), String> {
     
             Ok(())
         },
-        RunType::Run { save_file, project_file} => {
+        RunType::Run { save_file, token_file, project_file} => {
+
+            // Load token
+            let token: String = match read_to_string(&token_file) {
+                Ok(token) => token.trim().into(),
+                Err(why) => return Err(format!("Failed to read token file: {}", why))
+            };
+
+            // Load project
             let project: Project = match read_to_string(&project_file) {
                 Ok(file) => {
                     serde_json::from_str::<Project>(&file).map_err(|e| format!("Failed to parse project file: {}", e))?
@@ -76,73 +182,79 @@ fn main() -> Result<(), String> {
                 Err(why) => return Err(format!("Failed to open project file {}: {}", &project_file.to_str().unwrap(), why)),
             };
 
+            println!("Loaded project");
 
-            let mut state: ProjectState = match read_to_string(save_file) {
+            // Load or create project state
+            let state: ProjectStateSerializer = match read_to_string(save_file) {
                 Ok(file) => {
+                    println!("Loading project state file...");
                     let save_res = serde_json::from_str::<ProjectStateSerializer>(&file).map_err(|e| format!("Failed to parse state file: {}", e));
                     match save_res {
-                        Ok(save) => ProjectState::from_save_state(&save, &project).map_err(|e| e.to_string())?,
-                        Err(_) => ProjectState {
-                            running: false,
+                        Ok(save) => {
+                            ProjectState::from_save_state(&save, &project).map_err(|e| e.to_string())?;
+                            save
+                        }
+                        Err(_) => ProjectStateSerializer {
                             active_players: vec!(),
-                            streams: HashMap::new(),
-                            type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() }, 
+                            type_state: ProjectTypeStateSerializer::MarathonState { runner_times: HashMap::new() }, 
                         }
                     }
                 },
                 Err(_) => {
                     println!("Project state file does not exist, creating...");
                     File::create(save_file).map_err(|err| format!("Failed to create state file {}: {}", save_file.to_str().unwrap(), err))?;
-                    ProjectState {
-                        running: false,
+                    ProjectStateSerializer {
                         active_players: vec!(),
-                        streams: HashMap::new(),
-                        type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() }, 
+                        type_state: ProjectTypeStateSerializer::MarathonState { runner_times: HashMap::new() }, 
                     }
                 }
             };
 
-            
-
-            loop {
-                let mut cmd_str = String::new();
-                io::stdin().read_line(&mut cmd_str).unwrap();
-
-                if cmd_str.starts_with("exit") {
-                    break;
+            // Initialize discord bot
+            let http = Http::new(&token);
+            let owners = match http.get_current_application_info().await {
+                Ok(info) => {
+                    let mut owners = HashSet::new();
+                    owners.insert(info.owner.id);
+                    owners
                 }
+                Err(why) => return Err(format!("Could not access app info: {:?}", why))
+            };
 
-                let cmd = parse_cmds(&cmd_str, &project);
+            let bot_user = match http.get_current_user().await {
+                Ok(usr) => usr,
+                Err(why) => return Err(format!("Could not access user info: {:?}", why))
+            };
 
-                match &cmd {
-                    Ok(cmd) => {
-                        let state_res = state.apply_cmds(cmd);
-                        match state_res {
-                            Ok(new_state) => {
-                                state = new_state;
-                            }
-                            Err(err) => println!("State applying error: {}", err.to_string()),
-                        }
-                    },
-                    Err(err) => {
-                        println!("Command error: {}", err.to_string());
-                    }
-                }
-            }
+            println!("Found user {}", bot_user.name);
 
+            let (tx, rx): (UnboundedSender<CommandMessage>, UnboundedReceiver<CommandMessage>) = mpsc::unbounded_channel();
+
+            let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
+
+            let framework = StandardFramework::new()
+                .configure(|c| c.owners(owners).prefix("!"));
+
+            let mut client = Client::builder(token.trim(), intents)
+                .framework(framework)
+                .type_map_insert::<MessageStore>(tx)
+                .type_map_insert::<UserStore>(Arc::new(bot_user))
+                .event_handler(Handler)
+                .await.expect("Err creating client");
+
+            let work_thread = Handle::current().spawn(run_update(project, state, save_file.to_owned(), rx));
+
+            let _client_future = client.start().await;
+            work_thread.await;
+           /* 
             println!("Saving project state file...");
 
 
-            let state_save = serde_json::to_string_pretty(&state.to_save_state()).unwrap();
-            fs::write(save_file, state_save).map_err(|e| format!("Failed to write save file: {}", e))?;
-
+*/
             Ok(())
-
         },
-    }
-
-   
-    }
+    }   
+}
 
 
 #[cfg(test)]

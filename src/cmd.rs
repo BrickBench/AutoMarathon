@@ -23,10 +23,10 @@ pub enum CommandError{
 impl Display for CommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
        match self {
-            CommandError::InvalidPlayer(player) => write!(f, "Unknown player {}", player),
-            CommandError::UnknownCommand(cmd) => write!(f, "Unknown command {}", cmd),
-            CommandError::InvalidCommand(cmd) => write!(f, "Invalid command {}", cmd),
-            CommandError::InvalidTime(cmd) => write!(f, "Invalid time {}", cmd)
+            CommandError::InvalidPlayer(player) => write!(f, "Unknown player \"{}\"", player),
+            CommandError::UnknownCommand(cmd) => write!(f, "Unknown command \"{}\"", cmd),
+            CommandError::InvalidCommand(cmd) => write!(f, "Invalid command \"{}\"", cmd),
+            CommandError::InvalidTime(cmd) => write!(f, "Invalid time \"{}\"", cmd)
         } 
     }
 }

@@ -45,8 +45,8 @@ pub struct ProjectState<'a> {
 /// Certain transient aspects of a project, such as the .m3u8 streams in use, are not serialized.
 #[derive(Serialize, Deserialize)]
 pub struct ProjectStateSerializer {
-    active_players: Vec<String>,
-    type_state: ProjectTypeStateSerializer
+    pub active_players: Vec<String>,
+    pub type_state: ProjectTypeStateSerializer
 }
 
 #[derive(Debug)]
