@@ -72,7 +72,7 @@ pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Command<
                 "record" => {
                     let player = find_or_err(args[0], project)?;
                     let duration = Duration::from_millis(
-                        args[1].parse::<u64>().map_err(|e| CommandError::InvalidTime(args[1].to_owned()))?);
+                        args[1].parse::<u64>().map_err(|_| CommandError::InvalidTime(args[1].to_owned()))?);
 
                     Ok(Command::SetScore(player, duration))
                 }

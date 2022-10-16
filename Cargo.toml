@@ -1,5 +1,5 @@
 [package]
-name = "AutoMarathon"
+name = "auto_marathon"
 version = "0.1.0"
 edition = "2021"
 

@@ -1,14 +1,14 @@
-use std::{path::PathBuf, fs::{File, read_to_string, self}, collections::{HashMap, HashSet}, sync::Arc, future::Future, pin::Pin};
+use std::{path::PathBuf, fs::{File, read_to_string, self}, collections::{HashMap, HashSet}, sync::Arc};
 
 use clap::{Parser, Subcommand};
 
 use futures::{FutureExt, future::BoxFuture};
-use serenity::{async_trait, prelude::{EventHandler, Context, GatewayIntents, TypeMapKey}, model::{prelude::Message, user::{User, CurrentUser}}, Client, framework::StandardFramework, http::Http};
+use serenity::{async_trait, prelude::{EventHandler, Context, GatewayIntents, TypeMapKey}, model::{prelude::Message, user::CurrentUser}, Client, framework::StandardFramework, http::Http};
 use state::{Project, ProjectType, ProjectState, ProjectStateSerializer};
 use tokio::{sync::mpsc::{self, UnboundedSender, UnboundedReceiver}, runtime::Handle};
 use user::Player;
 
-use crate::{state::{ProjectTypeState, ProjectTypeStateSerializer}, cmd::parse_cmds};
+use crate::{state::ProjectTypeStateSerializer, cmd::parse_cmds};
 
 mod user;
 mod cmd;
@@ -244,8 +244,8 @@ async fn main() -> Result<(), String> {
 
             let work_thread = Handle::current().spawn(run_update(project, state, save_file.to_owned(), rx));
 
-            let _client_future = client.start().await;
-            work_thread.await;
+            client.start().await.expect("Discord failed.");
+            work_thread.await.expect("Work thread failed.");
            /* 
             println!("Saving project state file...");
 
