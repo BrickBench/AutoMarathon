@@ -1,17 +1,19 @@
-use std::{path::PathBuf, fs::{File, read_to_string, self}, collections::{HashMap, HashSet}, sync::Arc};
+use std::{path::PathBuf, fs::{File, read_to_string, self}, collections::HashMap};
 
 use clap::{Parser, Subcommand};
 
-use futures::{FutureExt, future::BoxFuture};
-use serenity::{async_trait, prelude::{EventHandler, Context, GatewayIntents, TypeMapKey}, model::{prelude::Message, user::CurrentUser}, Client, framework::StandardFramework, http::Http};
+use discord::test_discord;
+use futures::future::BoxFuture;
 use state::{Project, ProjectType, ProjectState, ProjectStateSerializer};
 use tokio::{sync::mpsc::{self, UnboundedSender, UnboundedReceiver}, runtime::Handle};
 use user::Player;
 
-use crate::{state::ProjectTypeStateSerializer, cmd::parse_cmds};
+use crate::{state::ProjectTypeStateSerializer, cmd::parse_cmds, discord::{init_discord, DiscordConfig}};
 
 mod user;
 mod cmd;
+mod layouts;
+mod discord;
 mod state;
 
 #[derive(Parser, Debug)]
@@ -39,6 +41,24 @@ enum RunType {
         project_file: PathBuf,
     },
 
+    /// Create a discord configuration file.
+    /// This initializes and validates a configuration file.
+    /// DO NOT SHARE THIS FILE, it contains the private token for your Discord bot.
+    Discord {
+        /// A token to a bot that exists in the server used for Discord.
+        /// For full functionality, this bot should have the ADD_REACTIONS, SEND_MESSAGES, and
+        /// READ_MESSAGE_HISTORY permissions. 
+        #[arg(short, long)]
+        token: String,
+
+        /// The channel name that this bot will monitor for messages
+        #[arg(short, long)]
+        channel: String,
+
+        /// The output path of the discord file.
+        discord_file: PathBuf
+    },
+
     /// Run a project file.
     Run {
 
@@ -46,70 +66,22 @@ enum RunType {
         #[arg(short, long)]
         save_file: PathBuf,
 
-        /// File containing the token to access the discord bot that will be used.
+        /// Location of Discord configuration file. 
+        /// If provided, Discord integration will be enabled.
         #[arg(short, long)]
-        token_file: PathBuf,
+        discord_file: Option<PathBuf>,
 
         project_file: PathBuf,
     }
 }
 
-struct Handler; 
+type CommandMessage = (String, Box<dyn Send + Sync + FnOnce(Option<String>) -> BoxFuture<'static, ()>>);
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn message(&self, context: Context, msg: Message) {
-       let channel = match msg.channel_id.to_channel(&context).await {
-            Ok(channel) => channel.guild().unwrap(),
-            Err(why) => {
-                println!("Err w/ channel {}", why);
-                
-                return;
-            }
-        };
-
-
-        let mut data = context.data.write().await;
-        let user = data.get::<UserStore>().unwrap();
-
-        if channel.name().contains("nsfw") && msg.author.id != user.id {
-            let channel = data.get_mut::<MessageStore>().unwrap();
-
-            let context = context.clone();
-            let res = channel.send((
-                msg.content.to_owned(),
-                Box::new(move |e: String| async move {
-                    if e.is_empty() {
-                        if let Err(why) = msg.react(&context, '\u{1F44D}').await {
-                            println!("Failed to react: {}", why);
-                        }
-                    } else {
-                        println!("{}", e);
-                        if let Err(why) = msg.reply(&context, e).await {
-                            println!("Failed to reply: {}", why);
-                        }
-                    } 
-                }.boxed())
-            ));
-        }
-    }
-}
-
-type CommandMessage = (String, Box<dyn Send + Sync + FnOnce(String) -> BoxFuture<'static, ()>>);
-
-struct MessageStore;
-impl TypeMapKey for MessageStore {
-    type Value = UnboundedSender<CommandMessage>;
-} 
-
-struct UserStore;
-impl TypeMapKey for UserStore {
-    type Value = Arc<CurrentUser>;
-}
-
-async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, state_file: PathBuf, mut rx: UnboundedReceiver<CommandMessage>) {
+async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, state_file: PathBuf, mut rx: UnboundedReceiver<CommandMessage>, obs: obws::Client) {
     let mut state = ProjectState::from_save_state(&state_src, &project).unwrap();
-
+    
+    let scenes = obs.scenes().list().await.unwrap();
+    println!("{:#?}", scenes);
     loop {
         let (msg, resp) = rx.recv().await.unwrap();
 
@@ -125,20 +97,22 @@ async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, sta
                 match state_res {
                     Ok(new_state) => {
                         state = new_state;
-                        resp("".to_owned()).await;
+                        tokio::spawn(resp(None));
+                        
+                        //apply_layout(state, obs);
 
                         let state_save = serde_json::to_string_pretty(&state.to_save_state()).unwrap();
                         fs::write(&state_file, state_save).expect("Failed to save file.");
                     }
                     Err(err) => {
                         println!("State applying error: {}", err.to_string());
-                        resp(err.to_string()).await;
+                        resp(Some(err.to_string())).await;
                     }
                 }
             },
             Err(err) => {
                 println!("Command error: {}", err.to_string());
-                resp(err.to_string()).await;
+                resp(Some(err.to_string())).await;
             }
         }
     }
@@ -166,13 +140,20 @@ async fn main() -> Result<(), String> {
     
             Ok(())
         },
-        RunType::Run { save_file, token_file, project_file} => {
+        RunType::Discord { token, channel, discord_file } => {
+            test_discord(token).await?;
 
-            // Load token
-            let token: String = match read_to_string(&token_file) {
-                Ok(token) => token.trim().into(),
-                Err(why) => return Err(format!("Failed to read token file: {}", why))
-            };
+            println!("Token is valid, saving file...");
+            let discord_config = DiscordConfig { token: token.to_owned(), channel: channel.to_owned() };
+
+            let discord_txt = serde_json::to_string_pretty(&discord_config).unwrap();
+            fs::write(&discord_file, discord_txt).map_err(|e| format!("Failed to save Discord file: {}", e))?;
+            
+            println!("Discord file saved.");
+
+            Ok(())
+        }
+        RunType::Run { save_file, discord_file, project_file} => {
 
             // Load project
             let project: Project = match read_to_string(&project_file) {
@@ -210,47 +191,34 @@ async fn main() -> Result<(), String> {
                 }
             };
 
-            // Initialize discord bot
-            let http = Http::new(&token);
-            let owners = match http.get_current_application_info().await {
-                Ok(info) => {
-                    let mut owners = HashSet::new();
-                    owners.insert(info.owner.id);
-                    owners
-                }
-                Err(why) => return Err(format!("Could not access app info: {:?}", why))
-            };
-
-            let bot_user = match http.get_current_user().await {
-                Ok(usr) => usr,
-                Err(why) => return Err(format!("Could not access user info: {:?}", why))
-            };
-
-            println!("Found user {}", bot_user.name);
-
             let (tx, rx): (UnboundedSender<CommandMessage>, UnboundedReceiver<CommandMessage>) = mpsc::unbounded_channel();
+            
+            // Initialize OBS websocket
+            println!("Connecting to OBS");
+            let obs = obws::Client::connect("localhost", 4455, Some("simoncart65")).await
+                .map_err(|e| format!("Failed to connect to OBS: {}", e.to_string()))?;
+            
+            let obs_version = obs.general().version().await.map_err(|e| e.to_string())?;
+            println!("Connected to OBS version {}, websocket {}, running on {} ({})", 
+                obs_version.obs_version.to_string(),
+                obs_version.obs_web_socket_version.to_string(),
+                obs_version.platform, obs_version.platform_description);
 
-            let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
+            let work_thread = Handle::current().spawn(run_update(project, state, save_file.to_owned(), rx, obs));
 
-            let framework = StandardFramework::new()
-                .configure(|c| c.owners(owners).prefix("!"));
 
-            let mut client = Client::builder(token.trim(), intents)
-                .framework(framework)
-                .type_map_insert::<MessageStore>(tx)
-                .type_map_insert::<UserStore>(Arc::new(bot_user))
-                .event_handler(Handler)
-                .await.expect("Err creating client");
-
-            let work_thread = Handle::current().spawn(run_update(project, state, save_file.to_owned(), rx));
-
-            client.start().await.expect("Discord failed.");
+            match discord_file {
+                Some(discord_path) => match read_to_string(&discord_path) {
+                    Ok(file) => {
+                        let config = serde_json::from_str::<DiscordConfig>(&file).map_err(|e| format!("Failed to parse Discord file: {}", e))?;
+                        init_discord(config, tx).await?;
+                    },
+                    Err(why) => return Err(format!("Failed to open Discord file {}: {}", &project_file.to_str().unwrap(), why)),
+                },
+                None => println!("Discord file was not provided, Discord integration is disabled.")
+            };
+           
             work_thread.await.expect("Work thread failed.");
-           /* 
-            println!("Saving project state file...");
-
-
-*/
             Ok(())
         },
     }   
