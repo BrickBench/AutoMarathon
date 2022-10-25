@@ -45,13 +45,13 @@ enum RunType {
     /// This initializes and validates a configuration file.
     /// DO NOT SHARE THIS FILE, it contains the private token for your Discord bot.
     Discord {
-        /// A token to a bot that exists in the server used for Discord.
+        /// A token to a bot that is present in the server to be used for commands.
         /// For full functionality, this bot should have the ADD_REACTIONS, SEND_MESSAGES, and
         /// READ_MESSAGE_HISTORY permissions. 
         #[arg(short, long)]
         token: String,
 
-        /// The channel name that this bot will monitor for messages
+        /// The channel name that this bot will monitor for command messages.
         #[arg(short, long)]
         channel: String,
 
@@ -59,7 +59,7 @@ enum RunType {
         discord_file: PathBuf
     },
 
-    /// Run a project file.
+    /// Run a project sourced from a project file.
     Run {
 
         /// Location for project state save file.
@@ -68,13 +68,29 @@ enum RunType {
 
         /// Location of Discord configuration file. 
         /// If provided, Discord integration will be enabled.
+        /// This configuration file can be created with the `AutoMarathon discord` command.
         #[arg(short, long)]
         discord_file: Option<PathBuf>,
+        
+        /// IP address for OBS websocket.
+        /// If none is provided, it defaults to `localhost`
+        #[arg(short = 'i', long)]
+        obs_ip: Option<String>,
+
+        /// Port for OBS websocket.
+        /// If none is provided, it defaults to `4455`
+        #[arg(short = 'p', long)]
+        obs_port: Option<u16>,
+
+        /// Password for OBS websocket.
+        #[arg(short = 'k', long)]
+        obs_password: Option<String>,
 
         project_file: PathBuf,
     }
 }
 
+/// A type for inter-thread communication with a string command and a callback for returning errors.
 type CommandMessage = (String, Box<dyn Send + Sync + FnOnce(Option<String>) -> BoxFuture<'static, ()>>);
 
 async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, state_file: PathBuf, mut rx: UnboundedReceiver<CommandMessage>, obs: obws::Client) {
@@ -137,7 +153,8 @@ async fn main() -> Result<(), String> {
             let new_json = serde_json::to_string_pretty(&new_project).unwrap();
             
             fs::write(project_file, new_json).map_err(|e| format!("Failed to write project file: {}", e))?;
-    
+            
+            println!("Project created, please open the file in a text editor and fill in the missing fields.");
             Ok(())
         },
         RunType::Discord { token, channel, discord_file } => {
@@ -153,7 +170,7 @@ async fn main() -> Result<(), String> {
 
             Ok(())
         }
-        RunType::Run { save_file, discord_file, project_file} => {
+        RunType::Run { save_file, discord_file, obs_ip, obs_port, obs_password, project_file} => {
 
             // Load project
             let project: Project = match read_to_string(&project_file) {
@@ -169,7 +186,7 @@ async fn main() -> Result<(), String> {
             let state: ProjectStateSerializer = match read_to_string(save_file) {
                 Ok(file) => {
                     println!("Loading project state file...");
-                    let save_res = serde_json::from_str::<ProjectStateSerializer>(&file).map_err(|e| format!("Failed to parse state file: {}", e));
+                    let save_res = serde_json::from_str::<ProjectStateSerializer>(&file).map_err(|e| format!("Failed to parse project state file: {}", e));
                     match save_res {
                         Ok(save) => {
                             ProjectState::from_save_state(&save, &project).map_err(|e| e.to_string())?;
@@ -195,7 +212,10 @@ async fn main() -> Result<(), String> {
             
             // Initialize OBS websocket
             println!("Connecting to OBS");
-            let obs = obws::Client::connect("localhost", 4455, Some("simoncart65")).await
+            let obs = obws::Client::connect(
+                obs_ip.to_owned().unwrap_or("localhost".to_owned()), 
+                obs_port.unwrap_or(4455), 
+                obs_password.to_owned()).await
                 .map_err(|e| format!("Failed to connect to OBS: {}", e.to_string()))?;
             
             let obs_version = obs.general().version().await.map_err(|e| e.to_string())?;

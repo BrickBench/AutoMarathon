@@ -42,7 +42,7 @@ pub struct ProjectState<'a> {
 }
 
 /// Serializizer utility type for ProjectState
-/// Certain transient aspects of a project, such as the .m3u8 streams in use, are not serialized.
+/// Certain transient elements of a project, such as the .m3u8 streams in use, are not serialized.
 #[derive(Serialize, Deserialize)]
 pub struct ProjectStateSerializer {
     pub active_players: Vec<String>,
@@ -76,7 +76,7 @@ pub fn find_stream(player: &Player) -> Result<String, ProjectError> {
     let output = process::Command::new("streamlink")
         .arg("-Q")
         .arg("-j")
-        .arg("https://twitch.tv/summit1g")
+        .arg(&player.twitch)
         .output().map_err(|_| ProjectError::StreamAcqError(player.name.clone(), "Failed to aquire stream.".to_owned()))?;
 
     let json = std::str::from_utf8(output.stdout.as_slice())
