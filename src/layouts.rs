@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Serialize, Deserialize};
 
 use crate::state::ProjectState;
@@ -7,16 +9,16 @@ pub struct ObsConfiguration {
     ip: String,
     port: u16,
     password: Option<String>,
-    layouts: Vec<Layout>,
+    layouts: HashMap<String, Layout>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub struct Layout {
-    name: String,
+    pub name: String,
     displays: Vec<UserDisplay>
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub struct UserDisplay {
     stream: PosSize,
     name: PosSize,
@@ -25,7 +27,7 @@ pub struct UserDisplay {
     description: Option<PosSize>,
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct PosSize {
     x: u32,
     y: u32,

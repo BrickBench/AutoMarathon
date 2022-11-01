@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
 
-use crate::{user::Player, cmd::Command};
+use crate::{user::Player, cmd::Command, layouts::Layout};
 
 /// A type used to determine the project type
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
@@ -38,7 +38,8 @@ pub struct ProjectState<'a> {
     pub running: bool,
     pub active_players: Vec<&'a Player>,
     pub streams: HashMap<&'a Player, String>,
-    pub type_state: ProjectTypeState<'a>
+    pub type_state: ProjectTypeState<'a>,
+    pub layout: String
 }
 
 /// Serializizer utility type for ProjectState
@@ -46,7 +47,8 @@ pub struct ProjectState<'a> {
 #[derive(Serialize, Deserialize)]
 pub struct ProjectStateSerializer {
     pub active_players: Vec<String>,
-    pub type_state: ProjectTypeStateSerializer
+    pub type_state: ProjectTypeStateSerializer,
+    pub layout: String
 }
 
 #[derive(Debug)]
@@ -171,7 +173,7 @@ impl<'a> ProjectState<'a> {
         ProjectStateSerializer {
             active_players: self.active_players.iter().map(|a| a.name.to_owned()).collect(),
             type_state: self.type_state.to_save_state(),
-
+            layout: self.layout
         }
     }
 
@@ -185,7 +187,8 @@ impl<'a> ProjectState<'a> {
                         .ok_or(ProjectError::ProjectLoadError(format!("Failed to find player {} when loading file", p))))
                 .collect::<Result<Vec<&Player>, ProjectError>>()?, 
             streams: HashMap::new(),
-            type_state: ProjectTypeState::from_save_state(&save.type_state, project)?
+            type_state: ProjectTypeState::from_save_state(&save.type_state, project)?,
+            layout: save.layout
         })
     }
 }

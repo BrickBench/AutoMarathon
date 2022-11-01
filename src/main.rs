@@ -3,7 +3,7 @@ use std::{path::PathBuf, fs::{File, read_to_string, self}, collections::HashMap}
 use clap::{Parser, Subcommand};
 
 use discord::test_discord;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 use state::{Project, ProjectType, ProjectState, ProjectStateSerializer};
 use tokio::{sync::mpsc::{self, UnboundedSender, UnboundedReceiver}, runtime::Handle};
 use user::Player;
@@ -115,19 +115,17 @@ async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, sta
                         state = new_state;
                         tokio::spawn(resp(None));
                         
-                        //apply_layout(state, obs);
+                        sapply_layout(state, obs);
 
                         let state_save = serde_json::to_string_pretty(&state.to_save_state()).unwrap();
                         fs::write(&state_file, state_save).expect("Failed to save file.");
                     }
                     Err(err) => {
-                        println!("State applying error: {}", err.to_string());
                         resp(Some(err.to_string())).await;
                     }
                 }
             },
             Err(err) => {
-                println!("Command error: {}", err.to_string());
                 resp(Some(err.to_string())).await;
             }
         }
@@ -224,20 +222,43 @@ async fn main() -> Result<(), String> {
                 obs_version.obs_web_socket_version.to_string(),
                 obs_version.platform, obs_version.platform_description);
 
-            let work_thread = Handle::current().spawn(run_update(project, state, save_file.to_owned(), rx, obs));
+            let work_thread = tokio::spawn(run_update(project, state, save_file.to_owned(), rx, obs));
 
-
-            match discord_file {
+            let discord_thread = match discord_file {
                 Some(discord_path) => match read_to_string(&discord_path) {
                     Ok(file) => {
                         let config = serde_json::from_str::<DiscordConfig>(&file).map_err(|e| format!("Failed to parse Discord file: {}", e))?;
-                        init_discord(config, tx).await?;
+                        Some(tokio::spawn(init_discord(config, tx.clone())))
                     },
                     Err(why) => return Err(format!("Failed to open Discord file {}: {}", &project_file.to_str().unwrap(), why)),
                 },
-                None => println!("Discord file was not provided, Discord integration is disabled.")
+                None => {
+                    println!("Discord file was not provided, Discord integration is disabled.");
+                    None
+                }
             };
-           
+         
+            loop {
+                let mut cmd: String = String::new();
+                std::io::stdin().read_line(&mut cmd).map_err(|_| "Failed to read command.")?;
+
+                if cmd.to_lowercase() == "exit" {
+                    break;
+                } else {
+                    tx.send((
+                        cmd,
+                        Box::new(move |e: Option<String>| async move {
+                            if let Some(err) = e {
+                               println!("Failed to run command: {}", err); 
+                            } 
+                        }.boxed())
+                    )).map_err(|e| e.to_string())?;
+                }
+            }
+
+            if let Some(thread) = discord_thread {
+                thread.await.expect("Discord thread failed.")?;
+            }
             work_thread.await.expect("Work thread failed.");
             Ok(())
         },
