@@ -2,14 +2,12 @@ use std::collections::HashMap;
 
 use serde::{Serialize, Deserialize};
 
-use crate::state::ProjectState;
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ObsConfiguration {
-    ip: String,
-    port: u16,
-    password: Option<String>,
-    layouts: HashMap<String, Layout>,
+    pub ip: Option<String>,
+    pub port: Option<u16>,
+    pub password: Option<String>,
+    pub layouts: HashMap<String, Layout>,
 }
 
 #[derive(PartialEq, Debug, Serialize, Deserialize)]
@@ -33,11 +31,5 @@ pub struct PosSize {
     y: u32,
     width: u32,
     height: u32
-}
-
-impl Layout {
-    pub async fn apply_layout(&self, _state: &ProjectState<'_>, _obs: &obws::Client) -> Result<(), String> {
-        Ok(())
-    }
 }
 

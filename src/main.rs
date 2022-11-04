@@ -5,14 +5,15 @@ use clap::{Parser, Subcommand};
 use discord::test_discord;
 use futures::{future::BoxFuture, FutureExt};
 use state::{Project, ProjectType, ProjectState, ProjectStateSerializer};
-use tokio::{sync::mpsc::{self, UnboundedSender, UnboundedReceiver}, runtime::Handle};
+use tokio::sync::mpsc::{self, UnboundedSender, UnboundedReceiver};
 use user::Player;
 
-use crate::{state::ProjectTypeStateSerializer, cmd::parse_cmds, discord::{init_discord, DiscordConfig}};
+use crate::{state::ProjectTypeStateSerializer, cmd::parse_cmds, discord::{init_discord, DiscordConfig}, obs::ObsConfiguration};
 
 mod user;
 mod cmd;
-mod layouts;
+mod obs;
+mod error;
 mod discord;
 mod state;
 
@@ -66,25 +67,16 @@ enum RunType {
         #[arg(short, long)]
         save_file: PathBuf,
 
+        /// Location for OBS configuration and layout file.
+        /// A sample is provided in the `obs/layouts` directory.
+        #[arg(short, long)]
+        obs_file: PathBuf,
+        
         /// Location of Discord configuration file. 
         /// If provided, Discord integration will be enabled.
         /// This configuration file can be created with the `AutoMarathon discord` command.
         #[arg(short, long)]
         discord_file: Option<PathBuf>,
-        
-        /// IP address for OBS websocket.
-        /// If none is provided, it defaults to `localhost`
-        #[arg(short = 'i', long)]
-        obs_ip: Option<String>,
-
-        /// Port for OBS websocket.
-        /// If none is provided, it defaults to `4455`
-        #[arg(short = 'p', long)]
-        obs_port: Option<u16>,
-
-        /// Password for OBS websocket.
-        #[arg(short = 'k', long)]
-        obs_password: Option<String>,
 
         project_file: PathBuf,
     }
@@ -93,8 +85,8 @@ enum RunType {
 /// A type for inter-thread communication with a string command and a callback for returning errors.
 type CommandMessage = (String, Box<dyn Send + Sync + FnOnce(Option<String>) -> BoxFuture<'static, ()>>);
 
-async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, state_file: PathBuf, mut rx: UnboundedReceiver<CommandMessage>, obs: obws::Client) {
-    let mut state = ProjectState::from_save_state(&state_src, &project).unwrap();
+async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, obs_cfg: ObsConfiguration, state_file: PathBuf, mut rx: UnboundedReceiver<CommandMessage>, obs: obws::Client) {
+    let mut state = ProjectState::from_save_state(&state_src, &project, &obs_cfg).unwrap();
     
     let scenes = obs.scenes().list().await.unwrap();
     println!("{:#?}", scenes);
@@ -115,7 +107,7 @@ async fn run_update<'a>(project: Project, state_src: ProjectStateSerializer, sta
                         state = new_state;
                         tokio::spawn(resp(None));
                         
-                        sapply_layout(state, obs);
+                        state.apply_layout(&obs);
 
                         let state_save = serde_json::to_string_pretty(&state.to_save_state()).unwrap();
                         fs::write(&state_file, state_save).expect("Failed to save file.");
@@ -168,7 +160,15 @@ async fn main() -> Result<(), String> {
 
             Ok(())
         }
-        RunType::Run { save_file, discord_file, obs_ip, obs_port, obs_password, project_file} => {
+        RunType::Run { save_file, obs_file, discord_file, project_file} => {
+
+            // Load  layouts
+            let obs_cfg: ObsConfiguration = match read_to_string(&obs_file) {
+                Ok(file) => {
+                    serde_json::from_str::<ObsConfiguration>(&file).map_err(|e| format!("Failed to parse OBS configuration file: {}", e))?
+                },
+                Err(why) => return Err(format!("Failed to open OBS configuration file {}: {}", &project_file.to_str().unwrap(), why)),
+            };
 
             // Load project
             let project: Project = match read_to_string(&project_file) {
@@ -187,12 +187,13 @@ async fn main() -> Result<(), String> {
                     let save_res = serde_json::from_str::<ProjectStateSerializer>(&file).map_err(|e| format!("Failed to parse project state file: {}", e));
                     match save_res {
                         Ok(save) => {
-                            ProjectState::from_save_state(&save, &project).map_err(|e| e.to_string())?;
+                            ProjectState::from_save_state(&save, &project, &obs_cfg).map_err(|e| e.to_string())?;
                             save
                         }
                         Err(_) => ProjectStateSerializer {
                             active_players: vec!(),
                             type_state: ProjectTypeStateSerializer::MarathonState { runner_times: HashMap::new() }, 
+                            layout: HashMap::new() 
                         }
                     }
                 },
@@ -202,6 +203,7 @@ async fn main() -> Result<(), String> {
                     ProjectStateSerializer {
                         active_players: vec!(),
                         type_state: ProjectTypeStateSerializer::MarathonState { runner_times: HashMap::new() }, 
+                        layout: HashMap::new() 
                     }
                 }
             };
@@ -211,9 +213,9 @@ async fn main() -> Result<(), String> {
             // Initialize OBS websocket
             println!("Connecting to OBS");
             let obs = obws::Client::connect(
-                obs_ip.to_owned().unwrap_or("localhost".to_owned()), 
-                obs_port.unwrap_or(4455), 
-                obs_password.to_owned()).await
+                obs_cfg.ip.to_owned().unwrap_or("localhost".to_owned()), 
+                obs_cfg.port.to_owned().unwrap_or(4455), 
+                obs_cfg.password.to_owned()).await
                 .map_err(|e| format!("Failed to connect to OBS: {}", e.to_string()))?;
             
             let obs_version = obs.general().version().await.map_err(|e| e.to_string())?;
@@ -222,7 +224,7 @@ async fn main() -> Result<(), String> {
                 obs_version.obs_web_socket_version.to_string(),
                 obs_version.platform, obs_version.platform_description);
 
-            let work_thread = tokio::spawn(run_update(project, state, save_file.to_owned(), rx, obs));
+            let work_thread = tokio::spawn(run_update(project, state, obs_cfg, save_file.to_owned(), rx, obs));
 
             let discord_thread = match discord_file {
                 Some(discord_path) => match read_to_string(&discord_path) {
@@ -270,7 +272,7 @@ async fn main() -> Result<(), String> {
 mod tests {
     use std::{collections::HashMap, time::Duration};
 
-    use crate::{state::{ProjectState, Project, ProjectType, ProjectTypeState, ProjectStateSerializer}, user::Player, cmd::{parse_cmd, Command}};
+    use crate::{state::{ProjectState, Project, ProjectType, ProjectTypeState, ProjectStateSerializer}, user::Player, cmd::{parse_cmd, Command}, obs::ObsConfiguration};
 
     #[test]
     fn test_nicks() {
@@ -328,7 +330,8 @@ mod tests {
             running: false,
             active_players: vec!(),
             streams: HashMap::new(),
-            type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() }, 
+            type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() },
+            layout: HashMap::new() 
         };
 
         state = state.apply_cmd(&parse_cmd("!toggle joe", &project).unwrap()).unwrap();
@@ -356,6 +359,13 @@ mod tests {
 
     #[test]
     fn test_serialization() {
+        let obs = ObsConfiguration {
+            ip: None,
+            port: None, 
+            password: None, 
+            layouts: HashMap::new()
+        };
+
         let project = Project {
             kind: ProjectType::Marathon,
             players: vec!(
@@ -374,13 +384,14 @@ mod tests {
             active_players: vec!(),
             streams: HashMap::new(),
             type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() }, 
+            layout: HashMap::new() 
         };
 
         state = state.apply_cmd(&parse_cmd("!toggle joe", &project).unwrap()).unwrap();
 
         let saved_state = serde_json::to_string(&state.to_save_state()).unwrap();
         let regen_state_serial: ProjectStateSerializer = serde_json::from_str(&saved_state).unwrap();
-        let regen_state = ProjectState::from_save_state(&regen_state_serial, &project).unwrap();
+        let regen_state = ProjectState::from_save_state(&regen_state_serial, &project, &obs).unwrap();
 
         assert_eq!(state, regen_state);
     }

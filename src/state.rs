@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
 
-use crate::{user::Player, cmd::Command, layouts::Layout};
+use crate::{user::Player, cmd::Command, obs::{Layout, ObsConfiguration}, error::ProjectError};
 
 /// A type used to determine the project type
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
@@ -39,7 +39,7 @@ pub struct ProjectState<'a> {
     pub active_players: Vec<&'a Player>,
     pub streams: HashMap<&'a Player, String>,
     pub type_state: ProjectTypeState<'a>,
-    pub layout: String
+    pub layout: HashMap<u32, &'a Layout>
 }
 
 /// Serializizer utility type for ProjectState
@@ -48,25 +48,9 @@ pub struct ProjectState<'a> {
 pub struct ProjectStateSerializer {
     pub active_players: Vec<String>,
     pub type_state: ProjectTypeStateSerializer,
-    pub layout: String
+    pub layout: HashMap<u32, String>
 }
 
-#[derive(Debug)]
-pub enum ProjectError {
-    ProjectLoadError(String),
-    StreamAcqError(String, String),
-    ProjectStateError(String)
-}
-
-impl Display for ProjectError{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProjectError::StreamAcqError(name, msg) => write!(f, "Failed to acquire stream for {}: {}", name, msg),
-            ProjectError::ProjectStateError(msg) => write!(f, "Invalid state: {}", msg),    
-            ProjectError::ProjectLoadError(msg) => write!(f, "Failed to load project: {}", msg)
-        }
-    }
-}
 
 impl Project {
     pub fn find_by_nick(&self, name: &str) -> Option<&Player> {
@@ -166,18 +150,28 @@ impl<'a> ProjectState<'a> {
                 Ok(new_state)
             }
             Command::Refresh(_) => Err(ProjectError::ProjectStateError("Cannot refresh streams while project is inactive.".to_owned())),
+            Command::Layout(count, layout) => {
+                new_state.layout.
+            }
         }
+    }
+
+    pub fn apply_layout(&self, obs: &obws::Client) -> Result<(), String> {
+        
+        Ok(())
     }
 
     pub fn to_save_state(&self) -> ProjectStateSerializer {
         ProjectStateSerializer {
             active_players: self.active_players.iter().map(|a| a.name.to_owned()).collect(),
             type_state: self.type_state.to_save_state(),
-            layout: self.layout
+            layout: self.layout.iter()
+                .map(|(k, v)| (k.to_owned(), v.name.to_owned()))
+                .collect()
         }
     }
 
-    pub fn from_save_state(save: &ProjectStateSerializer, project: &'a Project) -> Result<ProjectState<'a>, ProjectError> {
+    pub fn from_save_state(save: &ProjectStateSerializer, project: &'a Project, obs_cfg: &'a ObsConfiguration) -> Result<ProjectState<'a>, ProjectError> {
         Ok(ProjectState { 
             running: false, 
             active_players: save.active_players
@@ -188,7 +182,11 @@ impl<'a> ProjectState<'a> {
                 .collect::<Result<Vec<&Player>, ProjectError>>()?, 
             streams: HashMap::new(),
             type_state: ProjectTypeState::from_save_state(&save.type_state, project)?,
-            layout: save.layout
+            layout: save.layout.iter()
+                .map(|(k, v)| obs_cfg.layouts.get(v)
+                    .ok_or(ProjectError::ProjectLoadError(format!("Failed to find layout {}", k)))
+                    .map(|l| (k.to_owned(), l)))
+                .collect::<Result<HashMap<u32, &Layout>, ProjectError>>()?
         })
     }
 }
@@ -211,10 +209,10 @@ impl<'a> ProjectTypeState<'a> {
             ProjectTypeStateSerializer::MarathonState { runner_times } => 
                 runner_times
                     .iter()
-                    .map(|record| 
-                        project.find_by_nick(record.0)
-                            .ok_or(ProjectError::ProjectLoadError(format!("Failed to find player {} when loading file", record.0)))
-                            .map(|usr| (usr, record.1.to_owned())))
+                    .map(|(name, time)| 
+                        project.find_by_nick(name)
+                            .ok_or(ProjectError::ProjectLoadError(format!("Failed to find player {} when loading file", name)))
+                            .map(|usr| (usr, time.to_owned())))
                     .collect::<Result<Vec<(&Player, Duration)>, ProjectError>>()
                     .map(|records| ProjectTypeState::MarathonState { runner_times: records.into_iter().collect() })
         }

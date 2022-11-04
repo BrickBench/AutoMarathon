@@ -1,6 +1,6 @@
 use std::{fmt::Display, time::Duration};
 
-use crate::{user::Player, state::Project};
+use crate::{user::Player, state::{Project, ProjectState}, obs::{Layout, ObsConfiguration}, error::ProjectError};
 
 
 #[derive(PartialEq, Debug)]
@@ -9,40 +9,22 @@ pub enum Command<'a> {
     Swap(&'a Player, &'a Player),
     SetPlayers(Vec<&'a Player>),
     SetScore(&'a Player, Duration),
-    Refresh(Vec<&'a Player>)
+    Refresh(Vec<&'a Player>),
+    Layout(usize, &'a Layout)
 }
 
-#[derive(Debug)]
-pub enum CommandError{
-    InvalidPlayer(String),
-    InvalidCommand(String),
-    UnknownCommand(String),
-    InvalidTime(String)
+fn find_or_err<'a>(user: &'_ str, project: &'a Project) -> Result<&'a Player, ProjectError> {
+    project.find_by_nick(user).ok_or(ProjectError::PlayerError(user.to_owned()))
 }
 
-impl Display for CommandError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-       match self {
-            CommandError::InvalidPlayer(player) => write!(f, "Unknown player \"{}\"", player),
-            CommandError::UnknownCommand(cmd) => write!(f, "Unknown command \"{}\"", cmd),
-            CommandError::InvalidCommand(cmd) => write!(f, "Invalid command \"{}\"", cmd),
-            CommandError::InvalidTime(cmd) => write!(f, "Invalid time \"{}\"", cmd)
-        } 
-    }
-}
-
-fn find_or_err<'a>(user: &'_ str, project: &'a Project) -> Result<&'a Player, CommandError> {
-    project.find_by_nick(user).ok_or(CommandError::InvalidPlayer(user.to_owned()))
-}
-
-pub fn parse_cmds<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Vec<Command<'a>>, CommandError> {
+pub fn parse_cmds<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Vec<Command<'a>>, ProjectError> {
     full_cmd.split("\n")
         .filter(|c| !c.is_empty())
         .map(|c| parse_cmd(c, project))
-        .collect::<Result<Vec<Command>, CommandError>>()
+        .collect::<Result<Vec<Command>, ProjectError>>()
 }
 
-pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Command<'a>, CommandError> {
+pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project, obs: &'a ObsConfiguration, state: &'a ProjectState) -> Result<Command<'a>, ProjectError> {
     let mut elements = full_cmd.split(" ");
     match elements.next() {
         Some(cmd) => {
@@ -57,7 +39,7 @@ pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Command<
                     let p2 = find_or_err(args[1], project)?;
                     
                     if p1 == p2 {
-                        Err(CommandError::InvalidCommand(full_cmd.to_owned()))
+                        Err(ProjectError::CommandError("Cannot swap same player to itself.".to_string()))
                     } else {
                         Ok(Command::Swap(p1, p2))
                     }
@@ -66,13 +48,13 @@ pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Command<
                     args_iter
                         .map(|e| find_or_err(e, project))
                         .into_iter()
-                        .collect::<Result<Vec<&Player>, CommandError>>()
+                        .collect::<Result<Vec<&Player>, ProjectError>>()
                         .map(|ps| Command::SetPlayers(ps))
                 }
                 "record" => {
                     let player = find_or_err(args[0], project)?;
                     let duration = Duration::from_millis(
-                        args[1].parse::<u64>().map_err(|_| CommandError::InvalidTime(args[1].to_owned()))?);
+                        args[1].parse::<u64>().map_err(|_| ProjectError::InvalidTime(args[1].to_owned()))?);
 
                     Ok(Command::SetScore(player, duration))
                 }
@@ -80,16 +62,29 @@ pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project) -> Result<Command<
                     args_iter
                         .map(|e| find_or_err(e, project))
                         .into_iter()
-                        .collect::<Result<Vec<&Player>, CommandError>>()
+                        .collect::<Result<Vec<&Player>, ProjectError>>()
                         .map(|ps| Command::Refresh(ps))
                 }
                 "refresh" if args.len() == 0  => {
                     Ok(Command::Refresh(project.players.iter().collect()))
                 }
-                _ => Err(CommandError::UnknownCommand(cmd.to_owned()))
+                "layout" if args.len() == 1 => {
+                    obs.layouts.get(args[0])
+                        .map(|l| Command::Layout(state.active_players.len(), l))
+                        .ok_or(ProjectError::UnknownLayout(args[0].to_owned()))
+                }
+                "layout" if args.len() == 2 => {
+                    let idx= args[0].parse::<usize>()
+                        .map_err(|e| ProjectError::CommandError(full_cmd.to_string()))?;
+
+                    obs.layouts.get(args[0])
+                        .map(|l| Command::Layout(idx, l))
+                        .ok_or(ProjectError::UnknownLayout(args[0].to_owned()))
+                }
+                _ => Err(ProjectError::CommandError(cmd.to_owned()))
             }
         } 
-        None => Err(CommandError::InvalidCommand(full_cmd.to_owned())),
+        None => Err(ProjectError::CommandError(full_cmd.to_owned())),
     }
 }
 
