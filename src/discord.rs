@@ -5,7 +5,7 @@ use serde::{Serialize, Deserialize};
 use serenity::{async_trait, prelude::{EventHandler, Context, TypeMapKey, GatewayIntents}, model::{voice::VoiceState, prelude::Message, user::CurrentUser}, http::Http, framework::StandardFramework};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::CommandMessage;
+use crate::{CommandMessage, error::Error};
 
 #[derive(Serialize, Deserialize)]
 pub struct DiscordConfig {
@@ -81,7 +81,7 @@ pub async fn test_discord(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn init_discord(config: DiscordConfig, tx: UnboundedSender<CommandMessage>) -> Result<(), String> {
+pub async fn init_discord(config: DiscordConfig, tx: UnboundedSender<CommandMessage>) -> Result<(), Error> {
     println!("Initializing Discord bot");
     let http = Http::new(&config.token);
     let owners = match http.get_current_application_info().await {
@@ -90,7 +90,7 @@ pub async fn init_discord(config: DiscordConfig, tx: UnboundedSender<CommandMess
             owners.insert(info.owner.id);
             owners
         }
-        Err(why) => return Err(format!("Could not access app info: {:?}", why))
+        Err(why) => return Err(format!("Could not access app info: {:?}", why))?
     };
 
     let bot_user = http.get_current_user().await
@@ -112,6 +112,7 @@ pub async fn init_discord(config: DiscordConfig, tx: UnboundedSender<CommandMess
         .await.expect("Err creating client");
 
 
-    client.start().await.map_err(|why| format!("Discord failed: {}", why))
+    client.start().await?;
+    Ok(())
 }
 

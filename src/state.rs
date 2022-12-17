@@ -1,9 +1,10 @@
-use std::{collections::HashMap, fmt::Display, process, time::Duration};
+use std::{collections::HashMap, process, time::Duration};
 use clap::ValueEnum;
+use obws::requests::scene_items::{SetTransform, SceneItemTransform, Position};
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
 
-use crate::{user::Player, cmd::Command, obs::{Layout, ObsConfiguration}, error::ProjectError};
+use crate::{user::Player, cmd::Command, obs::{Layout, ObsConfiguration}, error::Error};
 
 /// A type used to determine the project type
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
@@ -58,19 +59,19 @@ impl Project {
     }
 }
 
-pub fn find_stream(player: &Player) -> Result<String, ProjectError> {
+pub fn find_stream(player: &Player) -> Result<String, Error> {
     let output = process::Command::new("streamlink")
         .arg("-Q")
         .arg("-j")
         .arg(&player.twitch)
-        .output().map_err(|_| ProjectError::StreamAcqError(player.name.clone(), "Failed to aquire stream.".to_owned()))?;
+        .output().map_err(|_| Error::StreamAcqError(player.name.clone(), "Failed to aquire stream.".to_owned()))?;
 
     let json = std::str::from_utf8(output.stdout.as_slice())
-            .map_err(|_| ProjectError::StreamAcqError(player.name.clone(), "Failed to decipher stream.".to_owned()))?;
+            .map_err(|_| Error::ParseError("Failed to decipher stream.".to_owned()))?;
 
     let parsed_json: Value = serde_json::from_str(json).unwrap();
     if parsed_json.get("error").is_some() {
-        Err(ProjectError::StreamAcqError(player.name.clone(), parsed_json["error"].to_string()))
+        Err(Error::StreamAcqError(player.name.clone(), parsed_json["error"].to_string()))
     } else {
         println!("{}", parsed_json["streams"]["best"]["url"].to_string().replace("\"", ""));
         Ok(parsed_json["streams"]["best"]["url"].to_string().replace("\"", ""))
@@ -78,7 +79,7 @@ pub fn find_stream(player: &Player) -> Result<String, ProjectError> {
 }
 
 impl<'a> ProjectState<'a> {
-    pub fn apply_cmds(&self, cmds: &Vec<Command<'a>>) -> Result<ProjectState<'a>, ProjectError> {
+    pub fn apply_cmds(&self, cmds: &Vec<Command<'a>>) -> Result<ProjectState<'a>, Error> {
         let mut new_state = self.clone();
 
         for cmd in cmds {
@@ -88,7 +89,7 @@ impl<'a> ProjectState<'a> {
         Ok(new_state)
     }
 
-    pub fn apply_cmd(&self, cmd: &Command<'a>) -> Result<ProjectState<'a>, ProjectError> {
+    pub fn apply_cmd(&self, cmd: &Command<'a>) -> Result<ProjectState<'a>, Error> {
         let mut new_state = self.clone();
         match cmd {
             Command::Toggle(player) => {
@@ -140,25 +141,52 @@ impl<'a> ProjectState<'a> {
             },
             Command::Refresh(players) if self.running => {
                 for player in players {
-                    new_state.streams.insert(
-                        player, 
-                        find_stream(player).unwrap_or_else(|e| {
-                            println!("{}", e.to_string());
-                            "".to_owned()
-                        }));
+                    new_state.streams.insert(player, find_stream(&player)?);
                 }
                 Ok(new_state)
             }
-            Command::Refresh(_) => Err(ProjectError::ProjectStateError("Cannot refresh streams while project is inactive.".to_owned())),
+            Command::Refresh(_) => Err(Error::ProjectStateError("Cannot refresh streams while project is inactive.".to_owned())),
             Command::Layout(count, layout) => {
-                new_state.layout.
+                new_state.layout.insert(*count, layout);
+                Ok(new_state)
             }
         }
     }
 
-    pub fn apply_layout(&self, obs: &obws::Client) -> Result<(), String> {
-        
-        Ok(())
+    pub async fn apply_layout(&self, obs_cfg: &ObsConfiguration, obs: &obws::Client) -> Result<(), Error> {
+        let items = obs.scene_items().list(&obs_cfg.scene).await?;
+
+        println!("{:?}", items);
+        match self.layout.get(&self.active_players.len().try_into().unwrap()).map(|l| *l)
+                .or_else(|| obs_cfg.layouts.values().find(|l| l.default.unwrap_or(false) && l.displays.len() == self.active_players.len()))
+                .or_else(|| obs_cfg.layouts.values().find(|l| l.displays.len() == self.active_players.len())) {
+            Some(layout) => {
+                for (idx, view) in layout.displays.iter().enumerate() {
+                    let stream_id = "stream_".to_string() + &idx.to_string();
+                    let stream = items.iter().find(|item| item.source_name == stream_id).ok_or(Error::GeneralError(format!("Unknown source {}", stream_id)))?;
+
+                    let stream_transform = SetTransform {
+                        scene: &obs_cfg.scene,
+                        item_id: stream.id,
+                        transform: SceneItemTransform {
+                            position: Some(Position {
+                                x: Some(view.stream.x as f32),
+                                y: Some(view.stream.y as f32),
+                            }),
+                            rotation: None,
+                            scale: None,
+                            alignment: None,
+                            bounds: None,
+                            crop: None,
+                        },
+                    };
+
+                    obs.scene_items().set_transform(stream_transform).await?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::LayoutError("No known layout for the current player count.".to_string())),
+        }
     }
 
     pub fn to_save_state(&self) -> ProjectStateSerializer {
@@ -171,22 +199,22 @@ impl<'a> ProjectState<'a> {
         }
     }
 
-    pub fn from_save_state(save: &ProjectStateSerializer, project: &'a Project, obs_cfg: &'a ObsConfiguration) -> Result<ProjectState<'a>, ProjectError> {
+    pub fn from_save_state(save: &ProjectStateSerializer, project: &'a Project, obs_cfg: &'a ObsConfiguration) -> Result<ProjectState<'a>, Error> {
         Ok(ProjectState { 
             running: false, 
             active_players: save.active_players
                 .iter()
                 .map(|p| 
                     project.find_by_nick(p)
-                        .ok_or(ProjectError::ProjectLoadError(format!("Failed to find player {} when loading file", p))))
-                .collect::<Result<Vec<&Player>, ProjectError>>()?, 
+                        .ok_or(Error::ProjectLoadError(format!("Failed to find player {} when loading file", p))))
+                .collect::<Result<Vec<&Player>, Error>>()?, 
             streams: HashMap::new(),
             type_state: ProjectTypeState::from_save_state(&save.type_state, project)?,
             layout: save.layout.iter()
                 .map(|(k, v)| obs_cfg.layouts.get(v)
-                    .ok_or(ProjectError::ProjectLoadError(format!("Failed to find layout {}", k)))
+                    .ok_or(Error::ProjectLoadError(format!("Failed to find layout {}", k)))
                     .map(|l| (k.to_owned(), l)))
-                .collect::<Result<HashMap<u32, &Layout>, ProjectError>>()?
+                .collect::<Result<HashMap<u32, &Layout>, Error>>()?
         })
     }
 }
@@ -204,16 +232,16 @@ impl<'a> ProjectTypeState<'a> {
         }
     }
 
-    pub fn from_save_state(save: &ProjectTypeStateSerializer, project: &'a Project) -> Result<ProjectTypeState<'a>, ProjectError> {
+    pub fn from_save_state(save: &ProjectTypeStateSerializer, project: &'a Project) -> Result<ProjectTypeState<'a>, Error> {
         match save {
             ProjectTypeStateSerializer::MarathonState { runner_times } => 
                 runner_times
                     .iter()
                     .map(|(name, time)| 
                         project.find_by_nick(name)
-                            .ok_or(ProjectError::ProjectLoadError(format!("Failed to find player {} when loading file", name)))
+                            .ok_or(Error::ProjectLoadError(format!("Failed to find player {} when loading file", name)))
                             .map(|usr| (usr, time.to_owned())))
-                    .collect::<Result<Vec<(&Player, Duration)>, ProjectError>>()
+                    .collect::<Result<Vec<(&Player, Duration)>, Error>>()
                     .map(|records| ProjectTypeState::MarathonState { runner_times: records.into_iter().collect() })
         }
     }
