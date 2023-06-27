@@ -22,8 +22,7 @@ pub struct Layout {
 pub struct UserDisplay {
     pub stream: PosSize,
     pub name: PosSize,
-    pub webcam: Option<PosSize>,
-    pub timer: Option<PosSize>,
+    pub extra_elements: Option<HashMap<String, PosSize>>,
     pub description: Option<PosSize>,
 }
 

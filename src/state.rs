@@ -1,37 +1,47 @@
-use std::{collections::HashMap, process, time::Duration};
 use clap::ValueEnum;
-use obws::requests::scene_items::{SetTransform, SceneItemTransform, Position};
-use serde::{Serialize, Deserialize};
+use obws::requests::{
+    inputs::SetSettings,
+    scene_items::{Position, Scale, SceneItemTransform, SetTransform},
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{collections::HashMap, process, time::Duration};
 
-use crate::{user::Player, cmd::Command, obs::{Layout, ObsConfiguration}, error::Error};
+use crate::{
+    cmd::Command,
+    error::Error,
+    obs::{Layout, ObsConfiguration},
+    user::Player,
+};
 
 /// A type used to determine the project type
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
 pub enum ProjectType {
-    Marathon
+    Marathon,
 }
 
-/// Contains the immutable state of a project. 
+/// Contains the immutable state of a project.
 #[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub kind: ProjectType,
-    pub players: Vec<Player>
+    pub players: Vec<Player>,
 }
 
 /// Holds state related to a specific project type
 #[derive(PartialEq, Debug, Clone)]
 pub enum ProjectTypeState<'a> {
-    MarathonState{ runner_times: HashMap<&'a Player, Duration> }
+    MarathonState {
+        runner_times: HashMap<&'a Player, Duration>,
+    },
 }
 
 /// Serializer utility type for ProjectTypeState
 #[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub enum ProjectTypeStateSerializer {
-    MarathonState{ runner_times: HashMap<String, Duration> }
+    MarathonState {
+        runner_times: HashMap<String, Duration>,
+    },
 }
-
-
 
 /// Holds the runtime project state for an active project.
 #[derive(PartialEq, Debug, Clone)]
@@ -40,7 +50,7 @@ pub struct ProjectState<'a> {
     pub active_players: Vec<&'a Player>,
     pub streams: HashMap<&'a Player, String>,
     pub type_state: ProjectTypeState<'a>,
-    pub layout: HashMap<u32, &'a Layout>
+    pub layouts_by_count: HashMap<u32, &'a Layout>,
 }
 
 /// Serializizer utility type for ProjectState
@@ -49,13 +59,17 @@ pub struct ProjectState<'a> {
 pub struct ProjectStateSerializer {
     pub active_players: Vec<String>,
     pub type_state: ProjectTypeStateSerializer,
-    pub layout: HashMap<u32, String>
+    pub layouts_by_count: HashMap<u32, String>,
 }
 
+#[derive(Serialize)]
+struct SpecificFreetype<'a> {
+    text: &'a str,
+}
 
 impl Project {
     pub fn find_by_nick(&self, name: &str) -> Option<&Player> {
-       self.players.iter().find(|p| p.name_match(name)) 
+        self.players.iter().find(|p| p.name_match(name))
     }
 }
 
@@ -64,17 +78,30 @@ pub fn find_stream(player: &Player) -> Result<String, Error> {
         .arg("-Q")
         .arg("-j")
         .arg(&player.twitch)
-        .output().map_err(|_| Error::StreamAcqError(player.name.clone(), "Failed to aquire stream.".to_owned()))?;
+        .output()
+        .map_err(|_| {
+            Error::StreamAcqError(player.name.clone(), "Failed to aquire stream.".to_owned())
+        })?;
 
     let json = std::str::from_utf8(output.stdout.as_slice())
-            .map_err(|_| Error::ParseError("Failed to decipher stream.".to_owned()))?;
+        .map_err(|_| Error::ParseError("Failed to decipher stream.".to_owned()))?;
 
     let parsed_json: Value = serde_json::from_str(json).unwrap();
     if parsed_json.get("error").is_some() {
-        Err(Error::StreamAcqError(player.name.clone(), parsed_json["error"].to_string()))
+        Err(Error::StreamAcqError(
+            player.name.clone(),
+            parsed_json["error"].to_string(),
+        ))
     } else {
-        println!("{}", parsed_json["streams"]["best"]["url"].to_string().replace("\"", ""));
-        Ok(parsed_json["streams"]["best"]["url"].to_string().replace("\"", ""))
+        println!(
+            "{}",
+            parsed_json["streams"]["best"]["url"]
+                .to_string()
+                .replace("\"", "")
+        );
+        Ok(parsed_json["streams"]["best"]["url"]
+            .to_string()
+            .replace("\"", ""))
     }
 }
 
@@ -97,7 +124,9 @@ impl<'a> ProjectState<'a> {
                     new_state.active_players.retain(|p| p != player);
                 } else {
                     new_state.active_players.push(player);
-                    if self.running { new_state.streams.insert(player, find_stream(player)?); }
+                    if self.running {
+                        new_state.streams.insert(player, find_stream(player)?);
+                    }
                 }
 
                 Ok(new_state)
@@ -107,26 +136,34 @@ impl<'a> ProjectState<'a> {
                 let pos_p2 = self.active_players.iter().position(|p| p == p2);
 
                 if pos_p1.is_some() && pos_p2.is_some() {
-                    new_state.active_players.swap(pos_p1.unwrap(), pos_p2.unwrap());
+                    new_state
+                        .active_players
+                        .swap(pos_p1.unwrap(), pos_p2.unwrap());
                 } else if pos_p1.is_some() {
                     new_state.active_players.insert(pos_p1.unwrap(), p2);
                     new_state.active_players.remove(pos_p1.unwrap() + 1);
 
-                    if self.running { new_state.streams.insert(p2, find_stream(p2)?); };
+                    if self.running {
+                        new_state.streams.insert(p2, find_stream(p2)?);
+                    };
                 } else if pos_p2.is_some() {
                     new_state.active_players.insert(pos_p2.unwrap(), p1);
                     new_state.active_players.remove(pos_p2.unwrap() + 1);
 
-                    if self.running { new_state.streams.insert(p1, find_stream(p1)?); };
+                    if self.running {
+                        new_state.streams.insert(p1, find_stream(p1)?);
+                    };
                 }
 
                 Ok(new_state)
-            },
+            }
             Command::SetPlayers(players) => {
                 new_state.active_players.clear();
                 for player in players {
                     new_state.active_players.push(player);
-                    if self.running { new_state.streams.insert(player, find_stream(player)?); };
+                    if self.running {
+                        new_state.streams.insert(player, find_stream(player)?);
+                    };
                 }
                 Ok(new_state)
             }
@@ -134,36 +171,65 @@ impl<'a> ProjectState<'a> {
                 match &mut new_state.type_state {
                     ProjectTypeState::MarathonState { runner_times } => {
                         runner_times.insert(player, time.to_owned());
-                    },
+                    }
                 }
 
                 Ok(new_state)
-            },
+            }
             Command::Refresh(players) if self.running => {
                 for player in players {
                     new_state.streams.insert(player, find_stream(&player)?);
                 }
                 Ok(new_state)
             }
-            Command::Refresh(_) => Err(Error::ProjectStateError("Cannot refresh streams while project is inactive.".to_owned())),
+            Command::Refresh(_) => Err(Error::ProjectStateError(
+                "Cannot refresh streams while project is inactive.".to_owned(),
+            )),
             Command::Layout(count, layout) => {
-                new_state.layout.insert(*count, layout);
+                new_state.layouts_by_count.insert(*count, layout);
                 Ok(new_state)
             }
         }
     }
 
-    pub async fn apply_layout(&self, obs_cfg: &ObsConfiguration, obs: &obws::Client) -> Result<(), Error> {
+    pub async fn apply_layout(
+        &self,
+        obs_cfg: &ObsConfiguration,
+        obs: &obws::Client,
+    ) -> Result<(), Error> {
         let items = obs.scene_items().list(&obs_cfg.scene).await?;
 
         println!("{:?}", items);
-        match self.layout.get(&self.active_players.len().try_into().unwrap()).map(|l| *l)
-                .or_else(|| obs_cfg.layouts.values().find(|l| l.default.unwrap_or(false) && l.displays.len() == self.active_players.len()))
-                .or_else(|| obs_cfg.layouts.values().find(|l| l.displays.len() == self.active_players.len())) {
+        match self
+            .layouts_by_count
+            .get(&self.active_players.len().try_into().unwrap())
+            .map(|l| *l)
+            .or_else(|| {
+                obs_cfg.layouts.values().find(|l| {
+                    l.default.unwrap_or(false) && l.displays.len() == self.active_players.len()
+                })
+            })
+            .or_else(|| {
+                obs_cfg
+                    .layouts
+                    .values()
+                    .find(|l| l.displays.len() == self.active_players.len())
+            }) {
             Some(layout) => {
                 for (idx, view) in layout.displays.iter().enumerate() {
+                    let player = self.active_players[idx];
+
                     let stream_id = "stream_".to_string() + &idx.to_string();
-                    let stream = items.iter().find(|item| item.source_name == stream_id).ok_or(Error::GeneralError(format!("Unknown source {}", stream_id)))?;
+                    let stream = items
+                        .iter()
+                        .find(|item| item.source_name == stream_id)
+                        .ok_or(Error::GeneralError(format!("Unknown source {}", stream_id)))?;
+
+                    let name_id = "name_".to_string() + &idx.to_string();
+                    let name = items
+                        .iter()
+                        .find(|item| item.source_name == name_id)
+                        .ok_or(Error::GeneralError(format!("Unknown source {}", stream_id)))?;
 
                     let stream_transform = SetTransform {
                         scene: &obs_cfg.scene,
@@ -174,47 +240,116 @@ impl<'a> ProjectState<'a> {
                                 y: Some(view.stream.y as f32),
                             }),
                             rotation: None,
-                            scale: None,
+                            scale: Some(Scale {
+                                x: Some(1.0),
+                                y: Some(1.0),
+                            }),
                             alignment: None,
-                            bounds: None,
+                            bounds: Some(obws::requests::scene_items::Bounds {
+                                r#type: Some(obws::common::BoundsType::MaxOnly),
+                                alignment: None,
+                                width: Some(view.stream.width as f32),
+                                height: Some(view.stream.width as f32),
+                            }),
                             crop: None,
                         },
                     };
 
                     obs.scene_items().set_transform(stream_transform).await?;
+
+                    let name_transform = SetTransform {
+                        scene: &obs_cfg.scene,
+                        item_id: name.id,
+                        transform: SceneItemTransform {
+                            position: Some(Position {
+                                x: Some(view.name.x as f32),
+                                y: Some(view.name.y as f32),
+                            }),
+                            rotation: None,
+                            scale: Some(Scale {
+                                x: Some(1.0),
+                                y: Some(1.0),
+                            }),
+                            alignment: None,
+                            bounds: Some(obws::requests::scene_items::Bounds {
+                                r#type: Some(obws::common::BoundsType::MaxOnly),
+                                alignment: None,
+                                width: Some(view.name.width as f32),
+                                height: Some(view.name.width as f32),
+                            }),
+                            crop: None,
+                        },
+                    };
+
+                    let name_setting = SpecificFreetype { text: &player.name };
+                    obs.scene_items().set_transform(name_transform).await?;
+                    obs.inputs()
+                        .set_settings(SetSettings {
+                            input: &name_id,
+                            settings: &name_setting,
+                            overlay: Some(true),
+                        })
+                        .await?;
                 }
                 Ok(())
             }
-            _ => Err(Error::LayoutError("No known layout for the current player count.".to_string())),
+            _ => Err(Error::LayoutError(
+                "No known layout for the current player count.".to_string(),
+            )),
         }
     }
 
     pub fn to_save_state(&self) -> ProjectStateSerializer {
         ProjectStateSerializer {
-            active_players: self.active_players.iter().map(|a| a.name.to_owned()).collect(),
+            active_players: self
+                .active_players
+                .iter()
+                .map(|a| a.name.to_owned())
+                .collect(),
             type_state: self.type_state.to_save_state(),
-            layout: self.layout.iter()
+            layouts_by_count: self
+                .layouts_by_count
+                .iter()
                 .map(|(k, v)| (k.to_owned(), v.name.to_owned()))
-                .collect()
+                .collect(),
         }
     }
 
-    pub fn from_save_state(save: &ProjectStateSerializer, project: &'a Project, obs_cfg: &'a ObsConfiguration) -> Result<ProjectState<'a>, Error> {
-        Ok(ProjectState { 
-            running: false, 
-            active_players: save.active_players
+    pub fn from_save_state(
+        save: &ProjectStateSerializer,
+        project: &'a Project,
+        obs_cfg: &'a ObsConfiguration,
+    ) -> Result<ProjectState<'a>, Error> {
+        Ok(ProjectState {
+            running: false,
+            active_players: save
+                .active_players
                 .iter()
-                .map(|p| 
-                    project.find_by_nick(p)
-                        .ok_or(Error::ProjectLoadError(format!("Failed to find player {} when loading file", p))))
-                .collect::<Result<Vec<&Player>, Error>>()?, 
+                .map(|p| {
+                    project
+                        .find_by_nick(p)
+                        .ok_or(Error::ProjectLoadError(format!(
+                            "Failed to find player {} when loading file",
+                            p
+                        )))
+                })
+                .collect::<Result<Vec<&Player>, Error>>()?,
             streams: HashMap::new(),
             type_state: ProjectTypeState::from_save_state(&save.type_state, project)?,
-            layout: save.layout.iter()
-                .map(|(k, v)| obs_cfg.layouts.get(v)
-                    .ok_or(Error::ProjectLoadError(format!("Failed to find layout {}", k)))
-                    .map(|l| (k.to_owned(), l)))
-                .collect::<Result<HashMap<u32, &Layout>, Error>>()?
+            layouts_by_count: save
+                .layouts_by_count
+                .iter()
+                .map(|(k, v)| {
+                    obs_cfg
+                        .layouts
+                        .get(v)
+                        .ok_or(Error::ProjectLoadError(format!(
+                            "Failed to find layout {}",
+                            k
+                        )))
+                        .map(|l| (k.to_owned(), l))
+                })
+                .collect::<Result<HashMap<u32, &Layout>, Error>>()?,
         })
     }
 }
@@ -222,27 +357,37 @@ impl<'a> ProjectState<'a> {
 impl<'a> ProjectTypeState<'a> {
     pub fn to_save_state(&self) -> ProjectTypeStateSerializer {
         match self {
-            ProjectTypeState::MarathonState { runner_times } => 
-                ProjectTypeStateSerializer::MarathonState { 
+            ProjectTypeState::MarathonState { runner_times } => {
+                ProjectTypeStateSerializer::MarathonState {
                     runner_times: runner_times
                         .iter()
                         .map(|record| (record.0.name.to_owned(), record.1.to_owned()))
-                        .collect() 
-                },
+                        .collect(),
+                }
+            }
         }
     }
 
-    pub fn from_save_state(save: &ProjectTypeStateSerializer, project: &'a Project) -> Result<ProjectTypeState<'a>, Error> {
+    pub fn from_save_state(
+        save: &ProjectTypeStateSerializer,
+        project: &'a Project,
+    ) -> Result<ProjectTypeState<'a>, Error> {
         match save {
-            ProjectTypeStateSerializer::MarathonState { runner_times } => 
-                runner_times
-                    .iter()
-                    .map(|(name, time)| 
-                        project.find_by_nick(name)
-                            .ok_or(Error::ProjectLoadError(format!("Failed to find player {} when loading file", name)))
-                            .map(|usr| (usr, time.to_owned())))
-                    .collect::<Result<Vec<(&Player, Duration)>, Error>>()
-                    .map(|records| ProjectTypeState::MarathonState { runner_times: records.into_iter().collect() })
+            ProjectTypeStateSerializer::MarathonState { runner_times } => runner_times
+                .iter()
+                .map(|(name, time)| {
+                    project
+                        .find_by_nick(name)
+                        .ok_or(Error::ProjectLoadError(format!(
+                            "Failed to find player {} when loading file",
+                            name
+                        )))
+                        .map(|usr| (usr, time.to_owned()))
+                })
+                .collect::<Result<Vec<(&Player, Duration)>, Error>>()
+                .map(|records| ProjectTypeState::MarathonState {
+                    runner_times: records.into_iter().collect(),
+                }),
         }
     }
 }

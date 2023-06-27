@@ -192,7 +192,7 @@ async fn main() -> Result<(), Error> {
                         Err(_) => ProjectStateSerializer {
                             active_players: vec!(),
                             type_state: ProjectTypeStateSerializer::MarathonState { runner_times: HashMap::new() }, 
-                            layout: HashMap::new() 
+                            layouts_by_count: HashMap::new() 
                         }
                     }
                 },
@@ -202,7 +202,7 @@ async fn main() -> Result<(), Error> {
                     ProjectStateSerializer {
                         active_players: vec!(),
                         type_state: ProjectTypeStateSerializer::MarathonState { runner_times: HashMap::new() }, 
-                        layout: HashMap::new() 
+                        layouts_by_count: HashMap::new() 
                     }
                 }
             };
@@ -313,7 +313,7 @@ mod tests {
             active_players: vec!(),
             streams: HashMap::new(),
             type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() },
-            layout: HashMap::new() 
+            layouts_by_count: HashMap::new() 
         };
 
 
@@ -356,7 +356,7 @@ mod tests {
             active_players: vec!(),
             streams: HashMap::new(),
             type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() },
-            layout: HashMap::new() 
+            layouts_by_count: HashMap::new() 
         };
 
 
@@ -419,7 +419,7 @@ mod tests {
             active_players: vec!(),
             streams: HashMap::new(),
             type_state: ProjectTypeState::MarathonState { runner_times: HashMap::new() }, 
-            layout: HashMap::new() 
+            layouts_by_count: HashMap::new() 
         };
 
         state = state.apply_cmd(&parse_cmd("!toggle joe", &project, &obs, &state).unwrap()).unwrap();
