@@ -12,4 +12,4 @@ serenity = "0.11"
 clap = { version = "4.0.15", features = ["derive"] }
 tokio = { version = "1.21.2", features = ["full"] }
 futures = "0.3.24"
-obws = "0.10.0-beta.4"
+obws = "0.11.2"

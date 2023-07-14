@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::{user::Player, state::{Project, ProjectState}, obs::{Layout, ObsConfiguration}, error::Error};
+use crate::{user::Player, state::{Project, ProjectState}, obs::{Layout, LayoutFile}, error::Error};
 
 
 #[derive(PartialEq, Debug)]
@@ -17,14 +17,14 @@ fn find_or_err<'a>(user: &'_ str, project: &'a Project) -> Result<&'a Player, Er
     project.find_by_nick(user).ok_or(Error::PlayerError(user.to_owned()))
 }
 
-pub fn parse_cmds<'a>(full_cmd: &'_ str, project: &'a Project, obs: &'a ObsConfiguration, state: &'_ ProjectState) -> Result<Vec<Command<'a>>, Error> {
+pub fn parse_cmds<'a>(full_cmd: &'_ str, project: &'a Project, layouts: &'a LayoutFile, state: &'_ ProjectState::<'a>) -> Result<Vec<Command<'a>>, Error> {
     full_cmd.split("\n")
         .filter(|c| !c.is_empty())
-        .map(|c| parse_cmd(c, project, obs, state))
+        .map(|c| parse_cmd(c, project, layouts, state))
         .collect::<Result<Vec<Command>, Error>>()
 }
 
-pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project, obs: &'a ObsConfiguration, state: &'_ ProjectState) -> Result<Command<'a>, Error> {
+pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project, layouts: &'a LayoutFile, state: &'_ ProjectState::<'a>) -> Result<Command<'a>, Error> {
     let mut elements = full_cmd.split(" ");
     match elements.next() {
         Some(cmd) => {
@@ -66,10 +66,10 @@ pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project, obs: &'a ObsConfig
                         .map(|ps| Command::Refresh(ps))
                 }
                 "refresh" if args.len() == 0  => {
-                    Ok(Command::Refresh(project.players.iter().collect()))
+                    Ok(Command::Refresh(state.active_players.clone()))
                 }
                 "layout" if args.len() == 1 => {
-                    obs.layouts.get(args[0])
+                    layouts.layouts.get(args[0])
                         .map(|l| Command::Layout(state.active_players.len().try_into().unwrap(), l))
                         .ok_or(Error::LayoutError(args[0].to_owned()))
                 }
@@ -77,7 +77,7 @@ pub fn parse_cmd<'a>(full_cmd: &'_ str, project: &'a Project, obs: &'a ObsConfig
                     let idx = args[0].parse::<u32>()
                         .map_err(|_| Error::CommandError(full_cmd.to_string()))?;
 
-                    obs.layouts.get(args[1])
+                    layouts.layouts.get(args[1])
                         .map(|l| Command::Layout(idx, l))
                         .ok_or(Error::LayoutError(args[0].to_owned()))
                 }

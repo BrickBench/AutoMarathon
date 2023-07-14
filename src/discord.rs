@@ -1,17 +1,11 @@
 use std::{sync::Arc, collections::HashSet};
 
 use futures::FutureExt;
-use serde::{Serialize, Deserialize};
+
 use serenity::{async_trait, prelude::{EventHandler, Context, TypeMapKey, GatewayIntents}, model::{voice::VoiceState, prelude::Message, user::CurrentUser}, http::Http, framework::StandardFramework};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{CommandMessage, error::Error};
-
-#[derive(Serialize, Deserialize)]
-pub struct DiscordConfig {
-    pub token: String,
-    pub channel: String,
-}
+use crate::{CommandMessage, error::Error, settings::Settings};
 
 struct MessageStore;
 impl TypeMapKey for MessageStore {
@@ -23,9 +17,9 @@ impl TypeMapKey for UserStore {
     type Value = Arc<CurrentUser>;
 }
 
-struct DiscordStore;
-impl TypeMapKey for DiscordStore {
-    type Value = DiscordConfig;
+struct SettingsStore;
+impl TypeMapKey for SettingsStore {
+    type Value = Settings;
 }
 
 pub struct Handler; 
@@ -81,9 +75,9 @@ pub async fn test_discord(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn init_discord(config: DiscordConfig, tx: UnboundedSender<CommandMessage>) -> Result<(), Error> {
+pub async fn init_discord(settings: Settings, tx: UnboundedSender<CommandMessage>) -> Result<(), Error> {
     println!("Initializing Discord bot");
-    let http = Http::new(&config.token);
+    let http = Http::new(&settings.discord_token.clone().unwrap());
     let owners = match http.get_current_application_info().await {
         Ok(info) => {
             let mut owners = HashSet::new();
@@ -98,13 +92,12 @@ pub async fn init_discord(config: DiscordConfig, tx: UnboundedSender<CommandMess
 
     println!("Found user {}", bot_user.name);
 
-
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
     let framework = StandardFramework::new()
         .configure(|c| c.owners(owners).prefix("!"));
 
-    let mut client = serenity::Client::builder(config.token.trim(), intents)
+    let mut client = serenity::Client::builder(settings.discord_token.clone().unwrap().trim(), intents)
         .framework(framework)
         .type_map_insert::<MessageStore>(tx)
         .type_map_insert::<UserStore>(Arc::new(bot_user))

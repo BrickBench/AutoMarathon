@@ -1,8 +1,5 @@
 use clap::ValueEnum;
-use obws::requests::{
-    inputs::SetSettings,
-    scene_items::{Position, Scale, SceneItemTransform, SetTransform},
-};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, process, time::Duration};
@@ -10,7 +7,7 @@ use std::{collections::HashMap, process, time::Duration};
 use crate::{
     cmd::Command,
     error::Error,
-    obs::{Layout, ObsConfiguration},
+    obs::{Layout, LayoutFile},
     user::Player,
 };
 
@@ -62,10 +59,6 @@ pub struct ProjectStateSerializer {
     pub layouts_by_count: HashMap<u32, String>,
 }
 
-#[derive(Serialize)]
-struct SpecificFreetype<'a> {
-    text: &'a str,
-}
 
 impl Project {
     pub fn find_by_nick(&self, name: &str) -> Option<&Player> {
@@ -93,12 +86,6 @@ pub fn find_stream(player: &Player) -> Result<String, Error> {
             parsed_json["error"].to_string(),
         ))
     } else {
-        println!(
-            "{}",
-            parsed_json["streams"]["best"]["url"]
-                .to_string()
-                .replace("\"", "")
-        );
         Ok(parsed_json["streams"]["best"]["url"]
             .to_string()
             .replace("\"", ""))
@@ -192,113 +179,6 @@ impl<'a> ProjectState<'a> {
         }
     }
 
-    pub async fn apply_layout(
-        &self,
-        obs_cfg: &ObsConfiguration,
-        obs: &obws::Client,
-    ) -> Result<(), Error> {
-        let items = obs.scene_items().list(&obs_cfg.scene).await?;
-
-        println!("{:?}", items);
-        match self
-            .layouts_by_count
-            .get(&self.active_players.len().try_into().unwrap())
-            .map(|l| *l)
-            .or_else(|| {
-                obs_cfg.layouts.values().find(|l| {
-                    l.default.unwrap_or(false) && l.displays.len() == self.active_players.len()
-                })
-            })
-            .or_else(|| {
-                obs_cfg
-                    .layouts
-                    .values()
-                    .find(|l| l.displays.len() == self.active_players.len())
-            }) {
-            Some(layout) => {
-                for (idx, view) in layout.displays.iter().enumerate() {
-                    let player = self.active_players[idx];
-
-                    let stream_id = "stream_".to_string() + &idx.to_string();
-                    let stream = items
-                        .iter()
-                        .find(|item| item.source_name == stream_id)
-                        .ok_or(Error::GeneralError(format!("Unknown source {}", stream_id)))?;
-
-                    let name_id = "name_".to_string() + &idx.to_string();
-                    let name = items
-                        .iter()
-                        .find(|item| item.source_name == name_id)
-                        .ok_or(Error::GeneralError(format!("Unknown source {}", stream_id)))?;
-
-                    let stream_transform = SetTransform {
-                        scene: &obs_cfg.scene,
-                        item_id: stream.id,
-                        transform: SceneItemTransform {
-                            position: Some(Position {
-                                x: Some(view.stream.x as f32),
-                                y: Some(view.stream.y as f32),
-                            }),
-                            rotation: None,
-                            scale: Some(Scale {
-                                x: Some(1.0),
-                                y: Some(1.0),
-                            }),
-                            alignment: None,
-                            bounds: Some(obws::requests::scene_items::Bounds {
-                                r#type: Some(obws::common::BoundsType::MaxOnly),
-                                alignment: None,
-                                width: Some(view.stream.width as f32),
-                                height: Some(view.stream.width as f32),
-                            }),
-                            crop: None,
-                        },
-                    };
-
-                    obs.scene_items().set_transform(stream_transform).await?;
-
-                    let name_transform = SetTransform {
-                        scene: &obs_cfg.scene,
-                        item_id: name.id,
-                        transform: SceneItemTransform {
-                            position: Some(Position {
-                                x: Some(view.name.x as f32),
-                                y: Some(view.name.y as f32),
-                            }),
-                            rotation: None,
-                            scale: Some(Scale {
-                                x: Some(1.0),
-                                y: Some(1.0),
-                            }),
-                            alignment: None,
-                            bounds: Some(obws::requests::scene_items::Bounds {
-                                r#type: Some(obws::common::BoundsType::MaxOnly),
-                                alignment: None,
-                                width: Some(view.name.width as f32),
-                                height: Some(view.name.width as f32),
-                            }),
-                            crop: None,
-                        },
-                    };
-
-                    let name_setting = SpecificFreetype { text: &player.name };
-                    obs.scene_items().set_transform(name_transform).await?;
-                    obs.inputs()
-                        .set_settings(SetSettings {
-                            input: &name_id,
-                            settings: &name_setting,
-                            overlay: Some(true),
-                        })
-                        .await?;
-                }
-                Ok(())
-            }
-            _ => Err(Error::LayoutError(
-                "No known layout for the current player count.".to_string(),
-            )),
-        }
-    }
-
     pub fn to_save_state(&self) -> ProjectStateSerializer {
         ProjectStateSerializer {
             active_players: self
@@ -318,7 +198,7 @@ impl<'a> ProjectState<'a> {
     pub fn from_save_state(
         save: &ProjectStateSerializer,
         project: &'a Project,
-        obs_cfg: &'a ObsConfiguration,
+        obs_cfg: &'a LayoutFile,
     ) -> Result<ProjectState<'a>, Error> {
         Ok(ProjectState {
             running: false,
