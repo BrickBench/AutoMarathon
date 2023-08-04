@@ -4,7 +4,7 @@ use serde::{Serialize, Deserialize};
 pub struct Player {
     pub name: String,
     pub nicks: Vec<String>,
-    pub twitch: String
+    pub stream: String
 }
 
 impl Player {

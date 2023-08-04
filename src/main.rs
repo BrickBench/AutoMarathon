@@ -6,26 +6,38 @@ use std::{
 
 use clap::{Parser, Subcommand};
 
-use discord::test_discord;
 use error::Error;
-use futures::{future::BoxFuture, FutureExt};
-use obs::update_obs;
-use state::{Project, ProjectState, ProjectStateSerializer, ProjectType};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use user::Player;
+use log::{debug, error, info, warn};
+use tokio::{
+    sync::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
+    task::JoinSet,
+};
 
 use crate::{
-    cmd::parse_cmds, discord::init_discord, obs::LayoutFile, settings::Settings,
-    state::ProjectTypeStateSerializer,
+    cmd::{parse_cmds, Command},
+    discord::init_discord,
+    discord::test_discord,
+    obs::update_obs,
+    obs::LayoutFile,
+    player::Player,
+    settings::Settings,
+    state::{FieldStateSerializer, Project, ProjectState, ProjectStateSerializer, ProjectTemplate},
+    therun::create_player_websocket,
+    web::run_http_server,
 };
 
 mod cmd;
 mod discord;
 mod error;
 mod obs;
+mod player;
 mod settings;
 mod state;
-mod user;
+mod therun;
+mod web;
 
 #[derive(Parser, Debug)]
 #[command(name = "AutoMarathon")]
@@ -43,7 +55,7 @@ enum RunType {
     /// The output .json file will need to be manually edited to fill in details for players.
     Create {
         #[arg(short = 't', long)]
-        project_type: ProjectType,
+        project_type: ProjectTemplate,
 
         /// List of players to initialize.
         #[arg(short = 'p', long, use_value_delimiter = true, value_delimiter = ',')]
@@ -80,11 +92,14 @@ enum RunType {
     },
 }
 
+pub enum Response {
+    Ok,
+    Error(String),
+    CurrentState(ProjectStateSerializer),
+}
+
 /// A type for inter-thread communication with a string command and a callback for returning errors.
-type CommandMessage = (
-    String,
-    Box<dyn Send + Sync + FnOnce(Option<String>) -> BoxFuture<'static, ()>>,
-);
+type CommandMessage = (String, Option<oneshot::Sender<Response>>);
 
 async fn run_update<'a>(
     project: Project,
@@ -93,78 +108,86 @@ async fn run_update<'a>(
     state_file: PathBuf,
     mut rx: UnboundedReceiver<CommandMessage>,
     obs: obws::Client,
-) {
+) -> Result<(), Error> {
     let mut state = ProjectState::from_save_state(&state_src, &project, &obs_cfg).unwrap();
 
     state.running = true;
 
     loop {
-        println!("At gaming");
         let (msg, resp) = rx.recv().await.unwrap();
 
-        println!("Processing {}", msg);
+        let mut resp_msg = Response::Ok;
+
+        debug!("Processing {}", msg);
 
         if msg.starts_with("exit") {
-            break;
+            break Ok(());
         }
 
         let cmd = parse_cmds(&msg, &project, &obs_cfg, &state);
 
         match &cmd {
-            Ok(cmd) => {
-                let state_res = state.apply_cmds(cmd);
+            Ok(cmds) if cmds.len() == 1 && cmds[0] == Command::GetState => {
+                resp_msg = Response::CurrentState(state.to_save_state());
+            }
+            Ok(cmds) => {
+                let state_res = state.apply_cmds(cmds);
                 match state_res {
-                    Ok(new_state) => {
+                    Ok((new_state, modifications)) => {
                         state = new_state;
-                        let resp = tokio::spawn(resp(None));
 
-                        if let Err(e) = update_obs(&state, &obs_cfg, &obs).await {
-                            println!("Error while applying layout: {}", e.to_string())
+                        match update_obs(&project, &state, modifications, &obs_cfg, &obs).await {
+                            Ok(_) => {
+                                let state_save =
+                                    serde_json::to_string_pretty(&state.to_save_state()).unwrap();
+                                fs::write(&state_file, state_save).expect("Failed to save file.");
+                            }
+                            Err(err) => {
+                                error!("Error while applying layout: {}", err.to_string());
+                                resp_msg = Response::Error(err.to_string());
+                            }
                         }
-
-                        let state_save =
-                            serde_json::to_string_pretty(&state.to_save_state()).unwrap();
-                        fs::write(&state_file, state_save).expect("Failed to save file.");
-
-                        resp.await.expect("Error in response.");
                     }
                     Err(err) => {
-                        resp(Some(err.to_string())).await;
+                        error!("Error while applying commands: {}", err.to_string());
+                        resp_msg = Response::Error(err.to_string());
                     }
                 }
             }
             Err(err) => {
-                resp(Some(err.to_string())).await;
+                error!("Error while parsing commands: {}", err.to_string());
+                resp_msg = Response::Error(err.to_string());
             }
+        }
+
+        if let Some(rx) = resp {
+            rx.send(resp_msg);
         }
     }
 }
 
-async fn read_terminal(tx: UnboundedSender<CommandMessage>) {
+async fn read_terminal(tx: UnboundedSender<CommandMessage>) -> Result<(), Error> {
     loop {
         let mut cmd: String = String::new();
         std::io::stdin()
             .read_line(&mut cmd)
             .expect("Failed to read from stdin");
 
-        println!("GEE {:?}", cmd);
-
         if cmd.to_lowercase() == "exit" {
-            break;
+            break Ok(());
         } else {
-            tx.send((
-                cmd,
-                Box::new(move |e: Option<String>| {
-                    async move {
-                        if let Some(err) = e {
-                            println!("Failed to run command: {}", err);
-                        }
+            let (rtx, rrx) = oneshot::channel();
+            let _ = tx.send((cmd, Some(rtx)));
+
+            if let Ok(resp) = rrx.await {
+                match resp {
+                    Response::Ok => {}
+                    Response::Error(message) => {
+                        error!("Failed to run command: {}", message);
                     }
-                    .boxed()
-                }),
-            ))
-            .map_err(|_| "Failed to send command.")
-            .unwrap();
+                    Response::CurrentState(value) => info!("{:?}", value),
+                }
+            }
         }
     }
 }
@@ -180,6 +203,10 @@ async fn main() -> Result<(), Error> {
         },
     }; //Args::parse();
 
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .init();
+
     match &args.command {
         RunType::Create {
             project_type,
@@ -187,22 +214,24 @@ async fn main() -> Result<(), Error> {
             project_file,
         } => {
             let new_project = Project {
-                kind: project_type.to_owned(),
+                template: project_type.to_owned(),
                 players: players
                     .iter()
                     .map(|p| Player {
                         name: p.to_owned(),
                         nicks: vec![],
-                        twitch: "FILL_THIS".to_owned(),
+                        stream: "FILL_THIS".to_owned(),
                     })
                     .collect(),
+                integrations: [].to_vec(),
+                extra_fields: [].to_vec(),
             };
 
             let new_json = serde_json::to_string_pretty(&new_project).unwrap();
 
             fs::write(project_file, new_json)?;
 
-            println!("Project created, please open the file in a text editor and fill in the missing fields.");
+            info!("Project created, please open the file in a text editor and fill in the missing fields.");
             Ok(())
         }
         RunType::Test { settings_file } => {
@@ -229,12 +258,12 @@ async fn main() -> Result<(), Error> {
             let settings: Settings =
                 serde_json::from_str::<Settings>(&read_to_string(&settings_file)?)?;
 
-            println!("Loaded project");
+            info!("Loaded project");
 
             // Load or create project state
             let state: ProjectStateSerializer = match read_to_string(save_file) {
                 Ok(file) => {
-                    println!("Loading project state file...");
+                    info!("Loading project state file...");
                     let save_res = serde_json::from_str::<ProjectStateSerializer>(&file);
                     match save_res {
                         Ok(save) => {
@@ -244,22 +273,34 @@ async fn main() -> Result<(), Error> {
                         }
                         Err(_) => ProjectStateSerializer {
                             active_players: vec![],
-                            type_state: ProjectTypeStateSerializer::MarathonState {
-                                runner_times: HashMap::new(),
+                            player_fields: FieldStateSerializer {
+                                player_fields: project
+                                    .players
+                                    .iter()
+                                    .map(|p| (p.name.clone(), HashMap::new()))
+                                    .collect(),
                             },
                             layouts_by_count: HashMap::new(),
+                            active_commentators: vec![],
+                            ignored_commentators: vec![],
                         },
                     }
                 }
                 Err(_) => {
-                    println!("Project state file does not exist, creating...");
+                    info!("Project state file does not exist, creating...");
                     File::create(save_file)?;
                     ProjectStateSerializer {
                         active_players: vec![],
-                        type_state: ProjectTypeStateSerializer::MarathonState {
-                            runner_times: HashMap::new(),
+                        player_fields: FieldStateSerializer {
+                            player_fields: project
+                                .players
+                                .iter()
+                                .map(|p| (p.name.clone(), HashMap::new()))
+                                .collect(),
                         },
                         layouts_by_count: HashMap::new(),
+                        active_commentators: vec![],
+                        ignored_commentators: vec![],
                     }
                 }
             };
@@ -270,7 +311,7 @@ async fn main() -> Result<(), Error> {
             ) = mpsc::unbounded_channel();
 
             // Initialize OBS websocket
-            println!("Connecting to OBS");
+            info!("Connecting to OBS");
             let obs = obws::Client::connect(
                 settings.obs_ip.to_owned().unwrap_or("localhost".to_owned()),
                 settings.obs_port.to_owned().unwrap_or(4455),
@@ -279,7 +320,7 @@ async fn main() -> Result<(), Error> {
             .await?;
 
             let obs_version = obs.general().version().await?;
-            println!(
+            info!(
                 "Connected to OBS version {}, websocket {}, running on {} ({})",
                 obs_version.obs_version.to_string(),
                 obs_version.obs_web_socket_version.to_string(),
@@ -287,29 +328,43 @@ async fn main() -> Result<(), Error> {
                 obs_version.platform_description
             );
 
-            println!("AutoMarathon initialized");
+            info!("AutoMarathon initialized");
 
-            let terminal_task = read_terminal(tx);
-            let work_task = run_update(project, state, layouts, save_file.to_owned(), rx, obs);
-            if let Some(_token) = &settings.discord_token {
-                /* let (discord, work, terminal) = tokio::join!(
-                    tokio::spawn(init_discord(settings.clone(), tx.clone())),
-                    tokio::spawn(work_task),
-                    tokio::spawn(terminal_task)
-                );
+            let mut tasks = JoinSet::<Result<(), Error>>::new();
 
-                discord.unwrap()?;
-                work.unwrap();
-                terminal.unwrap();*/
-            } else {
-                let (terminal, work) =
-                    tokio::join!(tokio::spawn(terminal_task), tokio::spawn(work_task));
-
-                work.unwrap();
-                terminal.unwrap();
+            if project.integrations.contains(&state::Integration::TheRun) {
+                for player in &project.players {
+                    let twitch_handle = player.stream.split('/').last().unwrap();
+                    tasks.spawn(create_player_websocket(
+                        player.name.clone(),
+                        twitch_handle.to_string(),
+                        tx.clone(),
+                    ));
+                }
             }
 
-            Ok(())
+            if project.integrations.contains(&state::Integration::Discord) {
+                tasks.spawn(init_discord(settings.clone(), tx.clone()));
+            }
+
+            tasks.spawn(read_terminal(tx.clone()));
+            tasks.spawn(run_http_server(tx.clone()));
+            tasks.spawn(run_update(
+                project,
+                state,
+                layouts,
+                save_file.to_owned(),
+                rx,
+                obs,
+            ));
+
+            loop {
+                match tasks.join_next().await {
+                    Some(Ok(_)) => info!("Service Done"),
+                    Some(Err(err)) => error!("{}", err.to_string()),
+                    None => break Ok(()),
+                }
+            }
         }
     }
 }
@@ -321,24 +376,24 @@ mod tests {
     use crate::{
         cmd::{parse_cmd, Command},
         obs::LayoutFile,
-        state::{Project, ProjectState, ProjectStateSerializer, ProjectType, ProjectTypeState},
-        user::Player,
+        player::Player,
+        state::{FieldState, Project, ProjectState, ProjectStateSerializer, ProjectTemplate},
     };
 
     #[test]
     fn test_nicks() {
         let project = Project {
-            kind: ProjectType::Marathon,
+            kind: ProjectTemplate::Marathon,
             players: vec![
                 Player {
                     name: "Joe".to_owned(),
                     nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    twitch: "test".to_owned(),
+                    stream: "test".to_owned(),
                 },
                 Player {
                     name: "William".to_owned(),
                     nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    twitch: "test2".to_owned(),
+                    stream: "test2".to_owned(),
                 },
             ],
         };
@@ -351,17 +406,17 @@ mod tests {
     #[test]
     fn test_cmds() {
         let project = Project {
-            kind: ProjectType::Marathon,
+            kind: ProjectTemplate::Marathon,
             players: vec![
                 Player {
                     name: "Joe".to_owned(),
                     nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    twitch: "test".to_owned(),
+                    stream: "test".to_owned(),
                 },
                 Player {
                     name: "William".to_owned(),
                     nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    twitch: "test2".to_owned(),
+                    stream: "test2".to_owned(),
                 },
             ],
         };
@@ -370,7 +425,7 @@ mod tests {
             running: false,
             active_players: vec![],
             streams: HashMap::new(),
-            type_state: ProjectTypeState::MarathonState {
+            player_fields: FieldState::MarathonState {
                 runner_times: HashMap::new(),
             },
             layouts_by_count: HashMap::new(),
@@ -402,7 +457,7 @@ mod tests {
         assert!(parse_cmd("!set bill will dill", &project, &layouts, &state).is_err());
 
         assert_eq!(
-            Command::SetScore(&project.players[0], Duration::from_millis(222)),
+            Command::SetEventRecord(&project.players[0], Duration::from_millis(222)),
             parse_cmd("!record joe 222", &project, &layouts, &state).unwrap()
         );
         assert!(parse_cmd("!record joe 22e", &project, &layouts, &state).is_err());
@@ -411,17 +466,17 @@ mod tests {
     #[test]
     fn test_cmd_apply() {
         let project = Project {
-            kind: ProjectType::Marathon,
+            kind: ProjectTemplate::Marathon,
             players: vec![
                 Player {
                     name: "Joe".to_owned(),
                     nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    twitch: "test".to_owned(),
+                    stream: "test".to_owned(),
                 },
                 Player {
                     name: "William".to_owned(),
                     nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    twitch: "test2".to_owned(),
+                    stream: "test2".to_owned(),
                 },
             ],
         };
@@ -430,7 +485,7 @@ mod tests {
             running: false,
             active_players: vec![],
             streams: HashMap::new(),
-            type_state: ProjectTypeState::MarathonState {
+            player_fields: FieldState::MarathonState {
                 runner_times: HashMap::new(),
             },
             layouts_by_count: HashMap::new(),
@@ -486,17 +541,17 @@ mod tests {
         };
 
         let project = Project {
-            kind: ProjectType::Marathon,
+            kind: ProjectTemplate::Marathon,
             players: vec![
                 Player {
                     name: "Joe".to_owned(),
                     nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    twitch: "test".to_owned(),
+                    stream: "test".to_owned(),
                 },
                 Player {
                     name: "William".to_owned(),
                     nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    twitch: "test2".to_owned(),
+                    stream: "test2".to_owned(),
                 },
             ],
         };
@@ -510,7 +565,7 @@ mod tests {
             running: false,
             active_players: vec![],
             streams: HashMap::new(),
-            type_state: ProjectTypeState::MarathonState {
+            player_fields: FieldState::MarathonState {
                 runner_times: HashMap::new(),
             },
             layouts_by_count: HashMap::new(),
