@@ -1,3 +1,4 @@
+use poise::serenity_prelude as serenity;
 
 #[derive(Debug)]
 pub enum Error {

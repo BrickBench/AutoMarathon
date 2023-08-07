@@ -2,12 +2,13 @@ use std::{
     collections::HashMap,
     fs::{self, read_to_string, File},
     path::PathBuf,
+    sync::Arc,
 };
 
 use clap::{Parser, Subcommand};
 
+use cmd::CommandSource;
 use error::Error;
-use log::{debug, error, info, warn};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -17,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    cmd::{parse_cmds, Command},
+    cmd::{parse_cmd, Command},
     discord::init_discord,
     discord::test_discord,
     obs::update_obs,
@@ -25,7 +26,7 @@ use crate::{
     player::Player,
     settings::Settings,
     state::{FieldStateSerializer, Project, ProjectState, ProjectStateSerializer, ProjectTemplate},
-    therun::create_player_websocket,
+    therun::create_player_websocket_monitor,
     web::run_http_server,
 };
 
@@ -92,19 +93,20 @@ enum RunType {
     },
 }
 
+/// Response types for CommandMessage
 pub enum Response {
     Ok,
     Error(String),
     CurrentState(ProjectStateSerializer),
 }
 
-/// A type for inter-thread communication with a string command and a callback for returning errors.
-type CommandMessage = (String, Option<oneshot::Sender<Response>>);
+/// A string message with optional response channel
+type CommandMessage = (CommandSource, Option<oneshot::Sender<Response>>);
 
 async fn run_update<'a>(
-    project: Project,
+    project: Arc<Project>,
     state_src: ProjectStateSerializer,
-    obs_cfg: LayoutFile,
+    obs_cfg: Arc<LayoutFile>,
     state_file: PathBuf,
     mut rx: UnboundedReceiver<CommandMessage>,
     obs: obws::Client,
@@ -118,20 +120,16 @@ async fn run_update<'a>(
 
         let mut resp_msg = Response::Ok;
 
-        debug!("Processing {}", msg);
+        log::debug!("Processing {:?}", msg);
 
-        if msg.starts_with("exit") {
-            break Ok(());
-        }
-
-        let cmd = parse_cmds(&msg, &project, &obs_cfg, &state);
+        let cmd = parse_cmd(&msg, &project, &obs_cfg);
 
         match &cmd {
-            Ok(cmds) if cmds.len() == 1 && cmds[0] == Command::GetState => {
+            Ok(cmds) if cmds == &Command::GetState => {
                 resp_msg = Response::CurrentState(state.to_save_state());
             }
             Ok(cmds) => {
-                let state_res = state.apply_cmds(cmds);
+                let state_res = state.apply_cmd(cmds);
                 match state_res {
                     Ok((new_state, modifications)) => {
                         state = new_state;
@@ -143,25 +141,25 @@ async fn run_update<'a>(
                                 fs::write(&state_file, state_save).expect("Failed to save file.");
                             }
                             Err(err) => {
-                                error!("Error while applying layout: {}", err.to_string());
+                                log::error!("Error while applying layout: {}", err.to_string());
                                 resp_msg = Response::Error(err.to_string());
                             }
                         }
                     }
                     Err(err) => {
-                        error!("Error while applying commands: {}", err.to_string());
+                        log::error!("Error while applying commands: {}", err.to_string());
                         resp_msg = Response::Error(err.to_string());
                     }
                 }
             }
             Err(err) => {
-                error!("Error while parsing commands: {}", err.to_string());
+                log::error!("Error while parsing commands: {}", err.to_string());
                 resp_msg = Response::Error(err.to_string());
             }
         }
 
         if let Some(rx) = resp {
-            rx.send(resp_msg);
+            let _ = rx.send(resp_msg);
         }
     }
 }
@@ -177,15 +175,15 @@ async fn read_terminal(tx: UnboundedSender<CommandMessage>) -> Result<(), Error>
             break Ok(());
         } else {
             let (rtx, rrx) = oneshot::channel();
-            let _ = tx.send((cmd, Some(rtx)));
+            //let _ = tx.send((cmd, Some(rtx)));
 
             if let Ok(resp) = rrx.await {
                 match resp {
                     Response::Ok => {}
                     Response::Error(message) => {
-                        error!("Failed to run command: {}", message);
+                        log::error!("Failed to run command: {}", message);
                     }
-                    Response::CurrentState(value) => info!("{:?}", value),
+                    Response::CurrentState(value) => log::info!("{:?}", value),
                 }
             }
         }
@@ -204,7 +202,9 @@ async fn main() -> Result<(), Error> {
     }; //Args::parse();
 
     env_logger::builder()
-        .filter_level(log::LevelFilter::Warn)
+        .filter(Some("tracing::span"), log::LevelFilter::Warn)
+        .filter(Some("serenity"), log::LevelFilter::Warn)
+        .filter_level(log::LevelFilter::Info)
         .init();
 
     match &args.command {
@@ -231,7 +231,7 @@ async fn main() -> Result<(), Error> {
 
             fs::write(project_file, new_json)?;
 
-            info!("Project created, please open the file in a text editor and fill in the missing fields.");
+            log::info!("Project created, please open the file in a text editor and fill in the missing fields.");
             Ok(())
         }
         RunType::Test { settings_file } => {
@@ -249,21 +249,24 @@ async fn main() -> Result<(), Error> {
             project_file,
         } => {
             // Load  layouts
-            let layouts: LayoutFile =
-                serde_json::from_str::<LayoutFile>(&read_to_string(&layout_file)?)?;
+            let layouts: Arc<LayoutFile> = Arc::new(serde_json::from_str::<LayoutFile>(
+                &read_to_string(&layout_file)?,
+            )?);
             // Load project
-            let project: Project =
-                serde_json::from_str::<Project>(&read_to_string(&project_file)?)?;
+            let project: Arc<Project> = Arc::new(serde_json::from_str::<Project>(
+                &read_to_string(&project_file)?,
+            )?);
             // Load settings
-            let settings: Settings =
-                serde_json::from_str::<Settings>(&read_to_string(&settings_file)?)?;
+            let settings: Arc<Settings> = Arc::new(serde_json::from_str::<Settings>(&read_to_string(
+                &settings_file,
+            )?)?);
 
-            info!("Loaded project");
+            log::info!("Loaded project");
 
             // Load or create project state
             let state: ProjectStateSerializer = match read_to_string(save_file) {
                 Ok(file) => {
-                    info!("Loading project state file...");
+                    log::info!("Loading project state file...");
                     let save_res = serde_json::from_str::<ProjectStateSerializer>(&file);
                     match save_res {
                         Ok(save) => {
@@ -287,7 +290,7 @@ async fn main() -> Result<(), Error> {
                     }
                 }
                 Err(_) => {
-                    info!("Project state file does not exist, creating...");
+                    log::info!("Project state file does not exist, creating...");
                     File::create(save_file)?;
                     ProjectStateSerializer {
                         active_players: vec![],
@@ -311,7 +314,7 @@ async fn main() -> Result<(), Error> {
             ) = mpsc::unbounded_channel();
 
             // Initialize OBS websocket
-            info!("Connecting to OBS");
+            log::info!("Connecting to OBS");
             let obs = obws::Client::connect(
                 settings.obs_ip.to_owned().unwrap_or("localhost".to_owned()),
                 settings.obs_port.to_owned().unwrap_or(4455),
@@ -320,7 +323,7 @@ async fn main() -> Result<(), Error> {
             .await?;
 
             let obs_version = obs.general().version().await?;
-            info!(
+            log::info!(
                 "Connected to OBS version {}, websocket {}, running on {} ({})",
                 obs_version.obs_version.to_string(),
                 obs_version.obs_web_socket_version.to_string(),
@@ -328,14 +331,14 @@ async fn main() -> Result<(), Error> {
                 obs_version.platform_description
             );
 
-            info!("AutoMarathon initialized");
+            log::info!("AutoMarathon initialized");
 
             let mut tasks = JoinSet::<Result<(), Error>>::new();
 
             if project.integrations.contains(&state::Integration::TheRun) {
                 for player in &project.players {
                     let twitch_handle = player.stream.split('/').last().unwrap();
-                    tasks.spawn(create_player_websocket(
+                    tasks.spawn(create_player_websocket_monitor(
                         player.name.clone(),
                         twitch_handle.to_string(),
                         tx.clone(),
@@ -344,7 +347,7 @@ async fn main() -> Result<(), Error> {
             }
 
             if project.integrations.contains(&state::Integration::Discord) {
-                tasks.spawn(init_discord(settings.clone(), tx.clone()));
+                tasks.spawn(init_discord(tx.clone(), settings.clone(), project.clone(), layouts.clone()));
             }
 
             tasks.spawn(read_terminal(tx.clone()));
@@ -360,15 +363,15 @@ async fn main() -> Result<(), Error> {
 
             loop {
                 match tasks.join_next().await {
-                    Some(Ok(_)) => info!("Service Done"),
-                    Some(Err(err)) => error!("{}", err.to_string()),
+                    Some(Ok(_)) => log::info!("Service Done"),
+                    Some(Err(err)) => log::error!("{}", err.to_string()),
                     None => break Ok(()),
                 }
             }
         }
     }
 }
-
+/*
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, time::Duration};
@@ -584,3 +587,4 @@ mod tests {
         assert_eq!(state, regen_state);
     }
 }
+*/

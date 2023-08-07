@@ -3,11 +3,11 @@ use std::{convert::Infallible, collections::HashMap};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use warp::{http::Method, Filter};
 
-use crate::{error::Error, CommandMessage, Response};
+use crate::{error::Error, CommandMessage, Response, cmd::CommandSource};
 
 async fn process_req(tx: UnboundedSender<CommandMessage>) -> Result<impl warp::Reply, Infallible> {
     let (rtx, rrx) = oneshot::channel();
-    let _ = tx.send(("get_state".to_owned(), Some(rtx)));
+    let _ = tx.send((CommandSource::GetState, Some(rtx)));
 
     if let Ok(resp) = rrx.await {
         match resp {

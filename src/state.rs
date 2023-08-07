@@ -72,8 +72,15 @@ impl Project {
     pub fn find_by_nick(&self, name: &str) -> Option<&Player> {
         self.players.iter().find(|p| p.name_match(name))
     }
+
+    pub fn find_or_err(&self, user: &'_ str) -> Result<&Player, Error> {
+        self 
+            .find_by_nick(user)
+            .ok_or(Error::PlayerError(user.to_owned()))
+    }
 }
 
+/// Elements of ProjectState that were modified during a state change.
 #[derive(PartialEq)]
 pub enum ModifiedState<'a> {
     PlayerView(&'a Player),
@@ -83,6 +90,7 @@ pub enum ModifiedState<'a> {
     PlayerFields,
 }
 
+/// Returns a .m3u8 link corresponding to the current players' stream.
 pub fn find_stream(player: &Player) -> Result<String, Error> {
     let output = process::Command::new("streamlink")
         .arg("-Q")
@@ -111,22 +119,8 @@ pub fn find_stream(player: &Player) -> Result<String, Error> {
 
 
 impl<'a> ProjectState<'a> {
-    pub fn apply_cmds(
-        &self,
-        cmds: &Vec<Command<'a>>,
-    ) -> Result<(ProjectState<'a>, Vec<ModifiedState<'a>>), Error> {
-        let mut state = self.clone();
-        let mut modifications = Vec::<ModifiedState<'a>>::new();
 
-        for cmd in cmds {
-            let (new_state, mut changes) = state.apply_cmd(cmd)?;
-            state = new_state;
-            modifications.append(&mut changes);
-        }
-
-        Ok((state, modifications))
-    }
-
+    /// Apply a command onto the current project state, providing a new state.
     pub fn apply_cmd(
         &self,
         cmd: &Command<'a>,
@@ -247,6 +241,7 @@ impl<'a> ProjectState<'a> {
         }
     }
 
+    /// Updates the provided player's stream in this state, returning if the stream changed.
     pub fn update_stream(&mut self, player: &'a Player) -> Result<bool, Error> {
         let new_stream = find_stream(player)?;
         let old_stream = self.streams.get(player);
