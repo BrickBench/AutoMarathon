@@ -8,8 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite;
 use url::Url;
 
-use crate::{error::Error, CommandMessage, cmd::CommandSource};
-
+use crate::{cmd::CommandSource, error::Error, CommandMessage};
 
 ///Response type for therun.gg player websocket
 #[allow(non_snake_case)]
@@ -29,7 +28,7 @@ struct Run {
     currentComparison: String,
     pb: f64,
     currentSplitName: String,
-    currentSplitIndex: usize,
+    currentSplitIndex: isize,
     splits: Vec<Split>,
 }
 
@@ -69,7 +68,14 @@ pub async fn create_player_websocket_monitor(
             ),
         }
 
-        let _ = tx.send((CommandSource::SetPlayerField(player.clone(), "stats_active".to_string(), Some("false".to_string())), None));
+        //let _ = tx.send((
+        //    CommandSource::SetPlayerField(
+        //        player.clone(),
+        //        "stats_active".to_string(),
+        //        Some("false".to_string()),
+        //    ),
+        //    None,
+        //));
 
         thread::sleep(time::Duration::from_secs(30));
     }
@@ -84,40 +90,59 @@ async fn create_player_websocket(
     twitch: String,
     tx: UnboundedSender<CommandMessage>,
 ) -> Result<(), Error> {
-    let (mut stream, _) = tokio_tungstenite::connect_async(
+    let (stream, _) = tokio_tungstenite::connect_async(
         Url::parse(&format!("wss://ws.therun.gg/?username={}", twitch)).unwrap(),
     )
     .await?;
 
     log::info!("TheRun.gg WebSocket open for {} ({})", player, twitch);
 
-    while let Some(res) = stream.next().await {
-        match res {
-            Ok(msg) => {
-                let stats = serde_json::from_str::<RunnerStats>(msg.to_text()?)?;
+    stream
+        .for_each(|res| async {
+            match res {
+                Ok(msg) => {
+                    match serde_json::from_str::<RunnerStats>(
+                        msg.to_text().expect("Failed to get text"),
+                    )   {
+                        Ok(stats) => {
+                            let mut stats_map = HashMap::<String, Option<String>>::new();
+                            stats_map.insert(
+                                "stats_active".to_string(),
+                                Some((stats.run.currentSplitIndex >= 0).to_string()),
+                            );
+                            stats_map
+                                .insert("delta".to_string(), Some(stats.run.delta.to_string()));
+                            stats_map.insert(
+                                "best_possible".to_string(),
+                                Some(stats.run.bestPossible.to_string()),
+                            );
 
-                let mut stats_map = HashMap::<String, String>::new();
-                stats_map.insert("stats_active".to_string(), "true".to_string());
-                stats_map.insert("delta".to_string(), stats.run.delta.to_string());
-                stats_map.insert(
-                    "best_possible".to_string(),
-                    stats.run.bestPossible.to_string(),
-                );
+                            if stats.run.currentSplitIndex > 0 {
+                                if let Some(latest_time) = stats.run.splits
+                                    [stats.run.currentSplitIndex as usize - 1]
+                                    .splitTime
+                                {
+                                    stats_map.insert(
+                                        "last_split".to_string(),
+                                        Some(latest_time.to_string()),
+                                    );
+                                }
+                            }
 
-                if stats.run.currentSplitIndex > 0 {
-                    if let Some(latest_time) =
-                        stats.run.splits[stats.run.currentSplitIndex - 1].splitTime
-                    {
-                        stats_map.insert("last_split".to_string(), latest_time.to_string());
-                    }
+                            let _ = tx.send((
+                                CommandSource::SetPlayerFields(player.clone(), stats_map),
+                                None,
+                            ));
+                        }
+                        Err(err) => {
+                            log::warn!("Failed to parse {} endpoint: {}", player, err.to_string());
+                        },
+                    };
                 }
-
-
-                let _ = tx.send((CommandSource::SetPlayerFields(player.clone(), stats_map), None));
+                Err(err) => log::error!("{}", err.to_string().replace("\\\"", "\"")),
             }
-            Err(err) => log::error!("{}", err.to_string().replace("\\\"", "\"")),
-        }
-    }
+        })
+        .await;
 
     Ok(())
 }

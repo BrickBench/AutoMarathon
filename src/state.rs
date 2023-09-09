@@ -41,13 +41,14 @@ pub struct ProjectState<'a> {
     pub active_commentators: Vec<String>,
     pub ignored_commentators: Vec<String>,
     pub streams: HashMap<&'a Player, String>,
-    pub player_fields: FieldState<'a>,
+    pub fields: FieldState<'a>,
     pub layouts_by_count: HashMap<u32, &'a Layout>,
 }
 
 /// Holds state related to a specific project type
 #[derive(PartialEq, Debug, Clone)]
 pub struct FieldState<'a> {
+    event_fields: HashMap<String, String>,
     player_fields: HashMap<&'a Player, HashMap<String, String>>,
 }
 
@@ -65,6 +66,7 @@ pub struct ProjectStateSerializer {
 /// Holds state related to a specific project type
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct FieldStateSerializer {
+    pub event_fields: HashMap<String, String>,
     pub player_fields: HashMap<String, HashMap<String, String>>,
 }
 
@@ -74,9 +76,34 @@ impl Project {
     }
 
     pub fn find_or_err(&self, user: &'_ str) -> Result<&Player, Error> {
-        self 
-            .find_by_nick(user)
+        self.find_by_nick(user)
             .ok_or(Error::PlayerError(user.to_owned()))
+    }
+
+    pub fn get_allowed_fields(&self) -> Vec<String> {
+        let mut fields = Vec::<String>::new();
+
+        match &self.template {
+            ProjectTemplate::Marathon => {
+                fields.extend_from_slice(&["event_pb".to_string()]);
+            }
+        }
+
+        for integration in &self.integrations {
+            match &integration {
+                Integration::Discord => {}
+                Integration::TheRun => {
+                    fields.extend_from_slice(&[
+                        "delta".to_string(),
+                        "last_split".to_string(),
+                        "best_possible".to_string(),
+                        "stats_active".to_string(),
+                    ]);
+                }
+            }
+        }
+
+        fields
     }
 }
 
@@ -117,9 +144,7 @@ pub fn find_stream(player: &Player) -> Result<String, Error> {
     }
 }
 
-
 impl<'a> ProjectState<'a> {
-
     /// Apply a command onto the current project state, providing a new state.
     pub fn apply_cmd(
         &self,
@@ -134,11 +159,12 @@ impl<'a> ProjectState<'a> {
                     new_state.active_players.retain(|p| p != player);
                 } else {
                     new_state.active_players.push(player);
-                    if self.running && new_state.update_stream(player)? {
+                    if new_state.update_stream(player)? {
                         modifications.push(ModifiedState::PlayerStream(player));
                     }
                 }
 
+                modifications.push(ModifiedState::Layout);
                 Ok((new_state, modifications))
             }
             Command::Swap(p1, p2) => {
@@ -156,14 +182,14 @@ impl<'a> ProjectState<'a> {
                     new_state.active_players.insert(pos_p1.unwrap(), p2);
                     new_state.active_players.remove(pos_p1.unwrap() + 1);
 
-                    if self.running && new_state.update_stream(p1)? {
+                    if new_state.update_stream(p1)? {
                         modifications.push(ModifiedState::PlayerStream(p1));
                     }
                 } else if pos_p2.is_some() {
                     new_state.active_players.insert(pos_p2.unwrap(), p1);
                     new_state.active_players.remove(pos_p2.unwrap() + 1);
 
-                    if self.running && new_state.update_stream(p2)? {
+                    if new_state.update_stream(p2)? {
                         modifications.push(ModifiedState::PlayerStream(p2));
                     }
                 }
@@ -172,13 +198,19 @@ impl<'a> ProjectState<'a> {
             }
             Command::SetPlayers(players) => {
                 for player in players {
-                    if !new_state.active_players.contains(player) && self.running && new_state.update_stream(player)? {
+                    if !new_state.active_players.contains(player)
+                        && new_state.update_stream(player)?
+                    {
                         modifications.push(ModifiedState::PlayerStream(player));
                     }
                 }
 
+                if new_state.active_players.len() != players.len() {
+                    modifications.push(ModifiedState::Layout);
+                }
+
                 new_state.active_players.clear();
-                
+
                 for player in players {
                     modifications.push(ModifiedState::PlayerView(player));
                     new_state.active_players.push(player);
@@ -186,41 +218,67 @@ impl<'a> ProjectState<'a> {
 
                 Ok((new_state, modifications))
             }
-            Command::Refresh(players) if self.running => {
+            Command::Refresh(players) => {
                 for player in players {
-                    if self.running && new_state.update_stream(player)? {
+                    if new_state.active_players.contains(player)
+                    {
+                        new_state.update_stream(player)?;
                         modifications.push(ModifiedState::PlayerStream(player));
                     }
                 }
+
                 Ok((new_state, modifications))
             }
-            Command::Refresh(_) => Err(Error::ProjectStateError(
-                "Cannot refresh streams while project is inactive.".to_owned(),
-            )),
             Command::Layout(count, layout) => {
                 modifications.push(ModifiedState::Layout);
                 new_state.layouts_by_count.insert(*count, layout);
                 Ok((new_state, modifications))
             }
-            Command::SetPlayerField(player, field, value) => {
-                let player_state = new_state.player_fields
-                    .player_fields.get_mut(player).unwrap();
+            Command::SetEventFields(fields) => {
+                for (field, val) in fields.iter() {
+                    match val {
+                        Some(v) => {
+                            new_state
+                                .fields
+                                .event_fields
+                                .insert(field.to_string(), v.to_string());
+                        }
+                        None => {
+                            new_state.fields.event_fields.remove(field);
+                        }
+                    }
+                }
 
-                match value {
-                    Some(val) => player_state.insert(field.to_string(), val.to_string()),
-                    None => player_state.remove(field)
-                };
-                
                 modifications.push(ModifiedState::PlayerFields);
 
                 Ok((new_state, modifications))
             }
             Command::SetPlayerFields(player, fields) => {
-                new_state.player_fields.player_fields.get_mut(player).unwrap().extend(fields.clone());
+                for (field, val) in fields.iter() {
+                    match val {
+                        Some(v) => {
+                            new_state
+                                .fields
+                                .player_fields
+                                .get_mut(player)
+                                .unwrap()
+                                .insert(field.to_string(), v.to_string());
+                        }
+                        None => {
+                            new_state
+                                .fields
+                                .player_fields
+                                .get_mut(player)
+                                .unwrap()
+                                .remove(field);
+                        }
+                    }
+                }
+
                 modifications.push(ModifiedState::PlayerFields);
 
                 Ok((new_state, modifications))
-            },
+            }
             Command::SetCommentaryIgnore(ignored) => {
                 if !new_state.ignored_commentators.eq(ignored) {
                     modifications.push(ModifiedState::Commentary);
@@ -228,15 +286,15 @@ impl<'a> ProjectState<'a> {
                 }
 
                 Ok((new_state, modifications))
-            },
+            }
             Command::SetCommentary(comms) => {
                 if !new_state.active_commentators.eq(comms) {
                     modifications.push(ModifiedState::Commentary);
                     new_state.active_commentators = comms.clone();
                 }
-        
+
                 Ok((new_state, modifications))
-            },
+            }
             Command::GetState => panic!("Should not get here"),
         }
     }
@@ -245,13 +303,14 @@ impl<'a> ProjectState<'a> {
     pub fn update_stream(&mut self, player: &'a Player) -> Result<bool, Error> {
         let new_stream = find_stream(player)?;
         let old_stream = self.streams.get(player);
-        match !old_stream.is_some() || old_stream.unwrap().eq(&new_stream) {
-            true => {
-                self.streams.insert(player, new_stream);
-                Ok(true)
-            }
-            false => Ok(false),
-        }
+        log::debug!("Acquired new stream for {}", player.name);
+        //    match !old_stream.is_some() || !old_stream.unwrap().eq(&new_stream) {
+        //      true => {
+        self.streams.insert(player, new_stream);
+        Ok(true)
+        //    }
+        //    false => Ok(false),
+        //  }
     }
 
     pub fn to_save_state(&self) -> ProjectStateSerializer {
@@ -263,7 +322,7 @@ impl<'a> ProjectState<'a> {
                 .collect(),
             active_commentators: self.active_commentators.clone(),
             ignored_commentators: self.ignored_commentators.clone(),
-            player_fields: self.player_fields.to_save_state(),
+            player_fields: self.fields.to_save_state(),
             layouts_by_count: self
                 .layouts_by_count
                 .iter()
@@ -294,7 +353,7 @@ impl<'a> ProjectState<'a> {
             active_commentators: save.active_commentators.clone(),
             ignored_commentators: save.ignored_commentators.clone(),
             streams: HashMap::new(),
-            player_fields: FieldState::from_save_state(&save.player_fields, project)?,
+            fields: FieldState::from_save_state(&save.player_fields, project)?,
             layouts_by_count: save
                 .layouts_by_count
                 .iter()
@@ -317,6 +376,7 @@ impl<'a> ProjectState<'a> {
 impl<'a> FieldState<'a> {
     pub fn to_save_state(&self) -> FieldStateSerializer {
         FieldStateSerializer {
+            event_fields: self.event_fields.to_owned(),
             player_fields: self
                 .player_fields
                 .iter()
@@ -329,7 +389,8 @@ impl<'a> FieldState<'a> {
         save: &FieldStateSerializer,
         project: &'a Project,
     ) -> Result<FieldState<'a>, Error> {
-        save.player_fields
+        let player_fields = save
+            .player_fields
             .iter()
             .map(|(name, time)| {
                 project
@@ -340,9 +401,11 @@ impl<'a> FieldState<'a> {
                     )))
                     .map(|usr| (usr, time.to_owned()))
             })
-            .collect::<Result<Vec<(&Player, HashMap<String, String>)>, Error>>()
-            .map(|fields| FieldState {
-                player_fields: fields.into_iter().collect(),
-            })
+            .collect::<Result<Vec<(&Player, HashMap<String, String>)>, Error>>()?;
+
+        Ok(FieldState {
+            event_fields: save.event_fields.to_owned(),
+            player_fields: player_fields.into_iter().collect(),
+        })
     }
 }

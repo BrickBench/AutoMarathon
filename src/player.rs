@@ -7,7 +7,9 @@ pub struct Player {
     /// Nicknames for commands
     pub nicks: Vec<String>,
     /// Link to Twitch channel
-    pub stream: String
+    pub stream: String,
+    // TheRun.gg username (if it differs from Twitch)
+    pub therun: Option<String>
 }
 
 impl Player {
@@ -15,6 +17,10 @@ impl Player {
     /// Return if the provided name matches this player's name or nicknames.
     pub fn name_match(&self, name: &str) -> bool {
         if self.name.to_lowercase() == name.to_lowercase() {
+            return true;
+        }
+
+        if self.therun.as_ref().map(|tr| name.to_lowercase() == tr.to_lowercase()).unwrap_or(false) {
             return true;
         }
 

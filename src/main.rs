@@ -107,6 +107,7 @@ async fn run_update<'a>(
     project: Arc<Project>,
     state_src: ProjectStateSerializer,
     obs_cfg: Arc<LayoutFile>,
+    settings: Arc<Settings>,
     state_file: PathBuf,
     mut rx: UnboundedReceiver<CommandMessage>,
     obs: obws::Client,
@@ -132,19 +133,32 @@ async fn run_update<'a>(
                 let state_res = state.apply_cmd(cmds);
                 match state_res {
                     Ok((new_state, modifications)) => {
-                        state = new_state;
-
-                        match update_obs(&project, &state, modifications, &obs_cfg, &obs).await {
-                            Ok(_) => {
-                                let state_save =
-                                    serde_json::to_string_pretty(&state.to_save_state()).unwrap();
-                                fs::write(&state_file, state_save).expect("Failed to save file.");
+                        if !modifications.is_empty() {
+                            match update_obs(
+                                &project,
+                                &new_state,
+                                &settings,
+                                modifications,
+                                &obs_cfg,
+                                &obs,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    state = new_state;
+                                }
+                                Err(err) => {
+                                    log::error!("Error while applying layout: {}", err.to_string());
+                                    resp_msg = Response::Error(err.to_string());
+                                }
                             }
-                            Err(err) => {
-                                log::error!("Error while applying layout: {}", err.to_string());
-                                resp_msg = Response::Error(err.to_string());
-                            }
+                        } else {
+                            state = new_state;
                         }
+
+                        let state_save =
+                            serde_json::to_string_pretty(&state.to_save_state()).unwrap();
+                        fs::write(&state_file, state_save).expect("Failed to save file.");
                     }
                     Err(err) => {
                         log::error!("Error while applying commands: {}", err.to_string());
@@ -204,7 +218,8 @@ async fn main() -> Result<(), Error> {
     env_logger::builder()
         .filter(Some("tracing::span"), log::LevelFilter::Warn)
         .filter(Some("serenity"), log::LevelFilter::Warn)
-        .filter_level(log::LevelFilter::Info)
+        .filter(Some("hyper"), log::LevelFilter::Warn)
+        .filter_level(log::LevelFilter::Debug)
         .init();
 
     match &args.command {
@@ -221,6 +236,7 @@ async fn main() -> Result<(), Error> {
                         name: p.to_owned(),
                         nicks: vec![],
                         stream: "FILL_THIS".to_owned(),
+                        therun: None
                     })
                     .collect(),
                 integrations: [].to_vec(),
@@ -257,9 +273,9 @@ async fn main() -> Result<(), Error> {
                 &read_to_string(&project_file)?,
             )?);
             // Load settings
-            let settings: Arc<Settings> = Arc::new(serde_json::from_str::<Settings>(&read_to_string(
-                &settings_file,
-            )?)?);
+            let settings: Arc<Settings> = Arc::new(serde_json::from_str::<Settings>(
+                &read_to_string(&settings_file)?,
+            )?);
 
             log::info!("Loaded project");
 
@@ -277,6 +293,7 @@ async fn main() -> Result<(), Error> {
                         Err(_) => ProjectStateSerializer {
                             active_players: vec![],
                             player_fields: FieldStateSerializer {
+                                event_fields: HashMap::new(),
                                 player_fields: project
                                     .players
                                     .iter()
@@ -295,6 +312,7 @@ async fn main() -> Result<(), Error> {
                     ProjectStateSerializer {
                         active_players: vec![],
                         player_fields: FieldStateSerializer {
+                            event_fields: HashMap::new(),
                             player_fields: project
                                 .players
                                 .iter()
@@ -337,17 +355,22 @@ async fn main() -> Result<(), Error> {
 
             if project.integrations.contains(&state::Integration::TheRun) {
                 for player in &project.players {
-                    let twitch_handle = player.stream.split('/').last().unwrap();
+                    let therun = player.therun.to_owned().unwrap_or(player.stream.split('/').last().unwrap().to_string());
                     tasks.spawn(create_player_websocket_monitor(
                         player.name.clone(),
-                        twitch_handle.to_string(),
+                        therun.to_string(),
                         tx.clone(),
                     ));
                 }
             }
 
             if project.integrations.contains(&state::Integration::Discord) {
-                tasks.spawn(init_discord(tx.clone(), settings.clone(), project.clone(), layouts.clone()));
+                tasks.spawn(init_discord(
+                    tx.clone(),
+                    settings.clone(),
+                    project.clone(),
+                    layouts.clone(),
+                ));
             }
 
             tasks.spawn(read_terminal(tx.clone()));
@@ -356,6 +379,7 @@ async fn main() -> Result<(), Error> {
                 project,
                 state,
                 layouts,
+                settings,
                 save_file.to_owned(),
                 rx,
                 obs,

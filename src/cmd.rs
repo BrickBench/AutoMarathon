@@ -13,8 +13,8 @@ pub enum CommandSource {
     Toggle(String),
     Swap(String, String),
     SetPlayers(Vec<String>),
-    SetPlayerField(String, String, Option<String>),
-    SetPlayerFields(String, HashMap<String, String>),
+    SetPlayerFields(String, HashMap<String, Option<String>>),
+    SetEventFields(HashMap<String, Option<String>>),
     Refresh(Vec<String>),
     Layout(String),
     Commentary(Vec<String>),
@@ -28,8 +28,8 @@ pub enum Command<'a> {
     Toggle(&'a Player),
     Swap(&'a Player, &'a Player),
     SetPlayers(Vec<&'a Player>),
-    SetPlayerField(&'a Player, String, Option<String>),
-    SetPlayerFields(&'a Player, HashMap<String, String>),
+    SetPlayerFields(&'a Player, HashMap<String, Option<String>>),
+    SetEventFields(HashMap<String, Option<String>>),
     Refresh(Vec<&'a Player>),
     Layout(u32, &'a Layout),
     SetCommentaryIgnore(Vec<String>),
@@ -62,15 +62,6 @@ pub fn parse_cmd<'a>(
             .map(|e| project.find_or_err(&e))
             .collect::<Result<Vec<&Player>, Error>>()
             .map(|ps| Command::SetPlayers(ps)),
-        CommandSource::SetPlayerField(runner, field, opt) => {
-            let player = project.find_or_err(runner)?;
-
-            Ok(Command::SetPlayerField(
-                player,
-                field.to_string(),
-                opt.as_ref().map(|s| s.to_string()),
-            ))
-        }
         CommandSource::SetPlayerFields(player, fields) => {
             let player = project.find_or_err(player)?;
 
