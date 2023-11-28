@@ -71,15 +71,14 @@ pub struct FieldStateSerializer {
 }
 
 impl Project {
-    pub fn find_by_nick(&self, name: &str) -> Option<&Player> {
+
+    /// Return a player by name or nickname, or return error
+    pub fn find_player(&self, name: &'_ str) -> Result<&Player, Error> {
         self.players.iter().find(|p| p.name_match(name))
+            .ok_or(Error::PlayerError(name.to_owned()))
     }
 
-    pub fn find_or_err(&self, user: &'_ str) -> Result<&Player, Error> {
-        self.find_by_nick(user)
-            .ok_or(Error::PlayerError(user.to_owned()))
-    }
-
+    /// Returns which project fields this project supports
     pub fn get_allowed_fields(&self) -> Vec<String> {
         let mut fields = Vec::<String>::new();
 
@@ -131,7 +130,7 @@ pub fn find_stream(player: &Player) -> Result<String, Error> {
     let json = std::str::from_utf8(output.stdout.as_slice())
         .map_err(|_| Error::ParseError("Failed to decipher stream.".to_owned()))?;
 
-    let parsed_json: Value = serde_json::from_str(json).unwrap();
+    let parsed_json: Value = serde_json::from_str(json).expect("Unable to parse streamlink output");
     if parsed_json.get("error").is_some() {
         Err(Error::StreamAcqError(
             player.name.clone(),
@@ -343,8 +342,8 @@ impl<'a> ProjectState<'a> {
                 .iter()
                 .map(|p| {
                     project
-                        .find_by_nick(p)
-                        .ok_or(Error::ProjectLoadError(format!(
+                        .find_player(p)
+                        .map_err(|_| Error::ProjectLoadError(format!(
                             "Failed to find player {} when loading file",
                             p
                         )))
@@ -394,8 +393,8 @@ impl<'a> FieldState<'a> {
             .iter()
             .map(|(name, time)| {
                 project
-                    .find_by_nick(name)
-                    .ok_or(Error::ProjectLoadError(format!(
+                    .find_player(name)
+                    .map_err(|_| Error::ProjectLoadError(format!(
                         "Failed to find player {} when loading file",
                         name
                     )))

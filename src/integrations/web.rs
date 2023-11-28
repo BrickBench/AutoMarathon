@@ -43,6 +43,7 @@ pub async fn run_http_server(tx: UnboundedSender<CommandMessage>) -> Result<(), 
             "Access-Control-Allow-Headers",
         ])
         .allow_methods(&[Method::GET, Method::POST, Method::DELETE]);
+
     let user_endpoint = warp::path("users")
         .and(warp::path::end())
         .and_then(move || {

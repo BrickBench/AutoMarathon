@@ -44,10 +44,10 @@ pub fn parse_cmd<'a>(
     layouts: &'a LayoutFile,
 ) -> Result<Command<'a>, Error> {
     match cmd {
-        CommandSource::Toggle(runner) => project.find_or_err(runner).map(|u| Command::Toggle(u)),
+        CommandSource::Toggle(runner) => project.find_player(runner).map(|u| Command::Toggle(u)),
         CommandSource::Swap(r1, r2)=> {
-            let p1 = project.find_or_err(&r1)?;
-            let p2 = project.find_or_err(&r2)?;
+            let p1 = project.find_player(&r1)?;
+            let p2 = project.find_player(&r2)?;
 
             if p1 == p2 {
                 Err(Error::CommandError(
@@ -59,16 +59,16 @@ pub fn parse_cmd<'a>(
         },
         CommandSource::SetPlayers(players) => players
             .into_iter()
-            .map(|e| project.find_or_err(&e))
+            .map(|e| project.find_player(&e))
             .collect::<Result<Vec<&Player>, Error>>()
             .map(|ps| Command::SetPlayers(ps)),
         CommandSource::SetPlayerFields(player, fields) => {
-            let player = project.find_or_err(player)?;
+            let player = project.find_player(player)?;
 
             Ok(Command::SetPlayerFields(player, fields.clone()))
         }
         CommandSource::Refresh(users) if users.len() != 0 => users.into_iter() 
-            .map(|e| project.find_or_err(e))
+            .map(|e| project.find_player(e))
             .collect::<Result<Vec<&Player>, Error>>()
             .map(|ps| Command::Refresh(ps)),
         CommandSource::Refresh(users) if users.len() == 0 => Ok(Command::Refresh(project.players.iter().collect())),

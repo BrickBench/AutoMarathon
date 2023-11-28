@@ -2,7 +2,8 @@ use std::{
     collections::HashMap,
     fs::{self, read_to_string, File},
     path::PathBuf,
-    sync::Arc,
+    sync::Arc, 
+    env::consts,
 };
 
 use clap::{Parser, Subcommand};
@@ -19,31 +20,28 @@ use tokio::{
 
 use crate::{
     cmd::{parse_cmd, Command},
-    discord::init_discord,
-    discord::test_discord,
+    integrations::discord::test_discord,
     obs::update_obs,
     obs::LayoutFile,
     player::Player,
     settings::Settings,
     state::{FieldStateSerializer, Project, ProjectState, ProjectStateSerializer, ProjectTemplate},
-    therun::create_player_websocket_monitor,
-    web::run_http_server,
 };
 
 mod cmd;
-mod discord;
 mod error;
+mod integrations;
 mod obs;
 mod player;
 mod settings;
 mod state;
-mod therun;
-mod web;
+
+const AUTOMARATHON_VER: &str = "0.1";
 
 #[derive(Parser, Debug)]
 #[command(name = "AutoMarathon")]
 #[command(author = "javster101")]
-#[command(version = "0.1")]
+#[command(version = AUTOMARATHON_VER)]
 #[command(about = "An automation tool for speedrunning events.", long_about = None)]
 struct Args {
     #[command(subcommand)]
@@ -222,7 +220,10 @@ async fn main() -> Result<(), Error> {
         .filter_level(log::LevelFilter::Debug)
         .init();
 
+    log::info!("Launching AutoMarathon {} on {}", AUTOMARATHON_VER, consts::OS);
+
     match &args.command {
+        // Create an empty project file
         RunType::Create {
             project_type,
             players,
@@ -236,7 +237,7 @@ async fn main() -> Result<(), Error> {
                         name: p.to_owned(),
                         nicks: vec![],
                         stream: "FILL_THIS".to_owned(),
-                        therun: None
+                        therun: None,
                     })
                     .collect(),
                 integrations: [].to_vec(),
@@ -250,6 +251,8 @@ async fn main() -> Result<(), Error> {
             log::info!("Project created, please open the file in a text editor and fill in the missing fields.");
             Ok(())
         }
+
+        // Test for a valid project file
         RunType::Test { settings_file } => {
             let settings: Settings =
                 serde_json::from_str::<Settings>(&read_to_string(&settings_file)?)?;
@@ -258,6 +261,8 @@ async fn main() -> Result<(), Error> {
 
             Ok(())
         }
+
+        // Run a project
         RunType::Run {
             save_file,
             layout_file,
@@ -268,10 +273,12 @@ async fn main() -> Result<(), Error> {
             let layouts: Arc<LayoutFile> = Arc::new(serde_json::from_str::<LayoutFile>(
                 &read_to_string(&layout_file)?,
             )?);
+
             // Load project
             let project: Arc<Project> = Arc::new(serde_json::from_str::<Project>(
                 &read_to_string(&project_file)?,
             )?);
+
             // Load settings
             let settings: Arc<Settings> = Arc::new(serde_json::from_str::<Settings>(
                 &read_to_string(&settings_file)?,
@@ -326,11 +333,6 @@ async fn main() -> Result<(), Error> {
                 }
             };
 
-            let (tx, rx): (
-                UnboundedSender<CommandMessage>,
-                UnboundedReceiver<CommandMessage>,
-            ) = mpsc::unbounded_channel();
-
             // Initialize OBS websocket
             log::info!("Connecting to OBS");
             let obs = obws::Client::connect(
@@ -351,37 +353,32 @@ async fn main() -> Result<(), Error> {
 
             log::info!("AutoMarathon initialized");
 
+            // Set up messaging channels
+            let (command_sender, command_receiver): (
+                UnboundedSender<CommandMessage>,
+                UnboundedReceiver<CommandMessage>,
+            ) = mpsc::unbounded_channel();
+
             let mut tasks = JoinSet::<Result<(), Error>>::new();
 
-            if project.integrations.contains(&state::Integration::TheRun) {
-                for player in &project.players {
-                    let therun = player.therun.to_owned().unwrap_or(player.stream.split('/').last().unwrap().to_string());
-                    tasks.spawn(create_player_websocket_monitor(
-                        player.name.clone(),
-                        therun.to_string(),
-                        tx.clone(),
-                    ));
-                }
-            }
+            // Spawn optional integrations
+            integrations::init_integrations(
+                &mut tasks,
+                command_sender.clone(),
+                settings.clone(),
+                layouts.clone(),
+                project.clone(),
+            );
 
-            if project.integrations.contains(&state::Integration::Discord) {
-                tasks.spawn(init_discord(
-                    tx.clone(),
-                    settings.clone(),
-                    project.clone(),
-                    layouts.clone(),
-                ));
-            }
-
-            tasks.spawn(read_terminal(tx.clone()));
-            tasks.spawn(run_http_server(tx.clone()));
+            // Spawn main task.
+            tasks.spawn(read_terminal(command_sender.clone()));
             tasks.spawn(run_update(
                 project,
                 state,
                 layouts,
                 settings,
                 save_file.to_owned(),
-                rx,
+                command_receiver,
                 obs,
             ));
 
@@ -395,220 +392,3 @@ async fn main() -> Result<(), Error> {
         }
     }
 }
-/*
-#[cfg(test)]
-mod tests {
-    use std::{collections::HashMap, time::Duration};
-
-    use crate::{
-        cmd::{parse_cmd, Command},
-        obs::LayoutFile,
-        player::Player,
-        state::{FieldState, Project, ProjectState, ProjectStateSerializer, ProjectTemplate},
-    };
-
-    #[test]
-    fn test_nicks() {
-        let project = Project {
-            kind: ProjectTemplate::Marathon,
-            players: vec![
-                Player {
-                    name: "Joe".to_owned(),
-                    nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    stream: "test".to_owned(),
-                },
-                Player {
-                    name: "William".to_owned(),
-                    nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    stream: "test2".to_owned(),
-                },
-            ],
-        };
-
-        assert_eq!(project.find_by_nick("Joe").unwrap().name, "Joe");
-        assert_eq!(project.find_by_nick("john").unwrap().name, "Joe");
-        assert!(project.find_by_nick("Jow").is_none());
-    }
-
-    #[test]
-    fn test_cmds() {
-        let project = Project {
-            kind: ProjectTemplate::Marathon,
-            players: vec![
-                Player {
-                    name: "Joe".to_owned(),
-                    nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    stream: "test".to_owned(),
-                },
-                Player {
-                    name: "William".to_owned(),
-                    nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    stream: "test2".to_owned(),
-                },
-            ],
-        };
-
-        let state = ProjectState {
-            running: false,
-            active_players: vec![],
-            streams: HashMap::new(),
-            player_fields: FieldState::MarathonState {
-                runner_times: HashMap::new(),
-            },
-            layouts_by_count: HashMap::new(),
-        };
-
-        let layouts = LayoutFile {
-            scene: "Scene".to_string(),
-            layouts: HashMap::new(),
-        };
-
-        assert_eq!(
-            Command::Toggle(&project.players[0]),
-            parse_cmd("!toggle john", &project, &layouts, &state).unwrap()
-        );
-
-        assert_eq!(
-            Command::Swap(&project.players[0], &project.players[1]),
-            parse_cmd("!swap john bill", &project, &layouts, &state).unwrap()
-        );
-        assert!(parse_cmd("!swap john sam", &project, &layouts, &state).is_err());
-        assert!(parse_cmd("!swap john will bill", &project, &layouts, &state).is_err());
-        assert!(parse_cmd("!swap bill will", &project, &layouts, &state).is_err());
-
-        assert_eq!(
-            Command::SetPlayers(vec!(&project.players[0], &project.players[1])),
-            parse_cmd("!set john bill", &project, &layouts, &state).unwrap()
-        );
-        assert!(parse_cmd("!set earl bill", &project, &layouts, &state).is_err());
-        assert!(parse_cmd("!set bill will dill", &project, &layouts, &state).is_err());
-
-        assert_eq!(
-            Command::SetEventRecord(&project.players[0], Duration::from_millis(222)),
-            parse_cmd("!record joe 222", &project, &layouts, &state).unwrap()
-        );
-        assert!(parse_cmd("!record joe 22e", &project, &layouts, &state).is_err());
-    }
-
-    #[test]
-    fn test_cmd_apply() {
-        let project = Project {
-            kind: ProjectTemplate::Marathon,
-            players: vec![
-                Player {
-                    name: "Joe".to_owned(),
-                    nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    stream: "test".to_owned(),
-                },
-                Player {
-                    name: "William".to_owned(),
-                    nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    stream: "test2".to_owned(),
-                },
-            ],
-        };
-
-        let mut state = ProjectState {
-            running: false,
-            active_players: vec![],
-            streams: HashMap::new(),
-            player_fields: FieldState::MarathonState {
-                runner_times: HashMap::new(),
-            },
-            layouts_by_count: HashMap::new(),
-        };
-
-        let layouts = LayoutFile {
-            scene: "Scene".to_string(),
-            layouts: HashMap::new(),
-        };
-
-        state = state
-            .apply_cmd(&parse_cmd("!toggle joe", &project, &layouts, &state).unwrap())
-            .unwrap();
-        assert_eq!(state.active_players[0].name, "Joe");
-
-        state = state
-            .apply_cmd(&parse_cmd("!swap joe will", &project, &layouts, &state).unwrap())
-            .unwrap();
-        assert_eq!(state.active_players[0].name, "William");
-
-        state = state
-            .apply_cmd(&parse_cmd("!swap joe will", &project, &layouts, &state).unwrap())
-            .unwrap();
-        assert_eq!(state.active_players[0].name, "Joe");
-
-        state = state
-            .apply_cmd(&parse_cmd("!set joe will", &project, &layouts, &state).unwrap())
-            .unwrap();
-        assert_eq!(state.active_players[0].name, "Joe");
-        assert_eq!(state.active_players[1].name, "William");
-
-        state = state
-            .apply_cmd(&parse_cmd("!swap joe will", &project, &layouts, &state).unwrap())
-            .unwrap();
-        assert_eq!(state.active_players[0].name, "William");
-        assert_eq!(state.active_players[1].name, "Joe");
-
-        state = state
-            .apply_cmd(&parse_cmd("!toggle joe", &project, &layouts, &state).unwrap())
-            .unwrap();
-        assert_eq!(state.active_players[0].name, "William");
-
-        assert!(state
-            .apply_cmd(&parse_cmd("!refresh", &project, &layouts, &state).unwrap())
-            .is_err());
-    }
-
-    #[test]
-    fn test_serialization() {
-        let layouts = LayoutFile {
-            scene: "Scene".to_string(),
-            layouts: HashMap::new(),
-        };
-
-        let project = Project {
-            kind: ProjectTemplate::Marathon,
-            players: vec![
-                Player {
-                    name: "Joe".to_owned(),
-                    nicks: vec!["Joseph".to_owned(), "John".to_owned()],
-                    stream: "test".to_owned(),
-                },
-                Player {
-                    name: "William".to_owned(),
-                    nicks: vec!["Will".to_owned(), "Bill".to_owned()],
-                    stream: "test2".to_owned(),
-                },
-            ],
-        };
-
-        let saved_project = serde_json::to_string(&project).unwrap();
-        let regen_project: Project = serde_json::from_str(&saved_project).unwrap();
-
-        assert_eq!(project, regen_project);
-
-        let mut state = ProjectState {
-            running: false,
-            active_players: vec![],
-            streams: HashMap::new(),
-            player_fields: FieldState::MarathonState {
-                runner_times: HashMap::new(),
-            },
-            layouts_by_count: HashMap::new(),
-        };
-
-        state = state
-            .apply_cmd(&parse_cmd("!toggle joe", &project, &layouts, &state).unwrap())
-            .unwrap();
-
-        let saved_state = serde_json::to_string(&state.to_save_state()).unwrap();
-        let regen_state_serial: ProjectStateSerializer =
-            serde_json::from_str(&saved_state).unwrap();
-        let regen_state =
-            ProjectState::from_save_state(&regen_state_serial, &project, &layouts).unwrap();
-
-        assert_eq!(state, regen_state);
-    }
-}
-*/

@@ -28,16 +28,19 @@ pub struct Layout {
     pub players: usize,
 }
 
+// OBS FreeType settings parameters
 #[derive(Serialize)]
 struct SpecificFreetype<'a> {
     text: &'a str,
 }
 
+// OBS VLC source parameters
 #[derive(Serialize)]
 struct VLC<'a> {
     playlist: Vec<PlaylistItem<'a>>,
 }
 
+// OBS PlaylistItem parameters
 #[derive(Serialize)]
 struct PlaylistItem<'a> {
     hidden: bool,
@@ -45,6 +48,7 @@ struct PlaylistItem<'a> {
     value: &'a str,
 }
 
+// Apply project state to OBS
 pub async fn update_obs<'a>(
     project: &Project,
     state: &ProjectState<'a>,
