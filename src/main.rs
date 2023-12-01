@@ -204,20 +204,13 @@ async fn read_terminal(tx: UnboundedSender<CommandMessage>) -> Result<(), Error>
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args = Args {
-        command: RunType::Run {
-            save_file: PathBuf::from("save.json"),
-            layout_file: PathBuf::from("layouts.json"),
-            settings_file: PathBuf::from("settings.json"),
-            project_file: PathBuf::from("proj.json"),
-        },
-    }; //Args::parse();
+    let args = Args::parse();
 
     env_logger::builder()
         .filter(Some("tracing::span"), log::LevelFilter::Warn)
         .filter(Some("serenity"), log::LevelFilter::Warn)
         .filter(Some("hyper"), log::LevelFilter::Warn)
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Info)
         .init();
 
     log::info!("Launching AutoMarathon {} on {}", AUTOMARATHON_VER, consts::OS);

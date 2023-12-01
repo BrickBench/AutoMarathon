@@ -1,0 +1,25 @@
+name: automarathon-build
+on:
+  push:
+    tags:
+      - 'v*'      
+
+jobs:
+  publish-archives:
+    name: Publish archives
+    strategy:
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build project
+        run: cargo build --release
+      - name: Release-Windows
+        if: contains(matrix.os, 'windows')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            ./target/release/automarathon.exe
+
