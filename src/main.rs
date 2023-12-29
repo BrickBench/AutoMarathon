@@ -1,15 +1,13 @@
 use std::{
-    collections::HashMap,
-    fs::{self, read_to_string, File},
-    path::PathBuf,
-    sync::Arc, 
     env::consts,
+    fs::{self, read_to_string},
+    path::PathBuf,
+    sync::Arc, collections::HashMap,
 };
 
 use clap::{Parser, Subcommand};
 
-use cmd::CommandSource;
-use error::Error;
+use project::ProjectType;
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -19,24 +17,62 @@ use tokio::{
 };
 
 use crate::{
-    cmd::{parse_cmd, Command},
     integrations::discord::test_discord,
-    obs::update_obs,
-    obs::LayoutFile,
+    obs::{run_obs, LayoutFile, ObsActor},
     player::Player,
+    project::{Project, ProjectTypeSettings},
     settings::Settings,
-    state::{FieldStateSerializer, Project, ProjectState, ProjectStateSerializer, ProjectTemplate},
+    state::{run_state_manager, StateActor},
 };
 
-mod cmd;
 mod error;
 mod integrations;
 mod obs;
 mod player;
+mod project;
 mod settings;
 mod state;
 
 const AUTOMARATHON_VER: &str = "0.1";
+
+struct ActorRef<T> {
+    tx: UnboundedSender<T>,
+}
+
+impl<T> ActorRef<T> {
+    pub fn send(&self, msg: T) {
+        let _ = self.tx.send(msg);
+    }
+
+    pub fn new() -> (Self, UnboundedReceiver<T>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        (Self { tx }, rx)
+    }
+}
+
+impl<T> Clone for ActorRef<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+struct Rto<T> {
+    rto: oneshot::Sender<Result<T, anyhow::Error>>,
+}
+
+impl<T> Rto<T> {
+    pub fn reply(self, msg: Result<T, anyhow::Error>) {
+        let _ = self.rto.send(msg);
+    }
+
+    pub fn new() -> (Rto<T>, oneshot::Receiver<Result<T, anyhow::Error>>) {
+        let (tx, rx) = oneshot::channel::<Result<T, anyhow::Error>>();
+        (Self { rto: tx }, rx)
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "AutoMarathon")]
@@ -54,7 +90,7 @@ enum RunType {
     /// The output .json file will need to be manually edited to fill in details for players.
     Create {
         #[arg(short = 't', long)]
-        project_type: ProjectTemplate,
+        project_type: ProjectType,
 
         /// List of players to initialize.
         #[arg(short = 'p', long, use_value_delimiter = true, value_delimiter = ',')]
@@ -72,138 +108,12 @@ enum RunType {
 
     /// Run a project sourced from a project file.
     Run {
-        /// Location for project state save file.
-        #[arg(short, long)]
-        save_file: PathBuf,
-
-        /// Location for OBS configuration and layout file.
-        /// A sample is provided in the `obs/layouts` directory.
-        #[arg(short, long)]
-        layout_file: PathBuf,
-
-        /// Location of Discord configuration file.
-        /// If provided, Discord integration will be enabled.
-        /// This configuration file can be created with the `AutoMarathon discord` command.
-        #[arg(short, long)]
-        settings_file: PathBuf,
-
-        project_file: PathBuf,
+        project_folder: PathBuf,
     },
 }
 
-/// Response types for CommandMessage
-pub enum Response {
-    Ok,
-    Error(String),
-    CurrentState(ProjectStateSerializer),
-}
-
-/// A string message with optional response channel
-type CommandMessage = (CommandSource, Option<oneshot::Sender<Response>>);
-
-async fn run_update<'a>(
-    project: Arc<Project>,
-    state_src: ProjectStateSerializer,
-    obs_cfg: Arc<LayoutFile>,
-    settings: Arc<Settings>,
-    state_file: PathBuf,
-    mut rx: UnboundedReceiver<CommandMessage>,
-    obs: obws::Client,
-) -> Result<(), Error> {
-    let mut state = ProjectState::from_save_state(&state_src, &project, &obs_cfg).unwrap();
-
-    state.running = true;
-
-    loop {
-        let (msg, resp) = rx.recv().await.unwrap();
-
-        let mut resp_msg = Response::Ok;
-
-        log::debug!("Processing {:?}", msg);
-
-        let cmd = parse_cmd(&msg, &project, &obs_cfg);
-
-        match &cmd {
-            Ok(cmds) if cmds == &Command::GetState => {
-                resp_msg = Response::CurrentState(state.to_save_state());
-            }
-            Ok(cmds) => {
-                let state_res = state.apply_cmd(cmds);
-                match state_res {
-                    Ok((new_state, modifications)) => {
-                        if !modifications.is_empty() {
-                            match update_obs(
-                                &project,
-                                &new_state,
-                                &settings,
-                                modifications,
-                                &obs_cfg,
-                                &obs,
-                            )
-                            .await
-                            {
-                                Ok(_) => {
-                                    state = new_state;
-                                }
-                                Err(err) => {
-                                    log::error!("Error while applying layout: {}", err.to_string());
-                                    resp_msg = Response::Error(err.to_string());
-                                }
-                            }
-                        } else {
-                            state = new_state;
-                        }
-
-                        let state_save =
-                            serde_json::to_string_pretty(&state.to_save_state()).unwrap();
-                        fs::write(&state_file, state_save).expect("Failed to save file.");
-                    }
-                    Err(err) => {
-                        log::error!("Error while applying commands: {}", err.to_string());
-                        resp_msg = Response::Error(err.to_string());
-                    }
-                }
-            }
-            Err(err) => {
-                log::error!("Error while parsing commands: {}", err.to_string());
-                resp_msg = Response::Error(err.to_string());
-            }
-        }
-
-        if let Some(rx) = resp {
-            let _ = rx.send(resp_msg);
-        }
-    }
-}
-
-async fn read_terminal(tx: UnboundedSender<CommandMessage>) -> Result<(), Error> {
-    loop {
-        let mut cmd: String = String::new();
-        std::io::stdin()
-            .read_line(&mut cmd)
-            .expect("Failed to read from stdin");
-
-        if cmd.to_lowercase() == "exit" {
-            break Ok(());
-        } else {
-            let (rtx, rrx) = oneshot::channel();
-            //let _ = tx.send((cmd, Some(rtx)));
-
-            if let Ok(resp) = rrx.await {
-                match resp {
-                    Response::Ok => {}
-                    Response::Error(message) => {
-                        log::error!("Failed to run command: {}", message);
-                    }
-                    Response::CurrentState(value) => log::info!("{:?}", value),
-                }
-            }
-        }
-    }
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
     env_logger::builder()
@@ -213,7 +123,11 @@ async fn main() -> Result<(), Error> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    log::info!("Launching AutoMarathon {} on {}", AUTOMARATHON_VER, consts::OS);
+    log::info!(
+        "Launching AutoMarathon {} on {}",
+        AUTOMARATHON_VER,
+        consts::OS
+    );
 
     match &args.command {
         // Create an empty project file
@@ -222,19 +136,23 @@ async fn main() -> Result<(), Error> {
             players,
             project_file,
         } => {
+            let new_project_type_data = match &project_type {
+                ProjectType::Marathon => ProjectTypeSettings::Marathon,
+                ProjectType::Relay => ProjectTypeSettings::Relay { teams: HashMap::new() },
+            };
+
             let new_project = Project {
-                template: project_type.to_owned(),
+                project_type: new_project_type_data,
                 players: players
                     .iter()
                     .map(|p| Player {
                         name: p.to_owned(),
-                        nicks: vec![],
-                        stream: "FILL_THIS".to_owned(),
+                        nicks: Some(vec![]),
+                        stream: Some("FILL_THIS".to_owned()),
                         therun: None,
                     })
                     .collect(),
                 integrations: [].to_vec(),
-                extra_fields: [].to_vec(),
             };
 
             let new_json = serde_json::to_string_pretty(&new_project).unwrap();
@@ -248,7 +166,7 @@ async fn main() -> Result<(), Error> {
         // Test for a valid project file
         RunType::Test { settings_file } => {
             let settings: Settings =
-                serde_json::from_str::<Settings>(&read_to_string(&settings_file)?)?;
+                serde_json::from_str::<Settings>(&read_to_string(settings_file)?)?;
 
             test_discord(&settings.discord_token.unwrap()).await?;
 
@@ -257,74 +175,24 @@ async fn main() -> Result<(), Error> {
 
         // Run a project
         RunType::Run {
-            save_file,
-            layout_file,
-            settings_file,
-            project_file,
+            project_folder
         } => {
-            // Load  layouts
+            // Load layouts
             let layouts: Arc<LayoutFile> = Arc::new(serde_json::from_str::<LayoutFile>(
-                &read_to_string(&layout_file)?,
+                &read_to_string(project_folder.join("layouts.json"))?,
             )?);
 
             // Load project
             let project: Arc<Project> = Arc::new(serde_json::from_str::<Project>(
-                &read_to_string(&project_file)?,
+                &read_to_string(project_folder.join("project.json"))?,
             )?);
 
             // Load settings
             let settings: Arc<Settings> = Arc::new(serde_json::from_str::<Settings>(
-                &read_to_string(&settings_file)?,
+                &read_to_string(project_folder.join("settings.json"))?,
             )?);
 
             log::info!("Loaded project");
-
-            // Load or create project state
-            let state: ProjectStateSerializer = match read_to_string(save_file) {
-                Ok(file) => {
-                    log::info!("Loading project state file...");
-                    let save_res = serde_json::from_str::<ProjectStateSerializer>(&file);
-                    match save_res {
-                        Ok(save) => {
-                            ProjectState::from_save_state(&save, &project, &layouts)
-                                .map_err(|e| e.to_string())?;
-                            save
-                        }
-                        Err(_) => ProjectStateSerializer {
-                            active_players: vec![],
-                            player_fields: FieldStateSerializer {
-                                event_fields: HashMap::new(),
-                                player_fields: project
-                                    .players
-                                    .iter()
-                                    .map(|p| (p.name.clone(), HashMap::new()))
-                                    .collect(),
-                            },
-                            layouts_by_count: HashMap::new(),
-                            active_commentators: vec![],
-                            ignored_commentators: vec![],
-                        },
-                    }
-                }
-                Err(_) => {
-                    log::info!("Project state file does not exist, creating...");
-                    File::create(save_file)?;
-                    ProjectStateSerializer {
-                        active_players: vec![],
-                        player_fields: FieldStateSerializer {
-                            event_fields: HashMap::new(),
-                            player_fields: project
-                                .players
-                                .iter()
-                                .map(|p| (p.name.clone(), HashMap::new()))
-                                .collect(),
-                        },
-                        layouts_by_count: HashMap::new(),
-                        active_commentators: vec![],
-                        ignored_commentators: vec![],
-                    }
-                }
-            };
 
             // Initialize OBS websocket
             log::info!("Connecting to OBS");
@@ -346,33 +214,37 @@ async fn main() -> Result<(), Error> {
 
             log::info!("AutoMarathon initialized");
 
-            // Set up messaging channels
-            let (command_sender, command_receiver): (
-                UnboundedSender<CommandMessage>,
-                UnboundedReceiver<CommandMessage>,
-            ) = mpsc::unbounded_channel();
+            let mut tasks = JoinSet::<Result<(), anyhow::Error>>::new();
 
-            let mut tasks = JoinSet::<Result<(), Error>>::new();
+            // Set up messaging channels
+            let (state_actor, state_rx) = StateActor::new();
+            let (obs_actor, obs_rx) = ObsActor::new();
 
             // Spawn optional integrations
             integrations::init_integrations(
                 &mut tasks,
-                command_sender.clone(),
                 settings.clone(),
                 layouts.clone(),
                 project.clone(),
+                state_actor.clone(),
             );
 
-            // Spawn main task.
-            tasks.spawn(read_terminal(command_sender.clone()));
-            tasks.spawn(run_update(
-                project,
-                state,
-                layouts,
+            // Spawn OBS task.
+            tasks.spawn(run_obs(
+                project.clone(),
                 settings,
-                save_file.to_owned(),
-                command_receiver,
+                layouts.clone(),
                 obs,
+                obs_rx,
+            ));
+
+            // Spawn main task.
+            tasks.spawn(run_state_manager(
+                project,
+                layouts,
+                project_folder.join("save.json").to_owned(),
+                state_rx,
+                obs_actor.clone(),
             ));
 
             loop {

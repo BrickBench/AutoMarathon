@@ -1,51 +1,48 @@
 use std::sync::Arc;
 
-use tokio::{sync::mpsc::UnboundedSender, task::JoinSet};
+use tokio::task::JoinSet;
 
 use crate::{
-    error::Error,
     obs::LayoutFile,
+    project::{Integration, Project},
     settings::Settings,
-    state::{self, Project},
-    CommandMessage,
+    state::StateActor,
 };
+
+use self::therun::{run_therun, TheRunActor};
 
 pub mod discord;
 pub mod therun;
 pub mod web;
 
 pub fn init_integrations(
-    tasks: &mut JoinSet<Result<(), Error>>,
-    command_sender: UnboundedSender<CommandMessage>,
+    tasks: &mut JoinSet<Result<(), anyhow::Error>>,
     settings: Arc<Settings>,
     layouts: Arc<LayoutFile>,
     project: Arc<Project>,
+    state_actor: StateActor,
 ) {
+    let mut therun_actor: Option<TheRunActor> = None;
+
     // Add TheRun.gg module to tasks
-    if project.integrations.contains(&state::Integration::TheRun) {
-        for player in &project.players {
-            let therun = player
-                .therun
-                .to_owned()
-                .unwrap_or(player.stream.split('/').last().unwrap().to_string());
-            tasks.spawn(therun::create_player_websocket_monitor(
-                player.name.clone(),
-                therun.to_string(),
-                command_sender.clone(),
-            ));
-        }
+    if project.integrations.contains(&Integration::TheRun) {
+        let (therun_actor_2, rx) = TheRunActor::new();
+
+        tasks.spawn(run_therun(project.clone(), state_actor.clone(), rx));
+
+        therun_actor = Some(therun_actor_2);
     }
 
     // Add discord integration to tasks
-    if project.integrations.contains(&state::Integration::Discord) {
+    if project.integrations.contains(&Integration::Discord) {
         tasks.spawn(discord::init_discord(
-            command_sender.clone(),
             settings.clone(),
             project.clone(),
             layouts.clone(),
+            state_actor.clone(),
         ));
     }
 
     // Add webserver to tasks
-    tasks.spawn(web::run_http_server(command_sender.clone()));
+    tasks.spawn(web::run_http_server(project, state_actor, therun_actor));
 }

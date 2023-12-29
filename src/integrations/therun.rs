@@ -1,56 +1,105 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::{thread, time};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 use tokio_tungstenite;
 use url::Url;
 
-use crate::{cmd::CommandSource, error::Error, CommandMessage};
+use crate::{
+    project::Project,
+    ActorRef, Rto, state::{StateActor, StateRequest, Command},
+};
 
-///Response type for therun.gg player websocket
-#[allow(non_snake_case)]
-#[derive(Debug, Serialize, Deserialize)]
-struct RunnerStats {
+#[derive(Serialize, Deserialize)]
+pub struct TheRunReturnJson {
     user: String,
-    run: Run,
+    run: Run
 }
 
 #[allow(non_snake_case)]
-#[derive(Debug, Serialize, Deserialize)]
-struct Run {
-    sob: f64,
-    bestPossible: f64,
-    delta: f64,
-    startedAt: String,
-    currentComparison: String,
-    pb: f64,
-    currentSplitName: String,
-    currentSplitIndex: isize,
-    splits: Vec<Split>,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Run {
+    pub sob: Option<f64>,
+    pub bestPossible: Option<f64>,
+    pub delta: Option<f64>,
+    pub startedAt: String,
+    pub currentComparison: String,
+    pub pb: Option<f64>,
+    pub currentSplitName: String,
+    pub currentSplitIndex: isize,
+    pub splits: Vec<Split>,
 }
 
 #[allow(non_snake_case)]
-#[derive(Debug, Serialize, Deserialize)]
-struct Split {
-    name: String,
-    pbSplitTime: f64,
-    splitTime: Option<f64>,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Split {
+    pub name: String,
+    pub pbSplitTime: Option<f64>,
+    pub splitTime: Option<f64>,
+}
+
+pub enum TheRunRequest {
+    GetLivePlayerStats(String, Rto<Option<Run>>),
+}
+
+pub type TheRunActor = ActorRef<TheRunRequest>;
+
+type StatsStore = Arc<Mutex<Option<(Run, bool)>>>;
+
+pub async fn run_therun(
+    project: Arc<Project>,
+    state_actor: StateActor,
+    mut rx: UnboundedReceiver<TheRunRequest>
+) -> Result<(), anyhow::Error> {
+    let mut stats_map: HashMap<String, StatsStore> = HashMap::new();
+
+    for player in &project.players {
+        let store = Arc::new(Mutex::new(None));
+
+        tokio::spawn(create_player_websocket_monitor(
+            player.name.clone(),
+            player.get_therun_username().to_string(),
+            state_actor.clone(),
+            store.clone(),
+        ));
+
+        stats_map.insert(player.name.clone(), store);
+    }
+    
+    loop {
+        match rx.recv().await.unwrap() {
+            TheRunRequest::GetLivePlayerStats(player, rto) => {
+                let stats: Option<Run>;
+
+                {
+                    let store = stats_map.get(&player).unwrap();
+                    let stats_guard = store.lock().await;
+
+                    stats = (*stats_guard).clone().map(|s| s.0);
+                }
+
+                rto.reply(Ok(stats))
+            },
+        }
+    }
 }
 
 /// Creates a player info websocket, restarting it on failure.
 pub async fn create_player_websocket_monitor(
     player: String,
-    twitch: String,
-    tx: UnboundedSender<CommandMessage>,
-) -> Result<(), Error> {
+    therun: String,
+    state_actor: StateActor,
+    dest: StatsStore,
+) -> Result<(), anyhow::Error> {
     loop {
         let res = tokio::spawn(create_player_websocket(
             player.clone(),
-            twitch.clone(),
-            tx.clone(),
+            therun.clone(),
+            state_actor.clone(),
+            dest.clone(),
         ))
         .await;
 
@@ -58,24 +107,15 @@ pub async fn create_player_websocket_monitor(
             Ok(_) => log::warn!(
                 "TheRun.gg WebSocket closed for {} ({}), reattempting in 30 seconds...",
                 player,
-                twitch
+                therun
             ),
             Err(error) => log::warn!(
                 "TheRun.gg WebSocket closed for {} ({}, {}), reattempting in 30 seconds...",
                 player,
-                twitch,
+                therun,
                 error.to_string()
             ),
         }
-
-        //let _ = tx.send((
-        //    CommandSource::SetPlayerField(
-        //        player.clone(),
-        //        "stats_active".to_string(),
-        //        Some("false".to_string()),
-        //    ),
-        //    None,
-        //));
 
         thread::sleep(time::Duration::from_secs(30));
     }
@@ -87,56 +127,35 @@ pub async fn create_player_websocket_monitor(
 /// so use the ```create_player_websocket_monitor``` function instead for error management.
 async fn create_player_websocket(
     player: String,
-    twitch: String,
-    tx: UnboundedSender<CommandMessage>,
-) -> Result<(), Error> {
+    therun: String,
+    state_actor: StateActor,
+    dest: StatsStore,
+) -> Result<(), anyhow::Error> {
     let (stream, _) = tokio_tungstenite::connect_async(
-        Url::parse(&format!("wss://ws.therun.gg/?username={}", twitch)).unwrap(),
+        Url::parse(&format!("wss://ws.therun.gg/?username={}", therun)).unwrap(),
     )
     .await?;
 
-    log::info!("TheRun.gg WebSocket open for {} ({})", player, twitch);
+    log::info!("TheRun.gg WebSocket open for {} ({})", player, therun);
 
     stream
         .for_each(|res| async {
             match res {
                 Ok(msg) => {
-                    match serde_json::from_str::<RunnerStats>(
+                    match serde_json::from_str::<TheRunReturnJson>(
                         msg.to_text().expect("Failed to get text"),
-                    )   {
+                    ) {
                         Ok(stats) => {
-                            let mut stats_map = HashMap::<String, Option<String>>::new();
-                            stats_map.insert(
-                                "stats_active".to_string(),
-                                Some((stats.run.currentSplitIndex >= 0).to_string()),
-                            );
-                            stats_map
-                                .insert("delta".to_string(), Some(stats.run.delta.to_string()));
-                            stats_map.insert(
-                                "best_possible".to_string(),
-                                Some(stats.run.bestPossible.to_string()),
-                            );
+                            let (rtx, rrx) = Rto::new();
+                            state_actor.send(StateRequest::UpdateState(Command::UpdateLiveData(player.clone(), stats.run.clone()), rtx));
+                            let _ = rrx.await;
 
-                            if stats.run.currentSplitIndex > 0 {
-                                if let Some(latest_time) = stats.run.splits
-                                    [stats.run.currentSplitIndex as usize - 1]
-                                    .splitTime
-                                {
-                                    stats_map.insert(
-                                        "last_split".to_string(),
-                                        Some(latest_time.to_string()),
-                                    );
-                                }
-                            }
-
-                            let _ = tx.send((
-                                CommandSource::SetPlayerFields(player.clone(), stats_map),
-                                None,
-                            ));
+                            let mut stats_store = dest.lock().await;
+                            *stats_store = Some((stats.run, true));
                         }
                         Err(err) => {
                             log::warn!("Failed to parse {} endpoint: {}", player, err.to_string());
-                        },
+                        }
                     };
                 }
                 Err(err) => log::error!("{}", err.to_string().replace("\\\"", "\"")),

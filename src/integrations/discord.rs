@@ -1,4 +1,4 @@
-use std::{collections::{HashSet, HashMap}, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use poise::serenity_prelude as serenity;
 
@@ -10,31 +10,41 @@ use serenity::{
         voice::VoiceState,
     },
 };
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 use crate::{
-    cmd::CommandSource, error::Error, obs::LayoutFile, settings::Settings, state::Project,
-    CommandMessage, Response,
+    error::Error,
+    obs::LayoutFile,
+    project::{Project, ProjectTypeSettings},
+    settings::Settings,
+    state::{Command, StateRequest},
+    Rto, StateActor,
 };
 
 struct Data {
     project: Arc<Project>,
     layouts: Arc<LayoutFile>,
     settings: Arc<Settings>,
-    tx: UnboundedSender<CommandMessage>,
+    state_actor: StateActor,
 }
+
 type CError = Box<dyn std::error::Error + Sync + Send>;
 type Context<'a> = poise::Context<'a, Data, CError>;
 
 /// Returns the GuildChannel for the provided voice
-async fn get_voice_guild_channel(state: &VoiceState, context: &serenity::Context) -> Option<GuildChannel> {
+async fn get_voice_guild_channel(
+    state: &VoiceState,
+    context: &serenity::Context,
+) -> Option<GuildChannel> {
     let channel_id = state.channel_id?;
 
     to_guild_channel(channel_id, context).await
 }
 
 /// Convert a ChannelID to a GuildChannel
-async fn to_guild_channel(channel_id: ChannelId, context: &serenity::Context) -> Option<GuildChannel> {
+async fn to_guild_channel(
+    channel_id: ChannelId,
+    context: &serenity::Context,
+) -> Option<GuildChannel> {
     match channel_id.to_channel(&context).await {
         Ok(channel) => channel.guild(),
         Err(why) => {
@@ -49,10 +59,10 @@ async fn handle_voice_state_event(
     context: &serenity::Context,
     old_state: &Option<VoiceState>,
     new_state: &VoiceState,
-    data: &Data
+    data: &Data,
 ) {
     let settings = &data.settings;
-    let tx = data.tx.clone();
+    let tx = &data.state_actor;
 
     if settings.discord_voice_channel.is_none() {
         return;
@@ -61,76 +71,61 @@ async fn handle_voice_state_event(
     let target = settings.discord_voice_channel.as_ref().unwrap().clone();
 
     let old_channel = match old_state {
-        Some(state) => get_voice_guild_channel(state, &context).await,
+        Some(state) => get_voice_guild_channel(state, context).await,
         None => None,
     };
 
-    let new_channel = get_voice_guild_channel(new_state, &context).await;
+    let new_channel = get_voice_guild_channel(new_state, context).await;
 
     let target_channel = old_channel
         .filter(|c| c.name() == target)
         .or(new_channel.filter(|c| c.name() == target));
 
-    match target_channel {
-        Some(channel) => {
-            let users = channel.members(&context).await.unwrap();
+    if let Some(channel) = target_channel {
+        let users = channel.members(&context).await.unwrap();
 
-            let user_list: Vec<String> =
-                users.iter().map(|u| u.display_name().to_string()).collect();
+        let user_list: Vec<String> = users.iter().map(|u| u.display_name().to_string()).collect();
 
-            let (rtx, rrx) = oneshot::channel();
-            let _res = tx.send((CommandSource::Commentary(user_list), Some(rtx)));
+        let (rtx, rrx) = Rto::new();
+        tx.send(StateRequest::UpdateState(
+            Command::Commentary(user_list),
+            rtx,
+        ));
 
-            if let Ok(resp) = rrx.await {
-                match resp {
-                    Response::Ok => {}
-                    Response::Error(message) => {
-                        log::error!("Failed to set voice state: {}", message);
-                    }
-                    Response::CurrentState(_) => {}
+        if let Ok(resp) = rrx.await {
+            match resp {
+                Ok(_) => {}
+                Err(message) => {
+                    log::error!("Failed to set voice state: {}", message);
                 }
             }
         }
-        None => {}
     }
 }
 
 /// General command processor
-async fn command_general(context: &Context<'_>, cmd: CommandSource) -> Result<(), CError> {
-    let channel = context.data().tx.clone();
+async fn command_general(context: &Context<'_>, cmd: Command) -> Result<(), CError> {
+    let channel = &context.data().state_actor;
     let _ = context.defer().await;
 
     let _msg_channel = to_guild_channel(context.channel_id(), context.serenity_context()).await;
 
-    let (rtx, rrx) = oneshot::channel();
-    let _res = channel.send((cmd, Some(rtx)));
+    let (rtx, rrx) = Rto::new();
+    channel.send(StateRequest::UpdateState(cmd, rtx));
 
     if let Ok(resp) = rrx.await {
         match resp {
-            Response::Ok => {
+            Ok(_) => {
                 if let Err(why) = context.say("\u{1F44D}").await {
                     println!("Failed to react: {}", why);
-                    Err(Box::new(Error::GeneralError(why.to_string())))
+                    Err(Box::new(Error::Unknown(why.to_string())))
                 } else {
                     Ok(())
                 }
             }
-            Response::Error(message) => {
-                if let Err(why) = context.say(message).await {
-                    Err(Box::new(Error::GeneralError(why.to_string())))
-                } else {
-                    Ok(())
-                }
-            }
-            Response::CurrentState(message) => {
-                if let Err(why) = context
-                    .say(format!(
-                        "```\n{}\n```",
-                        serde_json::to_string_pretty(&message).unwrap()
-                    ))
-                    .await
-                {
-                    Err(Box::new(Error::GeneralError(why.to_string())))
+            Err(message) => {
+                if let Err(why) = context.say(message.to_string()).await {
+                    Err(Box::new(Error::Unknown(why.to_string())))
                 } else {
                     Ok(())
                 }
@@ -155,7 +150,9 @@ async fn autocomplete_runner_name<'a>(
         .collect();
 
     futures::stream::iter(runners)
-        .filter(move |name| futures::future::ready(name.to_lowercase().starts_with(&partial.to_lowercase())))
+        .filter(move |name| {
+            futures::future::ready(name.to_lowercase().starts_with(&partial.to_lowercase()))
+        })
         .map(|name| name.to_string())
 }
 
@@ -177,16 +174,6 @@ async fn autocomplete_layout_name<'a>(
         .map(|name| name.to_string())
 }
 
-/// Create an autocomplete stream that matches layout names
-async fn autocomplete_field_name<'a>(
-    ctx: Context<'_>,
-    partial: &'a str,
-) -> impl Stream<Item = String> + 'a {
-    futures::stream::iter(ctx.data().project.get_allowed_fields())
-        .filter(move |name| futures::future::ready(name.starts_with(partial)))
-        .map(|name| name.to_string())
-}
-
 /// Toggle the visibility for a specific runner.
 ///
 /// ```
@@ -199,7 +186,7 @@ async fn toggle(
     #[autocomplete = "autocomplete_runner_name"]
     runner: String,
 ) -> Result<(), CError> {
-    command_general(&context, CommandSource::Toggle(runner)).await?;
+    command_general(&context, Command::Toggle(runner)).await?;
     Ok(())
 }
 
@@ -219,10 +206,10 @@ async fn refresh(
 ) -> Result<(), CError> {
     command_general(
         &context,
-        CommandSource::Refresh(
+        Command::Refresh(
             runners
-                .map(|r| r.split(",").map(|s| s.to_owned()).collect())
-                .unwrap_or(Vec::new()),
+                .map(|r| r.split(',').map(|s| s.to_owned()).collect())
+                .unwrap_or_default(),
         ),
     )
     .await?;
@@ -246,7 +233,7 @@ async fn swap(
     #[autocomplete = "autocomplete_runner_name"]
     runner2: String,
 ) -> Result<(), CError> {
-    command_general(&context, CommandSource::Swap(runner1, runner2)).await?;
+    command_general(&context, Command::Swap(runner1, runner2)).await?;
     Ok(())
 }
 
@@ -265,7 +252,7 @@ async fn layout(
     #[autocomplete = "autocomplete_layout_name"]
     layout: String,
 ) -> Result<(), CError> {
-    command_general(&context, CommandSource::Layout(layout)).await?;
+    command_general(&context, Command::Layout(layout)).await?;
     Ok(())
 }
 
@@ -282,10 +269,10 @@ async fn set(
 ) -> Result<(), CError> {
     command_general(
         &context,
-        CommandSource::SetPlayers(
+        Command::SetPlayers(
             runners
-                .map(|r| r.split(",").map(|s| s.to_owned()).collect())
-                .unwrap_or(Vec::new()),
+                .map(|r| r.split(',').map(|s| s.to_owned()).collect())
+                .unwrap_or_default(),
         ),
     )
     .await?;
@@ -307,55 +294,69 @@ async fn ignore(
 ) -> Result<(), CError> {
     command_general(
         &context,
-        CommandSource::CommentaryIgnore(
+        Command::CommentaryIgnore(
             ignored
-                .map(|r| r.split(",").map(|s| s.to_owned()).collect())
-                .unwrap_or(Vec::new()),
+                .map(|r| r.split(',').map(|s| s.to_owned()).collect())
+                .unwrap_or_default(),
         ),
     )
     .await?;
     Ok(())
 }
 
-/// Set a player field.
+/// Set the start time for a relay as a Unix millis timestamp.
 ///
-/// This command can be used to stop 'listener' users from appearing
-/// as commentators. The provided names should be the user's nicknames
-/// (those that appear in the voice channel).
 /// ```
-/// /ignore streamer_bot
+/// /set_relay_start 1701125546192
 /// ```
 #[poise::command(prefix_command, slash_command)]
-async fn set_field(
+async fn set_relay_start(
+    context: Context<'_>,
+    #[description = "Event start time in Unix time"] time: u64,
+) -> Result<(), CError> {
+    command_general(&context, Command::SetRelayStartTime(time)).await?;
+    Ok(())
+}
+
+/// Set the end time for a relay as a Unix millis timestamp.
+///
+/// ```
+/// /set_relay_end 1701125546192
+/// ```
+#[poise::command(prefix_command, slash_command)]
+async fn set_relay_end(
+    context: Context<'_>,
+    #[description = "Event start time in Unix time"] time: Option<u64>,
+) -> Result<(), CError> {
+    command_general(&context, Command::SetRelayEndTime(time)).await?;
+    Ok(())
+}
+
+/// Set the event end time for a runner.
+///
+/// This time should be the time that the relay timer shows when the player's run ends.
+/// ```
+/// /set_relay_time javster101 01:30:20
+/// ```
+#[poise::command(prefix_command, slash_command)]
+async fn set_relay_time(
     context: Context<'_>,
     #[description = "Runner"]
     #[autocomplete = "autocomplete_runner_name"]
     runner: String,
-    #[autocomplete = "autocomplete_field_name"]
-    #[description = "Field"]
-    field: String,
-    #[description = "Value"]
-    value: Option<String>
+    #[description = "Run time"]
+    time: String,
 ) -> Result<(), CError> {
-    let mut data = HashMap::new();
-    data.insert(field, value);
-
-    command_general(
-        &context,
-        CommandSource::SetPlayerFields(
-            runner, data
-        ),
-    )
-    .await?;
+    command_general(&context, Command::SetRelayRunTime(runner, time)).await?;
     Ok(())
 }
 
 pub async fn init_discord(
-    tx: UnboundedSender<CommandMessage>,
     settings: Arc<Settings>,
     project: Arc<Project>,
     layouts: Arc<LayoutFile>,
-) -> Result<(), Error> {
+    state_actor: StateActor,
+) -> Result<(), anyhow::Error> {
     log::info!("Initializing Discord bot");
     let http = Http::new(&settings.discord_token.clone().unwrap());
     let _owners = match http.get_current_application_info().await {
@@ -364,15 +365,30 @@ pub async fn init_discord(
             owners.insert(info.owner.id);
             owners
         }
-        Err(why) => return Err(format!("Could not access app info: {:?}", why))?,
+        Err(why) => {
+            return Err(Error::Unknown(format!(
+                "Could not access app info: {:?}",
+                why
+            )))?
+        }
     };
 
     let intents = serenity::GatewayIntents::non_privileged()
         | serenity::GatewayIntents::GUILD_MESSAGES
         | serenity::GatewayIntents::MESSAGE_CONTENT
         | serenity::GatewayIntents::GUILD_VOICE_STATES;
+
+    let mut commands = vec![toggle(), set(), swap(), layout(), refresh(), ignore()];
+
+    let extra_commands = match &project.project_type {
+        ProjectTypeSettings::Marathon => Vec::<_>::new(),
+        ProjectTypeSettings::Relay { teams: _ } => vec![set_relay_start(), set_relay_end(), set_relay_time()],
+    };
+
+    commands.extend(extra_commands);
+
     let options = poise::FrameworkOptions::<Data, CError> {
-        commands: vec![toggle(), set(), swap(), layout(), refresh(), ignore(), set_field()],
+        commands,
         prefix_options: poise::PrefixFrameworkOptions {
             prefix: Some("/".into()),
             edit_tracker: None,
@@ -383,13 +399,14 @@ pub async fn init_discord(
                 if let poise::event::Event::VoiceStateUpdate { old, new } = event {
                     handle_voice_state_event(ctx, old, new, data).await;
                 }
+
                 Ok(())
             })
         },
         ..Default::default()
     };
 
-    let _client = poise::Framework::<Data, CError>::builder()
+    poise::Framework::<Data, CError>::builder()
         .token(settings.discord_token.clone().unwrap().trim())
         .intents(intents)
         .options(options)
@@ -401,7 +418,7 @@ pub async fn init_discord(
                     settings,
                     project,
                     layouts,
-                    tx,
+                    state_actor,
                 })
             })
         })
@@ -412,7 +429,7 @@ pub async fn init_discord(
     Ok(())
 }
 
-pub async fn test_discord(token: &str) -> Result<(), String> {
+pub async fn test_discord(token: &str) -> Result<(), Error> {
     let http = Http::new(token);
 
     let bot_user = http

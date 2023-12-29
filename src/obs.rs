@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use obws::requests::{
     inputs::SetSettings,
@@ -7,10 +7,14 @@ use obws::requests::{
     },
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     error::Error,
-    state::{ModifiedState, Project, ProjectState}, settings::Settings,
+    project::Project,
+    settings::Settings,
+    state::{ModifiedState, ProjectState},
+    Rto, ActorRef,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,11 +22,11 @@ pub struct LayoutFile {
     pub scene: String,
     pub stream_name: Option<String>,
     pub player_name: Option<String>,
-    pub layouts: Vec<Layout>,
+    pub layouts: Vec<ObsLayout>,
 }
 
 #[derive(PartialEq, Debug, Serialize, Deserialize)]
-pub struct Layout {
+pub struct ObsLayout {
     pub name: String,
     pub default: Option<bool>,
     pub players: usize,
@@ -35,6 +39,7 @@ struct SpecificFreetype<'a> {
 }
 
 // OBS VLC source parameters
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Serialize)]
 struct VLC<'a> {
     playlist: Vec<PlaylistItem<'a>>,
@@ -48,46 +53,78 @@ struct PlaylistItem<'a> {
     value: &'a str,
 }
 
-// Apply project state to OBS
-pub async fn update_obs<'a>(
-    project: &Project,
-    state: &ProjectState<'a>,
-    settings: &Settings,
-    modifications: Vec<ModifiedState<'a>>,
-    obs_cfg: &LayoutFile,
-    obs: &obws::Client,
-) -> Result<(), Error> {
-    let items = obs.scene_items().list(&obs_cfg.scene).await?;
+impl LayoutFile {
+    pub fn get_layout_by_name(&self, name: &str) -> Result<&ObsLayout, anyhow::Error> {
+        for layout in &self.layouts {
+            if layout.name == name {
+                return Ok(layout);
+            }
+        }
 
-    match state
+        Err(Error::UnknownLayout(name.to_owned()))?
+    }
+}
+
+fn get_layout<'a>(state: &ProjectState, layouts: &'a LayoutFile) -> Option<&'a ObsLayout> {
+    state
         .layouts_by_count
         .get(&state.active_players.len().try_into().unwrap())
-        .map(|l| *l)
+        .and_then(|l| layouts.get_layout_by_name(l).ok())
         .or_else(|| {
-            obs_cfg
+            layouts
                 .layouts
                 .iter()
                 .find(|l| l.default.unwrap_or(false) && l.players == state.active_players.len())
         })
         .or_else(|| {
-            obs_cfg
+            layouts
                 .layouts
                 .iter()
                 .find(|l| l.players == state.active_players.len())
-        }) {
-        Some(layout) => {
+        })
+}
 
+pub enum ObsCommand {
+    UpdateObs(ProjectState, Vec<ModifiedState>, Rto<()>),
+}
+
+pub type ObsActor = ActorRef<ObsCommand>;
+
+pub async fn run_obs(
+    project: Arc<Project>,
+    settings: Arc<Settings>,
+    layouts: Arc<LayoutFile>,
+    obs: obws::Client,
+    mut rx: UnboundedReceiver<ObsCommand>,
+) -> Result<(), anyhow::Error> {
+    loop {
+        match rx.recv().await.unwrap() {
+            ObsCommand::UpdateObs(state, modifications, rto) => rto
+                .reply(update_obs(&project, &state, &settings, &modifications, &layouts, &obs).await),
+        };
+    }
+}
+
+// Apply project state to OBS
+pub async fn update_obs(
+    project: &Project,
+    state: &ProjectState,
+    settings: &Settings,
+    modifications: &[ModifiedState],
+    layouts: &LayoutFile,
+    obs: &obws::Client,
+) -> Result<(), anyhow::Error> {
+    let items = obs.scene_items().list(&layouts.scene).await?;
+
+    match get_layout(state, layouts) {
+        Some(layout) => {
             // Reset
             if modifications.contains(&ModifiedState::Layout) {
                 for item in &items {
-                    if let Some(item_layout) = obs_cfg
-                        .layouts
-                        .iter()
-                        .find(|l| &l.name == &item.source_name)
-                    {
+                    if let Ok(item_layout) = layouts.get_layout_by_name(&item.source_name) {
                         obs.scene_items()
                             .set_enabled(SetEnabled {
-                                scene: &obs_cfg.scene,
+                                scene: &layouts.scene,
                                 item_id: item.id,
                                 enabled: layout == item_layout,
                             })
@@ -98,11 +135,8 @@ pub async fn update_obs<'a>(
 
             // Modify commentary text
             if modifications.contains(&ModifiedState::Commentary) {
-                let mut commentators = state.active_commentators.clone();
-                commentators.retain(|c| !&state.ignored_commentators.contains(c));
-
                 let comm_setting = SpecificFreetype {
-                    text: &commentators.join("\n"),
+                    text: &state.get_commentators().join("\n"),
                 };
                 obs.inputs()
                     .set_settings(SetSettings {
@@ -115,14 +149,16 @@ pub async fn update_obs<'a>(
 
             // Set stream mute status
             for idx in 0..project.players.len() {
-                obs.inputs().set_muted(&format!("streamer_{}", idx), true).await?;
-            } 
+                obs.inputs()
+                    .set_muted(&format!("streamer_{}", idx), true)
+                    .await?;
+            }
 
             // Remove streamer views for changed or invisible runners
             for player in &project.players {
-                if (state.active_players.contains(&player)
-                    && modifications.contains(&ModifiedState::PlayerView(player)))
-                    || !state.active_players.contains(&player) 
+                if (state.active_players.contains(&player.name)
+                    && modifications.contains(&ModifiedState::PlayerView(player.name.to_string())))
+                    || !state.active_players.contains(&player.name)
                     || modifications.contains(&ModifiedState::Layout)
                 {
                     for item in &items {
@@ -131,9 +167,9 @@ pub async fn update_obs<'a>(
                                 "streamer_{}",
                                 &project.players.iter().position(|p| p == player).unwrap()
                             )
-                            && !obs.scene_items().locked(&obs_cfg.scene, item.id).await?
+                            && !obs.scene_items().locked(&layouts.scene, item.id).await?
                         {
-                            let _ = obs.scene_items().remove(&obs_cfg.scene, item.id).await;
+                            let _ = obs.scene_items().remove(&layouts.scene, item.id).await;
                         }
                     }
                 }
@@ -141,15 +177,19 @@ pub async fn update_obs<'a>(
 
             tokio::time::sleep(Duration::from_millis(200)).await;
             // Refresh items after deletions
-            let items = obs.scene_items().list(&obs_cfg.scene).await?;
+            let items = obs.scene_items().list(&layouts.scene).await?;
             let group = obs.scene_items().list_group(&layout.name).await?;
 
             for idx in 0..layout.players {
-                let player = state.active_players[idx];
+                let player = &state.active_players[idx];
 
                 let stream_id = format!(
                     "streamer_{}",
-                    project.players.iter().position(|p| player == p).unwrap()
+                    project
+                        .players
+                        .iter()
+                        .position(|p| player == &p.name)
+                        .unwrap()
                 );
 
                 if idx == 0 {
@@ -157,13 +197,13 @@ pub async fn update_obs<'a>(
                 }
 
                 // Update this player's stream
-                if modifications.contains(&ModifiedState::PlayerStream(player)) {
-                    log::debug!("Applying stream change to {}", player.name);
+                if modifications.contains(&ModifiedState::PlayerStream(player.to_string())) {
+                    log::debug!("Applying stream change to {}", player);
                     let vlc_setting = VLC {
                         playlist: vec![PlaylistItem {
                             hidden: false,
                             selected: false,
-                            value: &state.streams.get(&player).unwrap(),
+                            value: state.streams.get(player).unwrap(),
                         }],
                     };
                     obs.inputs()
@@ -173,17 +213,19 @@ pub async fn update_obs<'a>(
                             overlay: Some(true),
                         })
                         .await?;
-                    
+
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
 
                 // Update this player's view
-                if modifications.contains(&ModifiedState::PlayerView(player))
+                if modifications.contains(&ModifiedState::PlayerView(player.to_string()))
                     || modifications.contains(&ModifiedState::Layout)
                 {
-                    log::debug!("Applying position change to {}", player.name);
+                    log::debug!("Applying position change to {}", player);
                     let name_id = format!("name_{}", idx);
-                    let name_setting = SpecificFreetype { text: &player.name.to_uppercase() };
+                    let name_setting = SpecificFreetype {
+                        text: &player.to_uppercase(),
+                    };
                     obs.inputs()
                         .set_settings(SetSettings {
                             input: &name_id,
@@ -195,19 +237,22 @@ pub async fn update_obs<'a>(
                     let stream = items
                         .iter()
                         .find(|item| item.source_name == stream_id)
-                        .ok_or(Error::GeneralError(format!("Unknown source {}", stream_id)))?;
+                        .ok_or(Error::Unknown(format!("Unknown source {}", stream_id)))?;
 
-                    let stream_views: Vec<&obws::responses::scene_items::SceneItem> = group.iter().filter(|item| {
-                        item.source_name
-                            .starts_with(&format!("{}_stream_{}", &layout.name, idx))
-                    }).collect();
+                    let stream_views: Vec<&obws::responses::scene_items::SceneItem> = group
+                        .iter()
+                        .filter(|item| {
+                            item.source_name
+                                .starts_with(&format!("{}_stream_{}", &layout.name, idx))
+                        })
+                        .collect();
 
                     // Create a VLC source for each identified stream view
                     for view in stream_views {
                         let new_item = obs
                             .scene_items()
                             .duplicate(Duplicate {
-                                scene: &obs_cfg.scene,
+                                scene: &layouts.scene,
                                 item_id: stream.id,
                                 destination: None,
                             })
@@ -216,7 +261,7 @@ pub async fn update_obs<'a>(
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         obs.scene_items()
                             .set_enabled(SetEnabled {
-                                scene: &obs_cfg.scene,
+                                scene: &layouts.scene,
                                 item_id: new_item,
                                 enabled: true,
                             })
@@ -224,7 +269,7 @@ pub async fn update_obs<'a>(
 
                         obs.scene_items()
                             .set_index(SetIndex {
-                                scene: &obs_cfg.scene,
+                                scene: &layouts.scene,
                                 item_id: new_item,
                                 index: 0,
                             })
@@ -234,7 +279,7 @@ pub async fn update_obs<'a>(
                             obs.scene_items().transform(&layout.name, view.id).await?;
 
                         let new_transform = SetTransform {
-                            scene: &obs_cfg.scene,
+                            scene: &layouts.scene,
                             item_id: new_item,
                             transform: SceneItemTransform {
                                 position: Some(Position {
@@ -269,15 +314,15 @@ pub async fn update_obs<'a>(
                     Some(name) => {
                         obs.transitions().set_current(name).await?;
                         obs.transitions().trigger().await?;
-                    },
+                    }
                     None => obs.transitions().trigger().await?,
                 }
             }
 
             Ok(())
         }
-        _ => Err(Error::LayoutError(
+        _ => Err(Error::UnknownLayout(
             "No known layout for the current player count.".to_string(),
-        )),
+        ))?,
     }
 }

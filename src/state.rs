@@ -1,206 +1,211 @@
-use clap::ValueEnum;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, process};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, path::PathBuf, process, sync::Arc, u64};
+use tokio::{fs, sync::mpsc::UnboundedReceiver};
 
 use crate::{
-    cmd::Command,
     error::Error,
-    obs::{Layout, LayoutFile},
+    integrations::therun::Run,
+    obs::{LayoutFile, ObsCommand},
     player::Player,
+    project::{Project, ProjectTypeSettings},
+    ActorRef, ObsActor, Rto,
 };
 
-/// Contains the immutable state of a project.
-#[derive(PartialEq, Debug, Serialize, Deserialize)]
-pub struct Project {
-    pub template: ProjectTemplate,
-    pub integrations: Vec<Integration>,
-    pub extra_fields: Vec<String>,
-    pub players: Vec<Player>,
-}
-
-/// A type used to determine the project type
-#[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
-pub enum ProjectTemplate {
-    Marathon,
-}
-
-/// A type used to determine the project type
-#[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
-pub enum Integration {
-    Discord,
-    TheRun,
-}
-
 /// Holds the runtime project state for an active project.
-#[derive(PartialEq, Debug, Clone)]
-pub struct ProjectState<'a> {
-    pub running: bool,
-    pub active_players: Vec<&'a Player>,
-    pub active_commentators: Vec<String>,
-    pub ignored_commentators: Vec<String>,
-    pub streams: HashMap<&'a Player, String>,
-    pub fields: FieldState<'a>,
-    pub layouts_by_count: HashMap<u32, &'a Layout>,
-}
-
-/// Holds state related to a specific project type
-#[derive(PartialEq, Debug, Clone)]
-pub struct FieldState<'a> {
-    event_fields: HashMap<String, String>,
-    player_fields: HashMap<&'a Player, HashMap<String, String>>,
-}
-
-/// Serializer utility type for ProjectState
-/// Certain transient elements of a project, such as the .m3u8 streams in use, are not serialized.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ProjectStateSerializer {
-    pub active_players: Vec<String>,
-    pub active_commentators: Vec<String>,
-    pub ignored_commentators: Vec<String>,
-    pub player_fields: FieldStateSerializer,
-    pub layouts_by_count: HashMap<u32, String>,
-}
-
-/// Holds state related to a specific project type
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
-pub struct FieldStateSerializer {
+pub struct ProjectState {
+    pub running: bool,
+    pub active_players: Vec<String>,
+    active_commentators: Vec<String>,
+    ignored_commentators: Vec<String>,
+    pub streams: HashMap<String, String>,
     pub event_fields: HashMap<String, String>,
     pub player_fields: HashMap<String, HashMap<String, String>>,
+    pub layouts_by_count: HashMap<u32, String>,
+    pub event_state: ProjectTypeState,
 }
 
-impl Project {
-
-    /// Return a player by name or nickname, or return error
-    pub fn find_player(&self, name: &'_ str) -> Result<&Player, Error> {
-        self.players.iter().find(|p| p.name_match(name))
-            .ok_or(Error::PlayerError(name.to_owned()))
-    }
-
-    /// Returns which project fields this project supports
-    pub fn get_allowed_fields(&self) -> Vec<String> {
-        let mut fields = Vec::<String>::new();
-
-        match &self.template {
-            ProjectTemplate::Marathon => {
-                fields.extend_from_slice(&["event_pb".to_string()]);
-            }
-        }
-
-        for integration in &self.integrations {
-            match &integration {
-                Integration::Discord => {}
-                Integration::TheRun => {
-                    fields.extend_from_slice(&[
-                        "delta".to_string(),
-                        "last_split".to_string(),
-                        "best_possible".to_string(),
-                        "stats_active".to_string(),
-                    ]);
-                }
-            }
-        }
-
-        fields
-    }
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ProjectTypeState {
+    Marathon { event_pbs: HashMap<String, f64> },
+    Relay(RelayState),
 }
+
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub struct RelayState {
+    pub start_date_time: u64,
+    pub end_date_time: Option<u64>,
+    pub runner_start_date_time: HashMap<String, u64>,
+    pub runner_split_times: HashMap<String, Vec<(String, Option<f64>)>>,
+    pub runner_end_time: HashMap<String, String>,
+}
+
+/// String-based verson of Command, used for argument checking before command parsing
+#[derive(Debug, Clone)]
+pub enum Command {
+    Toggle(String),
+    Swap(String, String),
+    SetPlayers(Vec<String>),
+    Refresh(Vec<String>),
+    Layout(String),
+    Commentary(Vec<String>),
+    CommentaryIgnore(Vec<String>),
+    SetRelayStartTime(u64),
+    SetRelayRunTime(String, String),
+    SetRelayEndTime(Option<u64>),
+    UpdateLiveData(String, Run),
+}
+
+pub enum StateRequest {
+    UpdateState(Command, Rto<()>),
+    GetState(Rto<ProjectState>),
+}
+
+pub type StateActor = ActorRef<StateRequest>;
 
 /// Elements of ProjectState that were modified during a state change.
 #[derive(PartialEq)]
-pub enum ModifiedState<'a> {
-    PlayerView(&'a Player),
-    PlayerStream(&'a Player),
+pub enum ModifiedState {
+    PlayerView(String),
+    PlayerStream(String),
     Layout,
     Commentary,
-    PlayerFields,
 }
 
 /// Returns a .m3u8 link corresponding to the current players' stream.
-pub fn find_stream(player: &Player) -> Result<String, Error> {
+pub fn find_stream(player: &Player) -> Result<String, anyhow::Error> {
     let output = process::Command::new("streamlink")
         .arg("-Q")
         .arg("-j")
-        .arg(&player.stream)
+        .arg(&player.get_stream())
         .output()
         .map_err(|_| {
-            Error::StreamAcqError(player.name.clone(), "Failed to aquire stream.".to_owned())
+            Error::FailedStreamAcq(player.name.clone(), "Failed to aquire stream.".to_owned())
         })?;
 
-    let json = std::str::from_utf8(output.stdout.as_slice())
-        .map_err(|_| Error::ParseError("Failed to decipher stream.".to_owned()))?;
+    let json = std::str::from_utf8(output.stdout.as_slice())?;
 
     let parsed_json: Value = serde_json::from_str(json).expect("Unable to parse streamlink output");
     if parsed_json.get("error").is_some() {
-        Err(Error::StreamAcqError(
+        Err(Error::FailedStreamAcq(
             player.name.clone(),
             parsed_json["error"].to_string(),
-        ))
+        ))?
     } else {
         Ok(parsed_json["streams"]["best"]["url"]
             .to_string()
-            .replace("\"", ""))
+            .replace('\"', ""))
     }
 }
 
-impl<'a> ProjectState<'a> {
+pub async fn run_state_manager(
+    project: Arc<Project>,
+    layouts: Arc<LayoutFile>,
+    state_file: PathBuf,
+    mut rx: UnboundedReceiver<StateRequest>,
+    obs: ObsActor,
+) -> Result<(), anyhow::Error> {
+    // Load or create project state
+    let mut state = ProjectState::load_project_state(&state_file, &project, &layouts).await?;
+
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            StateRequest::UpdateState(cmd, rto) => {
+                match state.apply_cmd(&cmd, &project, &layouts) {
+                    Ok((new_state, mods)) => {
+                        let (tx, rrx) = Rto::<()>::new();
+                        obs.send(ObsCommand::UpdateObs(new_state.clone(), mods, tx));
+
+                        let obs_resp = rrx.await.unwrap();
+                        if obs_resp.is_ok() {
+                            println!("Saving");
+                            state = new_state;
+                            let state_save = serde_json::to_string_pretty(&state).unwrap();
+                            fs::write(&state_file, state_save)
+                                .await
+                                .expect("Failed to save file.");
+                        }
+
+                        rto.reply(obs_resp);
+                    }
+                    Err(e) => rto.reply(Err(e)),
+                }
+            }
+            StateRequest::GetState(rto) => rto.reply(Ok(state.clone())),
+        }
+    }
+
+    Ok(())
+}
+
+impl ProjectState {
     /// Apply a command onto the current project state, providing a new state.
     pub fn apply_cmd(
         &self,
-        cmd: &Command<'a>,
-    ) -> Result<(ProjectState<'a>, Vec<ModifiedState<'a>>), Error> {
+        cmd: &Command,
+        project: &Project,
+        layouts: &LayoutFile,
+    ) -> Result<(ProjectState, Vec<ModifiedState>), anyhow::Error> {
         let mut new_state = self.clone();
-        let mut modifications = Vec::<ModifiedState<'a>>::new();
+        let mut modifications = Vec::<ModifiedState>::new();
         match cmd {
-            Command::Toggle(player) => {
-                modifications.push(ModifiedState::PlayerView(player));
-                if self.active_players.contains(player) {
-                    new_state.active_players.retain(|p| p != player);
+            Command::Toggle(player_name) => {
+                let player = project.find_player(player_name)?;
+
+                modifications.push(ModifiedState::PlayerView(player.name.to_string()));
+                if self.active_players.contains(&player.name) {
+                    new_state.active_players.retain(|p| p != &player.name);
                 } else {
-                    new_state.active_players.push(player);
+                    new_state.active_players.push(player.name.to_string());
                     if new_state.update_stream(player)? {
-                        modifications.push(ModifiedState::PlayerStream(player));
+                        modifications.push(ModifiedState::PlayerStream(player.name.to_string()));
                     }
                 }
 
                 modifications.push(ModifiedState::Layout);
-                Ok((new_state, modifications))
             }
-            Command::Swap(p1, p2) => {
-                let pos_p1 = self.active_players.iter().position(|p| p == p1);
-                let pos_p2 = self.active_players.iter().position(|p| p == p2);
+            Command::Swap(p1_name, p2_name) => {
+                let p1 = project.find_player(p1_name)?;
+                let p2 = project.find_player(p2_name)?;
 
-                modifications.push(ModifiedState::PlayerView(p1));
-                modifications.push(ModifiedState::PlayerView(p2));
+                let pos_p1 = self.active_players.iter().position(|p| p == &p1.name);
+                let pos_p2 = self.active_players.iter().position(|p| p == &p2.name);
 
-                if pos_p1.is_some() && pos_p2.is_some() {
-                    new_state
-                        .active_players
-                        .swap(pos_p1.unwrap(), pos_p2.unwrap());
-                } else if pos_p1.is_some() {
-                    new_state.active_players.insert(pos_p1.unwrap(), p2);
-                    new_state.active_players.remove(pos_p1.unwrap() + 1);
+                modifications.push(ModifiedState::PlayerView(p1.name.to_string()));
+                modifications.push(ModifiedState::PlayerView(p2.name.to_string()));
 
-                    if new_state.update_stream(p1)? {
-                        modifications.push(ModifiedState::PlayerStream(p1));
-                    }
-                } else if pos_p2.is_some() {
-                    new_state.active_players.insert(pos_p2.unwrap(), p1);
-                    new_state.active_players.remove(pos_p2.unwrap() + 1);
+                if let (Some(pos_p1), Some(pos_p2)) = (pos_p1, pos_p2) {
+                    new_state.active_players.swap(pos_p1, pos_p2);
+                } else if let Some(pos_p1) = pos_p1 {
+                    new_state.active_players.insert(pos_p1, p2.name.to_string());
+                    new_state.active_players.remove(pos_p1 + 1);
 
                     if new_state.update_stream(p2)? {
-                        modifications.push(ModifiedState::PlayerStream(p2));
+                        modifications.push(ModifiedState::PlayerStream(p2.name.to_string()));
+                    }
+                } else if let Some(pos_p2) = pos_p2 {
+                    new_state.active_players.insert(pos_p2, p1.name.to_string());
+                    new_state.active_players.remove(pos_p2 + 1);
+
+                    if new_state.update_stream(p1)? {
+                        modifications.push(ModifiedState::PlayerStream(p1.name.to_string()));
                     }
                 }
-
-                Ok((new_state, modifications))
             }
-            Command::SetPlayers(players) => {
-                for player in players {
-                    if !new_state.active_players.contains(player)
+            Command::SetPlayers(players_strs) => {
+                let players = players_strs
+                    .iter()
+                    .map(|e| project.find_player(e))
+                    .collect::<Result<Vec<&Player>, anyhow::Error>>()?;
+
+                for player in &players {
+                    if !new_state.active_players.contains(&player.name)
                         && new_state.update_stream(player)?
                     {
-                        modifications.push(ModifiedState::PlayerStream(player));
+                        modifications.push(ModifiedState::PlayerStream(player.name.to_string()));
                     }
                 }
 
@@ -211,200 +216,319 @@ impl<'a> ProjectState<'a> {
                 new_state.active_players.clear();
 
                 for player in players {
-                    modifications.push(ModifiedState::PlayerView(player));
-                    new_state.active_players.push(player);
+                    modifications.push(ModifiedState::PlayerView(player.name.to_string()));
+                    new_state.active_players.push(player.name.to_string());
                 }
-
-                Ok((new_state, modifications))
             }
-            Command::Refresh(players) => {
+            Command::Refresh(players_strs) if !players_strs.is_empty() => {
+                let players = players_strs
+                    .iter()
+                    .map(|e| project.find_player(e))
+                    .collect::<Result<Vec<&Player>, anyhow::Error>>()?;
+
                 for player in players {
-                    if new_state.active_players.contains(player)
-                    {
+                    if new_state.active_players.contains(&player.name) {
                         new_state.update_stream(player)?;
-                        modifications.push(ModifiedState::PlayerStream(player));
+                        modifications.push(ModifiedState::PlayerStream(player.name.to_string()));
                     }
                 }
-
-                Ok((new_state, modifications))
             }
-            Command::Layout(count, layout) => {
+            Command::Refresh(_) => {
+                for player in &project.players {
+                    if new_state.active_players.contains(&player.name) {
+                        new_state.update_stream(player)?;
+                        modifications.push(ModifiedState::PlayerStream(player.name.to_string()));
+                    }
+                }
+            }
+            Command::Layout(layout_str) => {
+                let layout = layouts.get_layout_by_name(layout_str)?;
+
                 modifications.push(ModifiedState::Layout);
-                new_state.layouts_by_count.insert(*count, layout);
-                Ok((new_state, modifications))
+                new_state
+                    .layouts_by_count
+                    .insert(layout.players.try_into().unwrap(), layout_str.to_string());
             }
-            Command::SetEventFields(fields) => {
-                for (field, val) in fields.iter() {
-                    match val {
-                        Some(v) => {
-                            new_state
-                                .fields
-                                .event_fields
-                                .insert(field.to_string(), v.to_string());
-                        }
-                        None => {
-                            new_state.fields.event_fields.remove(field);
-                        }
-                    }
-                }
-
-                modifications.push(ModifiedState::PlayerFields);
-
-                Ok((new_state, modifications))
-            }
-            Command::SetPlayerFields(player, fields) => {
-                for (field, val) in fields.iter() {
-                    match val {
-                        Some(v) => {
-                            new_state
-                                .fields
-                                .player_fields
-                                .get_mut(player)
-                                .unwrap()
-                                .insert(field.to_string(), v.to_string());
-                        }
-                        None => {
-                            new_state
-                                .fields
-                                .player_fields
-                                .get_mut(player)
-                                .unwrap()
-                                .remove(field);
-                        }
-                    }
-                }
-
-                modifications.push(ModifiedState::PlayerFields);
-
-                Ok((new_state, modifications))
-            }
-            Command::SetCommentaryIgnore(ignored) => {
+            Command::CommentaryIgnore(ignored) => {
                 if !new_state.ignored_commentators.eq(ignored) {
                     modifications.push(ModifiedState::Commentary);
                     new_state.ignored_commentators = ignored.clone();
                 }
-
-                Ok((new_state, modifications))
             }
-            Command::SetCommentary(comms) => {
+            Command::Commentary(comms) => {
                 if !new_state.active_commentators.eq(comms) {
                     modifications.push(ModifiedState::Commentary);
                     new_state.active_commentators = comms.clone();
                 }
-
-                Ok((new_state, modifications))
             }
-            Command::GetState => panic!("Should not get here"),
-        }
+            Command::UpdateLiveData(runner, run) => {
+                if let ProjectTypeSettings::Relay { teams: _ } = &project.project_type {
+                    if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
+                        println!("{}", runner);
+                        if self.is_active(project.find_player(runner).unwrap()) {
+                            relay_state
+                                .runner_start_date_time
+                                .insert(runner.to_string(), run.startedAt.parse::<u64>().unwrap());
+
+                            let splits_vec = run
+                                .splits
+                                .iter()
+                                .map(|s| (s.name.clone(), s.splitTime))
+                                .collect::<_>();
+
+                            relay_state
+                                .runner_split_times
+                                .insert(runner.to_string(), splits_vec);
+                        }
+                    }
+                }
+            }
+            Command::SetRelayStartTime(time) => {
+                if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
+                    relay_state.start_date_time = *time;
+                }
+            }
+            Command::SetRelayEndTime(time) => {
+                if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
+                    relay_state.end_date_time = time.clone();
+                }
+            }
+            Command::SetRelayRunTime(player, time) => {
+                if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
+                    relay_state
+                        .runner_end_time
+                        .insert(player.to_string(), time.clone());
+                }
+            }
+        };
+
+        Ok((new_state, modifications))
+    }
+
+    pub fn get_commentators(&self) -> Vec<String> {
+        let mut commentators = self.active_commentators.clone();
+        commentators.retain(|c| !&self.ignored_commentators.contains(c));
+
+        commentators
     }
 
     /// Updates the provided player's stream in this state, returning if the stream changed.
-    pub fn update_stream(&mut self, player: &'a Player) -> Result<bool, Error> {
+    pub fn update_stream(&mut self, player: &Player) -> Result<bool, anyhow::Error> {
         let new_stream = find_stream(player)?;
-        let old_stream = self.streams.get(player);
         log::debug!("Acquired new stream for {}", player.name);
-        //    match !old_stream.is_some() || !old_stream.unwrap().eq(&new_stream) {
-        //      true => {
-        self.streams.insert(player, new_stream);
+
+        self.streams.insert(player.name.to_string(), new_stream);
         Ok(true)
-        //    }
-        //    false => Ok(false),
-        //  }
     }
 
-    pub fn to_save_state(&self) -> ProjectStateSerializer {
-        ProjectStateSerializer {
-            active_players: self
-                .active_players
-                .iter()
-                .map(|a| a.name.to_owned())
-                .collect(),
-            active_commentators: self.active_commentators.clone(),
-            ignored_commentators: self.ignored_commentators.clone(),
-            player_fields: self.fields.to_save_state(),
-            layouts_by_count: self
-                .layouts_by_count
-                .iter()
-                .map(|(k, v)| (k.to_owned(), v.name.to_owned()))
-                .collect(),
+    pub fn is_active(&self, player: &Player) -> bool {
+        self.active_players.iter().any(|a| a == &player.name)
+    }
+
+    pub async fn load_project_state(
+        path: &PathBuf,
+        project: &Project,
+        layouts: &LayoutFile,
+    ) -> Result<ProjectState, anyhow::Error> {
+        let event_state_default = match &project.project_type {
+            crate::project::ProjectTypeSettings::Marathon => ProjectTypeState::Marathon {
+                event_pbs: HashMap::new(),
+            },
+            crate::project::ProjectTypeSettings::Relay { teams } => {
+                ProjectTypeState::Relay(RelayState {
+                    start_date_time: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                    end_date_time: None,
+                    runner_start_date_time: HashMap::new(),
+                    runner_split_times: HashMap::new(),
+                    runner_end_time: HashMap::new(),
+                })
+            }
+        };
+
+        match tokio::fs::read_to_string(path).await {
+            Ok(state_str) => {
+                let state = serde_json::from_str::<ProjectState>(&state_str)?;
+
+                state.verify_project_state(project, layouts)?;
+
+                Ok(state)
+            }
+            Err(_) => Ok({
+                ProjectState {
+                    running: false,
+                    active_players: vec![],
+                    active_commentators: vec![],
+                    ignored_commentators: vec![],
+                    streams: HashMap::new(),
+                    event_fields: HashMap::new(),
+                    player_fields: HashMap::new(),
+                    layouts_by_count: HashMap::new(),
+                    event_state: event_state_default,
+                }
+            }),
         }
     }
 
-    pub fn from_save_state(
-        save: &ProjectStateSerializer,
-        project: &'a Project,
-        obs_cfg: &'a LayoutFile,
-    ) -> Result<ProjectState<'a>, Error> {
-        Ok(ProjectState {
-            running: false,
-            active_players: save
-                .active_players
-                .iter()
-                .map(|p| {
-                    project
-                        .find_player(p)
-                        .map_err(|_| Error::ProjectLoadError(format!(
-                            "Failed to find player {} when loading file",
-                            p
-                        )))
-                })
-                .collect::<Result<Vec<&Player>, Error>>()?,
-            active_commentators: save.active_commentators.clone(),
-            ignored_commentators: save.ignored_commentators.clone(),
-            streams: HashMap::new(),
-            fields: FieldState::from_save_state(&save.player_fields, project)?,
-            layouts_by_count: save
-                .layouts_by_count
-                .iter()
-                .map(|(k, v)| {
-                    obs_cfg
-                        .layouts
-                        .iter()
-                        .find(|l| &l.name == v)
-                        .ok_or(Error::ProjectLoadError(format!(
-                            "Failed to find layout {}",
-                            k
-                        )))
-                        .map(|l| (k.to_owned(), l))
-                })
-                .collect::<Result<HashMap<u32, &Layout>, Error>>()?,
-        })
+    fn verify_project_state(
+        &self,
+        project: &Project,
+        layouts: &LayoutFile,
+    ) -> Result<(), anyhow::Error> {
+        for player in &self.active_players {
+            if project.players.iter().all(|p| &p.name != player) {
+                Err(Error::UnknownPlayer(player.to_owned()))?;
+            }
+        }
+
+        for layout in self.layouts_by_count.values() {
+            if layouts.layouts.iter().all(|p| &p.name != layout) {
+                Err(Error::UnknownLayout(layout.to_owned()))?;
+            }
+        }
+
+        Ok(())
     }
 }
 
-impl<'a> FieldState<'a> {
-    pub fn to_save_state(&self) -> FieldStateSerializer {
-        FieldStateSerializer {
-            event_fields: self.event_fields.to_owned(),
-            player_fields: self
-                .player_fields
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+struct RelayPosition {
+    runner: usize,
+    split: isize,
+}
+
+impl RelayState {
+    pub fn calculate_deltas_to_leader(&self, project: &Project) -> HashMap<String, u64> {
+        if let ProjectTypeSettings::Relay { teams } = &project.project_type {
+            let first_place_splits = teams
                 .iter()
-                .map(|record| (record.0.name.to_owned(), record.1.to_owned()))
-                .collect(),
+                .map(|t| {
+                    (t.0, {
+                        let relaypos = self.get_latest_relay_split(t.1);
+                        relaypos
+                    })
+                })
+                .max_by_key(|p| p.1.clone());
+
+            match first_place_splits {
+                Some(first) => {
+                    let fast_team = teams.get(first.0).unwrap();
+                    let mut result_map = HashMap::new();
+
+                    for team in teams.keys() {
+                        if team == first.0 {
+                            if !result_map.contains_key(team) {
+                                result_map.insert(team.to_owned(), 0);
+                            }
+                        } else {
+                            let slow_team = teams.get(team).unwrap();
+                            let slow_latest = self.get_latest_relay_split(slow_team);
+
+                            if slow_latest == first.1 {
+                                println!("Sameo");
+                                let fast_time =
+                                    self.get_time_at_relay_split(fast_team, &slow_latest) as i128;
+                                let slow_time =
+                                    self.get_time_at_relay_split(slow_team, &slow_latest) as i128;
+
+                                println!("{:?} {:?}", fast_time, slow_time);
+                                let diff = slow_time - fast_time;
+                                if diff >= 0 {
+                                    result_map.insert(team.to_owned(), diff as u64);
+                                } else {
+                                    result_map.insert(team.to_owned(), 0);
+                                    result_map.insert(first.0.to_owned(), (-diff) as u64);
+                                }
+                            } else {
+                                let diff =
+                                    self.get_delta_at_split_to_timer(fast_team, &slow_latest);
+
+                                result_map.insert(team.to_owned(), diff);
+                            };
+                        }
+                    }
+
+                    println!("Results: {:?}", result_map);
+                    result_map
+                }
+                None => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
         }
     }
 
-    pub fn from_save_state(
-        save: &FieldStateSerializer,
-        project: &'a Project,
-    ) -> Result<FieldState<'a>, Error> {
-        let player_fields = save
-            .player_fields
-            .iter()
-            .map(|(name, time)| {
-                project
-                    .find_player(name)
-                    .map_err(|_| Error::ProjectLoadError(format!(
-                        "Failed to find player {} when loading file",
-                        name
-                    )))
-                    .map(|usr| (usr, time.to_owned()))
-            })
-            .collect::<Result<Vec<(&Player, HashMap<String, String>)>, Error>>()?;
+    /// Returns the last-completed split for the given team, in (runner, split) format.
+    /// If the runner is on their first split, it will return split -1.
+    fn get_latest_relay_split(&self, team: &[String]) -> RelayPosition {
+        let mut last_split: isize = 0;
+        let mut last_runner: usize = 0;
+        for (runner_idx, runner) in team.iter().enumerate() {
+            if self.runner_start_date_time.contains_key(runner) {
+                last_runner = runner_idx;
+                for (split_idx, (_split, time)) in self
+                    .runner_split_times
+                    .get(runner)
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                {
+                    if time.is_none() {
+                        return RelayPosition {
+                            runner: runner_idx,
+                            split: split_idx as isize,
+                        };
+                    }
 
-        Ok(FieldState {
-            event_fields: save.event_fields.to_owned(),
-            player_fields: player_fields.into_iter().collect(),
-        })
+                    last_split = split_idx as isize;
+                }
+            }
+        }
+
+        return RelayPosition {
+            runner: last_runner,
+            split: last_split,
+        };
+    }
+
+    fn get_delta_at_split_to_timer(
+        &self,
+        winning_team: &[String],
+        losing_pos: &RelayPosition,
+    ) -> u64 {
+        let winning_losing_pos_time = self.get_time_at_relay_split(winning_team, losing_pos);
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        current_time - winning_losing_pos_time
+    }
+
+    /// Returns the epoch time since the start of the relay at which the given split ended.
+    fn get_time_at_relay_split(&self, team: &[String], relay_pos: &RelayPosition) -> u64 {
+        let runner_name = &team[relay_pos.runner];
+        let start_time = *self
+            .runner_start_date_time
+            .get(runner_name)
+            .unwrap_or(&self.start_date_time);
+
+        if relay_pos.split == 0 {
+            return start_time;
+        } else {
+            let splits = self
+                .runner_split_times
+                .get(runner_name)
+                .cloned()
+                .unwrap_or(vec![]);
+
+            start_time
+                + splits
+                    .get(relay_pos.split as usize - 1)
+                    .and_then(|m| m.1)
+                    .unwrap_or(0.0) as u64
+        }
     }
 }
