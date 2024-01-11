@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 
+/// Json struct for project-independent settings
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
     pub obs_ip: Option<String>,

@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{player::Player, error::Error};
 
-
 /// Contains the immutable state of a project.
 #[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub struct Project {

@@ -17,6 +17,7 @@ use crate::{
     Rto, ActorRef,
 };
 
+/// Json struct for OBS layout settings
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LayoutFile {
     pub scene: String,
@@ -25,9 +26,11 @@ pub struct LayoutFile {
     pub layouts: Vec<ObsLayout>,
 }
 
+/// Individual layout settings
 #[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub struct ObsLayout {
     pub name: String,
+    /// Whether this layout should be the default layout for the provided player count
     pub default: Option<bool>,
     pub players: usize,
 }
@@ -38,14 +41,14 @@ struct SpecificFreetype<'a> {
     text: &'a str,
 }
 
-// OBS VLC source parameters
+/// OBS VLC source parameters
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Serialize)]
 struct VLC<'a> {
     playlist: Vec<PlaylistItem<'a>>,
 }
 
-// OBS PlaylistItem parameters
+/// OBS PlaylistItem parameters
 #[derive(Serialize)]
 struct PlaylistItem<'a> {
     hidden: bool,
@@ -54,6 +57,7 @@ struct PlaylistItem<'a> {
 }
 
 impl LayoutFile {
+    /// Return a layout in this layout file by name
     pub fn get_layout_by_name(&self, name: &str) -> Result<&ObsLayout, anyhow::Error> {
         for layout in &self.layouts {
             if layout.name == name {
@@ -65,25 +69,27 @@ impl LayoutFile {
     }
 }
 
+/// Return the appropriate layout for the given project state
 fn get_layout<'a>(state: &ProjectState, layouts: &'a LayoutFile) -> Option<&'a ObsLayout> {
     state
         .layouts_by_count
-        .get(&state.active_players.len().try_into().unwrap())
+        .get(&state.active_players.len().try_into().unwrap()) // Use previous layout
         .and_then(|l| layouts.get_layout_by_name(l).ok())
         .or_else(|| {
             layouts
                 .layouts
                 .iter()
                 .find(|l| l.default.unwrap_or(false) && l.players == state.active_players.len())
-        })
+        }) // Use the default layout for the player count
         .or_else(|| {
             layouts
                 .layouts
                 .iter()
                 .find(|l| l.players == state.active_players.len())
-        })
+        }) // Use any layout for the player count
 }
 
+/// Requests for ObsActor
 pub enum ObsCommand {
     UpdateObs(ProjectState, Vec<ModifiedState>, Rto<()>),
 }
@@ -105,7 +111,7 @@ pub async fn run_obs(
     }
 }
 
-// Apply project state to OBS
+/// Apply project state to OBS
 pub async fn update_obs(
     project: &Project,
     state: &ProjectState,

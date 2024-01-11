@@ -35,15 +35,18 @@ mod state;
 
 const AUTOMARATHON_VER: &str = "0.1";
 
+/// Actor reference
 struct ActorRef<T> {
     tx: UnboundedSender<T>,
 }
 
 impl<T> ActorRef<T> {
+    /// Send a message to the provided actor
     pub fn send(&self, msg: T) {
         let _ = self.tx.send(msg);
     }
 
+    /// Spawn an actor, returning an ActorRef and the corresponding receiver
     pub fn new() -> (Self, UnboundedReceiver<T>) {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -59,11 +62,13 @@ impl<T> Clone for ActorRef<T> {
     }
 }
 
+/// Oneshot fallible return channel
 struct Rto<T> {
     rto: oneshot::Sender<Result<T, anyhow::Error>>,
 }
 
 impl<T> Rto<T> {
+    /// Send a reply through this Rto
     pub fn reply(self, msg: Result<T, anyhow::Error>) {
         let _ = self.rto.send(msg);
     }

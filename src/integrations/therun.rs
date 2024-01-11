@@ -13,12 +13,14 @@ use crate::{
     ActorRef, Rto, state::{StateActor, StateRequest, Command},
 };
 
+/// TheRun websocket return type
 #[derive(Serialize, Deserialize)]
 pub struct TheRunReturnJson {
     user: String,
     run: Run
 }
 
+/// Data for an active LiveSplit run
 #[allow(non_snake_case)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Run {
@@ -33,6 +35,7 @@ pub struct Run {
     pub splits: Vec<Split>,
 }
 
+/// A single LiveSplit split
 #[allow(non_snake_case)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Split {
@@ -41,6 +44,7 @@ pub struct Split {
     pub splitTime: Option<f64>,
 }
 
+/// Requests that can be sent to TheRunActor
 pub enum TheRunRequest {
     GetLivePlayerStats(String, Rto<Option<Run>>),
 }

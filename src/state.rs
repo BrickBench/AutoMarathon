@@ -27,6 +27,7 @@ pub struct ProjectState {
     pub event_state: ProjectTypeState,
 }
 
+/// Project type dependent state
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ProjectTypeState {
@@ -34,6 +35,7 @@ pub enum ProjectTypeState {
     Relay(RelayState),
 }
 
+/// State specific to a relay project
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct RelayState {
     pub start_date_time: u64,
@@ -43,7 +45,6 @@ pub struct RelayState {
     pub runner_end_time: HashMap<String, String>,
 }
 
-/// String-based verson of Command, used for argument checking before command parsing
 #[derive(Debug, Clone)]
 pub enum Command {
     Toggle(String),
@@ -59,6 +60,7 @@ pub enum Command {
     UpdateLiveData(String, Run),
 }
 
+/// Requests that can be sent to a StateActor
 pub enum StateRequest {
     UpdateState(Command, Rto<()>),
     GetState(Rto<ProjectState>),
@@ -305,6 +307,7 @@ impl ProjectState {
         Ok((new_state, modifications))
     }
 
+    /// Returns all active commentators
     pub fn get_commentators(&self) -> Vec<String> {
         let mut commentators = self.active_commentators.clone();
         commentators.retain(|c| !&self.ignored_commentators.contains(c));
@@ -321,10 +324,12 @@ impl ProjectState {
         Ok(true)
     }
 
+    /// Returns if the provided player is active and visible onscreen
     pub fn is_active(&self, player: &Player) -> bool {
         self.active_players.iter().any(|a| a == &player.name)
     }
 
+    /// Load a project state from a file, creating a default state if the file does not exist 
     pub async fn load_project_state(
         path: &PathBuf,
         project: &Project,
@@ -372,6 +377,7 @@ impl ProjectState {
         }
     }
 
+    /// Verify that the provided project state works for the given project and layouts
     fn verify_project_state(
         &self,
         project: &Project,
