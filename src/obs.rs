@@ -120,12 +120,14 @@ pub async fn update_obs(
     layouts: &LayoutFile,
     obs: &obws::Client,
 ) -> Result<(), anyhow::Error> {
+    log::debug!("Updating OBS: {:?}", modifications);
     let items = obs.scene_items().list(&layouts.scene).await?;
 
     match get_layout(state, layouts) {
         Some(layout) => {
             // Reset
             if modifications.contains(&ModifiedState::Layout) {
+                log::debug!("Activating new layout");
                 for item in &items {
                     if let Ok(item_layout) = layouts.get_layout_by_name(&item.source_name) {
                         obs.scene_items()
@@ -141,8 +143,9 @@ pub async fn update_obs(
 
             // Modify commentary text
             if modifications.contains(&ModifiedState::Commentary) {
+                log::debug!("Updating commentator list");
                 let comm_setting = SpecificFreetype {
-                    text: &state.get_commentators().join("\n"),
+                    text: &state.get_commentators().join(" "),
                 };
                 obs.inputs()
                     .set_settings(SetSettings {
@@ -154,6 +157,7 @@ pub async fn update_obs(
             }
 
             // Set stream mute status
+            log::debug!("Muting {} streams", project.players.len());
             for idx in 0..project.players.len() {
                 obs.inputs()
                     .set_muted(&format!("streamer_{}", idx), true)
@@ -161,6 +165,7 @@ pub async fn update_obs(
             }
 
             // Remove streamer views for changed or invisible runners
+            log::debug!("Removing leftover streams");
             for player in &project.players {
                 if (state.active_players.contains(&player.name)
                     && modifications.contains(&ModifiedState::PlayerView(player.name.to_string())))
@@ -316,6 +321,7 @@ pub async fn update_obs(
 
             tokio::time::sleep(Duration::from_millis(200)).await;
             if obs.ui().studio_mode_enabled().await? {
+                log::debug!("Triggering Studio Mode transition");
                 match &settings.obs_transition {
                     Some(name) => {
                         obs.transitions().set_current(name).await?;
@@ -324,6 +330,8 @@ pub async fn update_obs(
                     None => obs.transitions().trigger().await?,
                 }
             }
+
+            log::debug!("OBS update complete");
 
             Ok(())
         }

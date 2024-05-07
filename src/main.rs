@@ -125,7 +125,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .filter(Some("tracing::span"), log::LevelFilter::Warn)
         .filter(Some("serenity"), log::LevelFilter::Warn)
         .filter(Some("hyper"), log::LevelFilter::Warn)
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .init();
 
     log::info!(

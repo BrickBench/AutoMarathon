@@ -69,7 +69,7 @@ pub enum StateRequest {
 pub type StateActor = ActorRef<StateRequest>;
 
 /// Elements of ProjectState that were modified during a state change.
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum ModifiedState {
     PlayerView(String),
     PlayerStream(String),
@@ -116,6 +116,7 @@ pub async fn run_state_manager(
     while let Some(msg) = rx.recv().await {
         match msg {
             StateRequest::UpdateState(cmd, rto) => {
+                log::info!("Applying command {:?}", cmd);
                 match state.apply_cmd(&cmd, &project, &layouts) {
                     Ok((new_state, mods)) => {
                         let (tx, rrx) = Rto::<()>::new();
@@ -123,12 +124,14 @@ pub async fn run_state_manager(
 
                         let obs_resp = rrx.await.unwrap();
                         if obs_resp.is_ok() {
-                            println!("Saving");
+                            log::debug!("Saving state file");
                             state = new_state;
                             let state_save = serde_json::to_string_pretty(&state).unwrap();
                             fs::write(&state_file, state_save)
                                 .await
                                 .expect("Failed to save file.");
+                        } else {
+                            log::warn!("Failed to update OBS: {:?}", obs_resp);
                         }
 
                         rto.reply(obs_resp);
@@ -266,7 +269,6 @@ impl ProjectState {
             Command::UpdateLiveData(runner, run) => {
                 if let ProjectTypeSettings::Relay { teams: _ } = &project.project_type {
                     if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
-                        println!("{}", runner);
                         if self.is_active(project.find_player(runner).unwrap()) {
                             relay_state
                                 .runner_start_date_time

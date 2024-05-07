@@ -105,11 +105,28 @@ async fn handle_voice_state_event(
 
 /// General command processor
 async fn command_general(context: &Context<'_>, cmd: Command) -> Result<(), CError> {
+    log::debug!("Discord received command {:?}", cmd);
+
     let channel = &context.data().state_actor;
+    let settings = &context.data().settings;
     let _ = context.defer().await;
 
     let _msg_channel = to_guild_channel(context.channel_id(), context.serenity_context()).await;
 
+    // Check for desired channel
+    if let Some(channel) = _msg_channel {
+        if let Some(desired_channel) = &settings.discord_command_channel {
+            if !channel.name().eq_ignore_ascii_case(&desired_channel) {
+                log::debug!("Command ignored, incorrect channel '{}'", channel.name());
+                return if let Err(why) = context.say("Commands are not read on this channel.").await {
+                    Err(Box::new(Error::Unknown(why.to_string())))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+    
     let (rtx, rrx) = Rto::new();
     channel.send(StateRequest::UpdateState(cmd, rtx));
 
@@ -117,7 +134,7 @@ async fn command_general(context: &Context<'_>, cmd: Command) -> Result<(), CErr
         match resp {
             Ok(_) => {
                 if let Err(why) = context.say("\u{1F44D}").await {
-                    println!("Failed to react: {}", why);
+                    log::warn!("Failed to react: {}", why);
                     Err(Box::new(Error::Unknown(why.to_string())))
                 } else {
                     Ok(())
@@ -358,6 +375,19 @@ pub async fn init_discord(
     state_actor: StateActor,
 ) -> Result<(), anyhow::Error> {
     log::info!("Initializing Discord bot");
+
+    if let Some(channel) = &settings.discord_command_channel {
+        log::info!("Receiving Discord commands on '{}'", channel);
+    } else {
+        log::warn!("No channel specified for 'discord_channel' in the settings file, this bot will accept commands on any channel!");
+    }
+
+    if let Some(channel) = &settings.discord_voice_channel {
+        log::info!("Reading commentator events on '{}'", channel);
+    } else {
+        log::warn!("No channel specified for 'discord_voice_channel' in the settings file, commentator tracking is disabled.");
+    }
+
     let http = Http::new(&settings.discord_token.clone().unwrap());
     let _owners = match http.get_current_application_info().await {
         Ok(info) => {
