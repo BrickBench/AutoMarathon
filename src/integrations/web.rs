@@ -1,10 +1,10 @@
-use std::{collections::HashMap, convert::Infallible, sync::Arc};
+use std::{collections::HashMap, convert::Infallible};
 
 use serde::{Deserialize, Serialize};
 use warp::{http::Method, Filter};
 
 use crate::{
-    project::Project,
+    project::{Project, ProjectStore},
     state::{StateActor, StateRequest},
     Rto,
 };
@@ -14,19 +14,9 @@ use super::therun::{Run, TheRunActor, TheRunRequest};
 #[derive(Serialize, Deserialize)]
 struct StateResponse {
     #[serde(flatten)]
-    type_response: ProjectTypeResponse,
+    start_time: Option<u64>,
+    end_time: Option<u64>,
     runner_state: HashMap<String, PlayerResponse>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum ProjectTypeResponse {
-    Marathon,
-    Relay {
-        start_time: u64,
-        end_time: Option<u64>,
-        team_behind_by: HashMap<String, u64>
-    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -34,9 +24,8 @@ struct PlayerResponse {
     runner: String,
     is_visible: bool,
     live_stats: Option<Run>,
-
-    #[serde(flatten)]
-    type_response: ProjectTypePlayerResponse,
+    event_pb: Option<f64>,
+    relay_split_time: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,20 +35,21 @@ enum ProjectTypePlayerResponse {
     Relay { run_time: Option<String> },
 }
 
-async fn project_endpoint(project: &Project) -> Result<impl warp::Reply, Infallible> {
+async fn project_endpoint(project: ProjectStore) -> Result<impl warp::Reply, Infallible> {
     Ok(warp::reply::with_status(
-        serde_json::to_string(project).unwrap(),
+        serde_json::to_string::<Project>(&*project.read().await).unwrap(),
         warp::http::StatusCode::OK,
     ))
 }
 
 async fn state_endpoint(
-    project: &Project,
+    project: ProjectStore,
     state_actor: StateActor,
     therun_actor: Option<TheRunActor>,
 ) -> Result<impl warp::Reply, Infallible> {
     let (rtx, rrx) = Rto::new();
     state_actor.send(StateRequest::GetState(rtx));
+    let project = project.read().await.clone();
 
     if let Ok(resp) = rrx.await {
         match resp {
@@ -67,24 +57,22 @@ async fn state_endpoint(
                 let mut player_responses = HashMap::<String, PlayerResponse>::new();
 
                 for player in &project.players {
-                    let player_type_response = match &state.event_state {
-                        crate::state::ProjectTypeState::Marathon { event_pbs } => {
-                            ProjectTypePlayerResponse::Marathon {
-                                event_pb: event_pbs.get(&player.name).copied(),
-                            }
-                        }
-                        crate::state::ProjectTypeState::Relay(relay_data) => {
-                            ProjectTypePlayerResponse::Relay {
-                                run_time: relay_data.runner_end_time.get(&player.name).cloned() 
-                            }
-                        }
-                    };
-
                     let mut player_resp = PlayerResponse {
                         runner: player.name.clone(),
                         live_stats: None,
                         is_visible: state.is_active(player),
-                        type_response: player_type_response,
+                        event_pb: state
+                            .marathon_pbs
+                            .clone()
+                            .map(|m| m.get(&player.name).cloned())
+                            .flatten()
+                            .map(|d| d.as_secs_f64()),
+                        relay_split_time: state
+                            .relay_state
+                            .clone()
+                            .map(|r| r.runner_end_time.get(&player.name).cloned())
+                            .flatten()
+                            .map(|d| d.as_secs_f64()),
                     };
 
                     if let Some(actor) = &therun_actor {
@@ -99,21 +87,9 @@ async fn state_endpoint(
                     player_responses.insert(player.name.clone(), player_resp);
                 }
 
-                let response_event_state = match &state.event_state {
-                    crate::state::ProjectTypeState::Marathon { event_pbs: _ } => {
-                        ProjectTypeResponse::Marathon
-                    }
-                    crate::state::ProjectTypeState::Relay(relay_state) => {
-                        ProjectTypeResponse::Relay {
-                            start_time: relay_state.start_date_time,
-                            team_behind_by: relay_state.calculate_deltas_to_leader(project).clone(),
-                            end_time: relay_state.end_date_time,
-                        }
-                    }
-                };
-
                 let response = StateResponse {
-                    type_response: response_event_state,
+                    start_time: state.timer_state.clone().map(|t| t.start_date_time).flatten(),
+                    end_time: state.timer_state.clone().map(|t| t.end_date_time).flatten(),
                     runner_state: player_responses,
                 };
 
@@ -159,7 +135,7 @@ async fn commentary_endpoint(state_actor: StateActor) -> Result<impl warp::Reply
 }
 
 pub async fn run_http_server(
-    project: Arc<Project>,
+    project: ProjectStore,
     state_actor: StateActor,
     therun_actor: Option<TheRunActor>,
 ) -> Result<(), anyhow::Error> {
@@ -182,16 +158,17 @@ pub async fn run_http_server(
         .and(warp::path::end())
         .and_then(move || {
             let proj = proj2.clone();
-            async move { project_endpoint(&proj).await }
+            async move { project_endpoint(proj).await }
         });
 
     let state_actor_2 = state_actor.clone();
-    let commentary_endpoint = warp::path("commentators")
-        .and(warp::path::end())
-        .and_then(move || {
-            let state_actor = state_actor_2.clone();
-            async move { commentary_endpoint(state_actor).await }
-        });
+    let commentary_endpoint =
+        warp::path("commentators")
+            .and(warp::path::end())
+            .and_then(move || {
+                let state_actor = state_actor_2.clone();
+                async move { commentary_endpoint(state_actor).await }
+            });
 
     let state_endpoint = warp::path("event_state")
         .and(warp::path::end())
@@ -200,16 +177,22 @@ pub async fn run_http_server(
             let therun_actor = therun_actor.clone();
             let proj = project.clone();
 
-            async move { state_endpoint(&proj, state_actor, therun_actor).await }
+            async move { state_endpoint(proj, state_actor, therun_actor).await }
         });
 
     let dashboard = warp::path("dashboard")
         .and(warp::path::end())
         .and(warp::fs::file("web/dashboard.html"));
 
-    warp::serve(state_endpoint.or(project_endpoint).or(commentary_endpoint).or(dashboard).with(cors))
-        .run(([0, 0, 0, 0], 28010))
-        .await;
+    warp::serve(
+        state_endpoint
+            .or(project_endpoint)
+            .or(commentary_endpoint)
+            .or(dashboard)
+            .with(cors),
+    )
+    .run(([0, 0, 0, 0], 28010))
+    .await;
 
     Ok(())
 }

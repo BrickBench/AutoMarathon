@@ -1,26 +1,29 @@
 use std::{sync::Arc, time::Duration};
 
-use obws::requests::{
-    inputs::SetSettings,
-    scene_items::{
-        Bounds, Duplicate, Position, SceneItemTransform, SetEnabled, SetIndex, SetTransform,
+use anyhow::anyhow;
+use obws::{
+    requests::{
+        inputs::{self, InputId, SetSettings},
+        scene_items::{
+            Bounds, CreateSceneItem, Position, SceneItemTransform, SetIndex, SetTransform,
+        },
+        scenes::SceneId,
     },
+    responses::scene_items::SceneItem,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     error::Error,
-    project::Project,
     settings::Settings,
     state::{ModifiedState, ProjectState},
-    Rto, ActorRef,
+    ActorRef, Rto,
 };
 
 /// Json struct for OBS layout settings
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LayoutFile {
-    pub scene: String,
     pub stream_name: Option<String>,
     pub player_name: Option<String>,
     pub layouts: Vec<ObsLayout>,
@@ -35,17 +38,23 @@ pub struct ObsLayout {
     pub players: usize,
 }
 
-// OBS FreeType settings parameters
+// OBS FreeType partial settings parameters
 #[derive(Serialize)]
 struct SpecificFreetype<'a> {
     text: &'a str,
 }
 
-/// OBS VLC source parameters
+/// OBS VLC partial source parameters
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Serialize)]
 struct VLC<'a> {
     playlist: Vec<PlaylistItem<'a>>,
+}
+
+/// OBS browser partial source parameters
+#[derive(Serialize)]
+struct Browser<'a> {
+    url: &'a str,
 }
 
 /// OBS PlaylistItem parameters
@@ -91,13 +100,15 @@ fn get_layout<'a>(state: &ProjectState, layouts: &'a LayoutFile) -> Option<&'a O
 
 /// Requests for ObsActor
 pub enum ObsCommand {
-    UpdateObs(ProjectState, Vec<ModifiedState>, Rto<()>),
+    UpdateState(ProjectState, Vec<ModifiedState>, Rto<()>),
+    SetLadderLeagueId(String, Rto<()>),
+    StartStream(Rto<()>),
+    EndStream(Rto<()>),
 }
 
 pub type ObsActor = ActorRef<ObsCommand>;
 
 pub async fn run_obs(
-    project: Arc<Project>,
     settings: Arc<Settings>,
     layouts: Arc<LayoutFile>,
     obs: obws::Client,
@@ -105,40 +116,76 @@ pub async fn run_obs(
 ) -> Result<(), anyhow::Error> {
     loop {
         match rx.recv().await.unwrap() {
-            ObsCommand::UpdateObs(state, modifications, rto) => rto
-                .reply(update_obs(&project, &state, &settings, &modifications, &layouts, &obs).await),
+            ObsCommand::UpdateState(state, modifications, rto) => {
+                rto.reply(update_obs_state(&state, &settings, &modifications, &layouts, &obs).await)
+            }
+            ObsCommand::StartStream(rto) => {
+                rto.reply(obs.streaming().start().await.map_err(|e| e.into()))
+            }
+            ObsCommand::EndStream(rto) => {
+                rto.reply(obs.streaming().stop().await.map_err(|e| e.into()))
+            }
+            ObsCommand::SetLadderLeagueId(league, rto) => todo!(),
         };
     }
 }
 
+pub async fn update_ladder_league_urls(obs: obws::Client, league_id: String) -> anyhow::Result<()> {
+    log::debug!("Updating browser sources to use ID: {}", league_id);
+    let host_prefix = "https://obama.com/";
+    let site = format!("{}?spreadsheet_id={}", host_prefix, host_prefix);
+
+    let main_view = Browser { url: &site };
+    obs.inputs()
+        .set_settings(SetSettings {
+            input: InputId::Name("league_view"),
+            settings: &main_view,
+            overlay: Some(true),
+        })
+        .await?;
+
+
+    Ok(())
+}
+
+pub async fn delete_scene_items_for_player(
+    obs: &obws::Client,
+    layout: SceneId<'_>,
+    scene_items: &[SceneItem],
+    source_id_name: &str,
+) -> anyhow::Result<()> {
+    for old_item in scene_items {
+        if old_item.source_name == source_id_name
+            && obs.scene_items().enabled(layout, old_item.id).await?
+        {
+            obs.scene_items().remove(layout, old_item.id).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply project state to OBS
-pub async fn update_obs(
-    project: &Project,
+pub async fn update_obs_state(
     state: &ProjectState,
     settings: &Settings,
     modifications: &[ModifiedState],
     layouts: &LayoutFile,
     obs: &obws::Client,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     log::debug!("Updating OBS: {:?}", modifications);
-    let items = obs.scene_items().list(&layouts.scene).await?;
+
+    let mut vlc_inputs = obs.inputs().list(Some("vlc_source")).await?;
+    let scenes = obs.scenes().list().await?;
 
     match get_layout(state, layouts) {
         Some(layout) => {
-            // Reset
-            if modifications.contains(&ModifiedState::Layout) {
-                log::debug!("Activating new layout");
-                for item in &items {
-                    if let Ok(item_layout) = layouts.get_layout_by_name(&item.source_name) {
-                        obs.scene_items()
-                            .set_enabled(SetEnabled {
-                                scene: &layouts.scene,
-                                item_id: item.id,
-                                enabled: layout == item_layout,
-                            })
-                            .await?;
-                    }
-                }
+            let target_layout_id = SceneId::Name(&layout.name);
+
+            if !scenes.scenes.iter().any(|s| s.name != layout.name) {
+                return Err(anyhow!(format!(
+                    "OBS has no scene named {}, which the current layout requires.",
+                    layout.name
+                )));
             }
 
             // Modify commentary text
@@ -149,66 +196,44 @@ pub async fn update_obs(
                 };
                 obs.inputs()
                     .set_settings(SetSettings {
-                        input: "commentary",
+                        input: InputId::Name("commentary"),
                         settings: &comm_setting,
                         overlay: Some(true),
                     })
                     .await?;
             }
 
-            // Set stream mute status
-            log::debug!("Muting {} streams", project.players.len());
-            for idx in 0..project.players.len() {
-                obs.inputs()
-                    .set_muted(&format!("streamer_{}", idx), true)
-                    .await?;
-            }
+            let scene_items = obs.scene_items().list(target_layout_id).await?;
 
-            // Remove streamer views for changed or invisible runners
-            log::debug!("Removing leftover streams");
-            for player in &project.players {
-                if (state.active_players.contains(&player.name)
-                    && modifications.contains(&ModifiedState::PlayerView(player.name.to_string())))
-                    || !state.active_players.contains(&player.name)
-                    || modifications.contains(&ModifiedState::Layout)
-                {
-                    for item in &items {
-                        if item.source_name
-                            == format!(
-                                "streamer_{}",
-                                &project.players.iter().position(|p| p == player).unwrap()
-                            )
-                            && !obs.scene_items().locked(&layouts.scene, item.id).await?
-                        {
-                            let _ = obs.scene_items().remove(&layouts.scene, item.id).await;
-                        }
-                    }
-                }
-            }
+            for (idx, player) in state.active_players.iter().enumerate() {
+                log::debug!("Updating player {}", player);
+                let stream_source_id_name = format!("streamer_{}", player);
+                let stream_source_id = InputId::Name(&stream_source_id_name);
 
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            // Refresh items after deletions
-            let items = obs.scene_items().list(&layouts.scene).await?;
-            let group = obs.scene_items().list_group(&layout.name).await?;
+                let mut just_created = false;
+                if !vlc_inputs.iter().any(|i| i.id.name == stream_source_id) {
+                    // Source does not exist, create source
+                    log::debug!("Creating source for {}", player);
+                    let vlc_setting = VLC {
+                        playlist: vec![PlaylistItem {
+                            hidden: false,
+                            selected: false,
+                            value: state.streams.get(player).unwrap(),
+                        }],
+                    };
 
-            for idx in 0..layout.players {
-                let player = &state.active_players[idx];
+                    let new_input = inputs::Create {
+                        scene: target_layout_id,
+                        input: &stream_source_id_name,
+                        kind: "vlc_source",
+                        settings: Some(vlc_setting),
+                        enabled: Some(false),
+                    };
 
-                let stream_id = format!(
-                    "streamer_{}",
-                    project
-                        .players
-                        .iter()
-                        .position(|p| player == &p.name)
-                        .unwrap()
-                );
-
-                if idx == 0 {
-                    obs.inputs().set_muted(&stream_id, false).await?;
-                }
-
-                // Update this player's stream
-                if modifications.contains(&ModifiedState::PlayerStream(player.to_string())) {
+                    obs.inputs().create(new_input).await?;
+                    just_created = true;
+                } else if modifications.contains(&ModifiedState::PlayerStream(player.to_string())) {
+                    // Source exists but requires new stream
                     log::debug!("Applying stream change to {}", player);
                     let vlc_setting = VLC {
                         playlist: vec![PlaylistItem {
@@ -219,7 +244,7 @@ pub async fn update_obs(
                     };
                     obs.inputs()
                         .set_settings(SetSettings {
-                            input: &stream_id,
+                            input: stream_source_id,
                             settings: &vlc_setting,
                             overlay: Some(true),
                         })
@@ -228,69 +253,76 @@ pub async fn update_obs(
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
 
+                if idx == 0 {
+                    obs.inputs().set_muted(stream_source_id, false).await?;
+                } else {
+                    obs.inputs().set_muted(stream_source_id, true).await?;
+                }
+
                 // Update this player's view
                 if modifications.contains(&ModifiedState::PlayerView(player.to_string()))
                     || modifications.contains(&ModifiedState::Layout)
+                    || just_created
                 {
-                    log::debug!("Applying position change to {}", player);
-                    let name_id = format!("name_{}", idx);
+                    log::debug!("Deleting old items for {}", player);
+                    // Remove old scene_items
+                    delete_scene_items_for_player(
+                        obs,
+                        target_layout_id,
+                        &scene_items,
+                        &stream_source_id_name,
+                    )
+                    .await?;
+
+                    log::debug!("Updating name field for to {}", player);
+                    // Update name field
                     let name_setting = SpecificFreetype {
                         text: &player.to_uppercase(),
                     };
+
                     obs.inputs()
                         .set_settings(SetSettings {
-                            input: &name_id,
+                            input: InputId::Name(&format!("name_{}", idx)),
                             settings: &name_setting,
                             overlay: Some(true),
                         })
                         .await?;
 
-                    let stream = items
+                    log::debug!("Creating new stream views for {}", player);
+                    // Get the user-defined list of stream views in the layout
+                    let stream_views: Vec<&obws::responses::scene_items::SceneItem> = scene_items
                         .iter()
-                        .find(|item| item.source_name == stream_id)
-                        .ok_or(Error::Unknown(format!("Unknown source {}", stream_id)))?;
-
-                    let stream_views: Vec<&obws::responses::scene_items::SceneItem> = group
-                        .iter()
-                        .filter(|item| {
-                            item.source_name
-                                .starts_with(&format!("{}_stream_{}", &layout.name, idx))
-                        })
+                        .filter(|item| item.source_name.starts_with(&format!("stream_{}", idx)))
                         .collect();
 
-                    // Create a VLC source for each identified stream view
+                    // Create a VLC source scene item for each identified stream view
                     for view in stream_views {
                         let new_item = obs
                             .scene_items()
-                            .duplicate(Duplicate {
-                                scene: &layouts.scene,
-                                item_id: stream.id,
-                                destination: None,
+                            .create(CreateSceneItem {
+                                scene: target_layout_id,
+                                source: stream_source_id.into(),
+                                enabled: Some(true),
                             })
                             .await?;
 
                         tokio::time::sleep(Duration::from_millis(200)).await;
-                        obs.scene_items()
-                            .set_enabled(SetEnabled {
-                                scene: &layouts.scene,
-                                item_id: new_item,
-                                enabled: true,
-                            })
-                            .await?;
 
                         obs.scene_items()
                             .set_index(SetIndex {
-                                scene: &layouts.scene,
+                                scene: target_layout_id,
                                 item_id: new_item,
                                 index: 0,
                             })
                             .await?;
 
-                        let existing_transform =
-                            obs.scene_items().transform(&layout.name, view.id).await?;
+                        let existing_transform = obs
+                            .scene_items()
+                            .transform(target_layout_id, view.id)
+                            .await?;
 
                         let new_transform = SetTransform {
-                            scene: &layouts.scene,
+                            scene: target_layout_id,
                             item_id: new_item,
                             transform: SceneItemTransform {
                                 position: Some(Position {
@@ -314,13 +346,38 @@ pub async fn update_obs(
                                 }),
                             },
                         };
-                        obs.scene_items().set_transform(new_transform).await?;
+                        obs.scene_items().set_transform(new_transform).await.map_err(|e| anyhow!(format!(
+                            "Failed to set stream bounds: \n{:?}. \n\nIs the stream view {} transform set correctly (eg. with a bounding box enabled)?", e, view.source_name)))?;
                     }
+                }
+
+                // Remove this input from the list of inputs
+                vlc_inputs.retain_mut(|i| i.id.name != stream_source_id);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Delete any input that was not visited
+            for input in vlc_inputs {
+                if settings.keep_unused_streams.unwrap_or(true) {
+                    log::debug!("Deleting old items for unused input {}", input.id.name);
+                    delete_scene_items_for_player(
+                        obs,
+                        target_layout_id,
+                        &scene_items,
+                        &input.id.name,
+                    )
+                    .await?;
+                } else {
+                    log::debug!("Deleting stale VLC input {}", input.id.name);
+                    obs.inputs().remove(InputId::Name(&input.id.name)).await?;
                 }
             }
 
             tokio::time::sleep(Duration::from_millis(200)).await;
             if obs.ui().studio_mode_enabled().await? {
+                obs.scenes()
+                    .set_current_preview_scene(target_layout_id)
+                    .await?;
                 log::debug!("Triggering Studio Mode transition");
                 match &settings.obs_transition {
                     Some(name) => {
@@ -329,6 +386,13 @@ pub async fn update_obs(
                     }
                     None => obs.transitions().trigger().await?,
                 }
+            } else if modifications.contains(&ModifiedState::Layout)
+                && scenes.current_program_scene.unwrap().name != layout.name
+            {
+                log::debug!("Activating new layout: {}", layout.name);
+                obs.scenes()
+                    .set_current_program_scene(target_layout_id)
+                    .await?;
             }
 
             log::debug!("OBS update complete");

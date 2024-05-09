@@ -14,17 +14,18 @@ use serenity::{
 use crate::{
     error::Error,
     obs::LayoutFile,
-    project::{Project, ProjectTypeSettings},
+    project::{Feature, ProjectStore},
     settings::Settings,
-    state::{Command, StateRequest},
-    Rto, StateActor,
+    state::{StateCommand, StateRequest},
+    Rto, StateActor, ObsActor
 };
 
 struct Data {
-    project: Arc<Project>,
+    project: ProjectStore,
     layouts: Arc<LayoutFile>,
     settings: Arc<Settings>,
     state_actor: StateActor,
+    obs_actor: ObsActor
 }
 
 type CError = Box<dyn std::error::Error + Sync + Send>;
@@ -88,7 +89,7 @@ async fn handle_voice_state_event(
 
         let (rtx, rrx) = Rto::new();
         tx.send(StateRequest::UpdateState(
-            Command::Commentary(user_list),
+            StateCommand::Commentary(user_list),
             rtx,
         ));
 
@@ -103,11 +104,7 @@ async fn handle_voice_state_event(
     }
 }
 
-/// General command processor
-async fn command_general(context: &Context<'_>, cmd: Command) -> Result<(), CError> {
-    log::debug!("Discord received command {:?}", cmd);
-
-    let channel = &context.data().state_actor;
+async fn check_channel(context: &Context<'_>) -> Result<bool, CError> {
     let settings = &context.data().settings;
     let _ = context.defer().await;
 
@@ -118,36 +115,58 @@ async fn command_general(context: &Context<'_>, cmd: Command) -> Result<(), CErr
         if let Some(desired_channel) = &settings.discord_command_channel {
             if !channel.name().eq_ignore_ascii_case(&desired_channel) {
                 log::debug!("Command ignored, incorrect channel '{}'", channel.name());
-                return if let Err(why) = context.say("Commands are not read on this channel.").await {
+                return if let Err(why) = context.say("Commands are not read on this channel.").await
+                {
                     Err(Box::new(Error::Unknown(why.to_string())))
                 } else {
-                    Ok(())
-                }
+                    Ok(false)
+                };
             }
         }
     }
-    
+
+    return Ok(true);
+}
+
+async fn send_discord_reply_from_response<T>(
+    context: &Context<'_>,
+    response: &anyhow::Result<T>,
+) -> Result<(), CError> {
+    match response {
+        Ok(_) => {
+            if let Err(why) = context.say("\u{1F44D}").await {
+                log::warn!("Failed to react: {}", why);
+                Err(Box::new(Error::Unknown(why.to_string())))
+            } else {
+                Ok(())
+            }
+        }
+        Err(message) => {
+            if let Err(why) = context.say(message.to_string()).await {
+                Err(Box::new(Error::Unknown(why.to_string())))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// General command processor
+async fn command_general(context: &Context<'_>, cmd: StateCommand) -> Result<(), CError> {
+    log::debug!("Discord received command {:?}", cmd);
+
+    if !check_channel(context).await? {
+        return Ok(());
+    }
+
+    let channel = &context.data().state_actor;
+    let _ = context.defer().await;
     let (rtx, rrx) = Rto::new();
+    log::debug!("Sent valid command {:?}", cmd);
     channel.send(StateRequest::UpdateState(cmd, rtx));
 
     if let Ok(resp) = rrx.await {
-        match resp {
-            Ok(_) => {
-                if let Err(why) = context.say("\u{1F44D}").await {
-                    log::warn!("Failed to react: {}", why);
-                    Err(Box::new(Error::Unknown(why.to_string())))
-                } else {
-                    Ok(())
-                }
-            }
-            Err(message) => {
-                if let Err(why) = context.say(message.to_string()).await {
-                    Err(Box::new(Error::Unknown(why.to_string())))
-                } else {
-                    Ok(())
-                }
-            }
-        }
+        send_discord_reply_from_response(context, &resp).await
     } else {
         Ok(())
     }
@@ -161,6 +180,8 @@ async fn autocomplete_runner_name<'a>(
     let runners: Vec<String> = ctx
         .data()
         .project
+        .read()
+        .await
         .players
         .iter()
         .map(|p| p.name.clone())
@@ -203,7 +224,7 @@ async fn toggle(
     #[autocomplete = "autocomplete_runner_name"]
     runner: String,
 ) -> Result<(), CError> {
-    command_general(&context, Command::Toggle(runner)).await?;
+    command_general(&context, StateCommand::Toggle(runner)).await?;
     Ok(())
 }
 
@@ -223,7 +244,7 @@ async fn refresh(
 ) -> Result<(), CError> {
     command_general(
         &context,
-        Command::Refresh(
+        StateCommand::Refresh(
             runners
                 .map(|r| r.split(',').map(|s| s.to_owned()).collect())
                 .unwrap_or_default(),
@@ -250,7 +271,7 @@ async fn swap(
     #[autocomplete = "autocomplete_runner_name"]
     runner2: String,
 ) -> Result<(), CError> {
-    command_general(&context, Command::Swap(runner1, runner2)).await?;
+    command_general(&context, StateCommand::Swap(runner1, runner2)).await?;
     Ok(())
 }
 
@@ -269,7 +290,7 @@ async fn layout(
     #[autocomplete = "autocomplete_layout_name"]
     layout: String,
 ) -> Result<(), CError> {
-    command_general(&context, Command::Layout(layout)).await?;
+    command_general(&context, StateCommand::Layout(layout)).await?;
     Ok(())
 }
 
@@ -286,7 +307,7 @@ async fn set(
 ) -> Result<(), CError> {
     command_general(
         &context,
-        Command::SetPlayers(
+        StateCommand::SetPlayers(
             runners
                 .map(|r| r.split(',').map(|s| s.to_owned()).collect())
                 .unwrap_or_default(),
@@ -311,7 +332,7 @@ async fn ignore(
 ) -> Result<(), CError> {
     command_general(
         &context,
-        Command::CommentaryIgnore(
+        StateCommand::CommentaryIgnore(
             ignored
                 .map(|r| r.split(',').map(|s| s.to_owned()).collect())
                 .unwrap_or_default(),
@@ -321,32 +342,70 @@ async fn ignore(
     Ok(())
 }
 
-/// Set the start time for a relay as a Unix millis timestamp.
+/// Set the start time for a race as a Unix millis timestamp.
 ///
 /// ```
 /// /set_relay_start 1701125546192
 /// ```
 #[poise::command(prefix_command, slash_command)]
-async fn set_relay_start(
+async fn set_start_time(
     context: Context<'_>,
     #[description = "Event start time in Unix time"] time: u64,
 ) -> Result<(), CError> {
-    command_general(&context, Command::SetRelayStartTime(time)).await?;
+    command_general(&context, StateCommand::SetStartTime(time)).await?;
     Ok(())
 }
 
-/// Set the end time for a relay as a Unix millis timestamp.
+/// Set the end time for a race as a Unix millis timestamp.
 ///
 /// ```
 /// /set_relay_end 1701125546192
 /// ```
 #[poise::command(prefix_command, slash_command)]
-async fn set_relay_end(
+async fn set_end_time(
     context: Context<'_>,
     #[description = "Event start time in Unix time"] time: Option<u64>,
 ) -> Result<(), CError> {
-    command_general(&context, Command::SetRelayEndTime(time)).await?;
+    command_general(&context, StateCommand::SetEndTime(time)).await?;
     Ok(())
+}
+
+/// Start the OBS stream.
+#[poise::command(prefix_command, slash_command)]
+async fn start_stream(context: Context<'_>) -> Result<(), CError> {
+    if !check_channel(&context).await? {
+        return Ok(());
+    }
+    
+    let channel = &context.data().obs_actor;
+    let _ = context.defer().await;
+    let (rtx, rrx) = Rto::new();
+    channel.send(crate::obs::ObsCommand::StartStream(rtx));
+
+    if let Ok(resp) = rrx.await {
+        send_discord_reply_from_response(&context, &resp).await
+    } else {
+        Ok(())
+    }
+}
+
+/// Stop the OBS stream.
+#[poise::command(prefix_command, slash_command)]
+async fn stop_stream(context: Context<'_>) -> Result<(), CError> {
+    if !check_channel(&context).await? {
+        return Ok(());
+    }
+    
+    let channel = &context.data().obs_actor;
+    let _ = context.defer().await;
+    let (rtx, rrx) = Rto::new();
+    channel.send(crate::obs::ObsCommand::EndStream(rtx));
+
+    if let Ok(resp) = rrx.await {
+        send_discord_reply_from_response(&context, &resp).await
+    } else {
+        Ok(())
+    }
 }
 
 /// Set the event end time for a runner.
@@ -361,25 +420,25 @@ async fn set_relay_time(
     #[description = "Runner"]
     #[autocomplete = "autocomplete_runner_name"]
     runner: String,
-    #[description = "Run time"]
-    time: String,
+    #[description = "Run time"] time: String,
 ) -> Result<(), CError> {
-    command_general(&context, Command::SetRelayRunTime(runner, time)).await?;
+    command_general(&context, StateCommand::SetRelayRunTime(runner, time)).await?;
     Ok(())
 }
 
 pub async fn init_discord(
     settings: Arc<Settings>,
-    project: Arc<Project>,
+    project: ProjectStore,
     layouts: Arc<LayoutFile>,
     state_actor: StateActor,
+    obs_actor: ObsActor,
 ) -> Result<(), anyhow::Error> {
     log::info!("Initializing Discord bot");
 
     if let Some(channel) = &settings.discord_command_channel {
         log::info!("Receiving Discord commands on '{}'", channel);
     } else {
-        log::warn!("No channel specified for 'discord_channel' in the settings file, this bot will accept commands on any channel!");
+        log::warn!("No channel specified for 'discord_command_channel' in the settings file, this bot will accept commands on any channel!");
     }
 
     if let Some(channel) = &settings.discord_voice_channel {
@@ -410,12 +469,16 @@ pub async fn init_discord(
 
     let mut commands = vec![toggle(), set(), swap(), layout(), refresh(), ignore()];
 
-    let extra_commands = match &project.project_type {
-        ProjectTypeSettings::Marathon => Vec::<_>::new(),
-        ProjectTypeSettings::Relay { teams: _ } => vec![set_relay_start(), set_relay_end(), set_relay_time()],
-    };
-
-    commands.extend(extra_commands);
+    for feature in &project.read().await.features {
+        match feature {
+            Feature::Timer => commands.extend(vec![set_start_time(), set_end_time()]),
+            Feature::StreamControl => commands.extend(vec![start_stream(), stop_stream()]),
+            Feature::Relay => {
+                commands.extend(vec![set_relay_time()]);
+            }
+            _ => {}
+        };
+    }
 
     let options = poise::FrameworkOptions::<Data, CError> {
         commands,
@@ -449,6 +512,7 @@ pub async fn init_discord(
                     project,
                     layouts,
                     state_actor,
+                    obs_actor
                 })
             })
         })

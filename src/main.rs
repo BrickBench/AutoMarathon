@@ -2,16 +2,18 @@ use std::{
     env::consts,
     fs::{self, read_to_string},
     path::PathBuf,
-    sync::Arc, collections::HashMap,
+    sync::Arc,
+    time::Duration,
 };
 
+use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 
-use project::ProjectType;
+use obws::requests::EventSubscription;
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
-        oneshot,
+        oneshot, RwLock,
     },
     task::JoinSet,
 };
@@ -20,7 +22,7 @@ use crate::{
     integrations::discord::test_discord,
     obs::{run_obs, LayoutFile, ObsActor},
     player::Player,
-    project::{Project, ProjectTypeSettings},
+    project::{Project, ProjectStore},
     settings::Settings,
     state::{run_state_manager, StateActor},
 };
@@ -64,17 +66,17 @@ impl<T> Clone for ActorRef<T> {
 
 /// Oneshot fallible return channel
 struct Rto<T> {
-    rto: oneshot::Sender<Result<T, anyhow::Error>>,
+    rto: oneshot::Sender<anyhow::Result<T>>,
 }
 
 impl<T> Rto<T> {
     /// Send a reply through this Rto
-    pub fn reply(self, msg: Result<T, anyhow::Error>) {
+    pub fn reply(self, msg: anyhow::Result<T>) {
         let _ = self.rto.send(msg);
     }
 
-    pub fn new() -> (Rto<T>, oneshot::Receiver<Result<T, anyhow::Error>>) {
-        let (tx, rx) = oneshot::channel::<Result<T, anyhow::Error>>();
+    pub fn new() -> (Rto<T>, oneshot::Receiver<anyhow::Result<T>>) {
+        let (tx, rx) = oneshot::channel::<anyhow::Result<T>>();
         (Self { rto: tx }, rx)
     }
 }
@@ -94,9 +96,6 @@ enum RunType {
     /// Create and initialize a new project.
     /// The output .json file will need to be manually edited to fill in details for players.
     Create {
-        #[arg(short = 't', long)]
-        project_type: ProjectType,
-
         /// List of players to initialize.
         #[arg(short = 'p', long, use_value_delimiter = true, value_delimiter = ',')]
         players: Vec<String>,
@@ -112,19 +111,19 @@ enum RunType {
     },
 
     /// Run a project sourced from a project file.
-    Run {
-        project_folder: PathBuf,
-    },
+    Run { project_folder: PathBuf },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     env_logger::builder()
         .filter(Some("tracing::span"), log::LevelFilter::Warn)
         .filter(Some("serenity"), log::LevelFilter::Warn)
         .filter(Some("hyper"), log::LevelFilter::Warn)
+        .filter(Some("h2"), log::LevelFilter::Warn)
+        .filter(Some("rustls"), log::LevelFilter::Warn)
         .filter_level(log::LevelFilter::Debug)
         .init();
 
@@ -137,17 +136,11 @@ async fn main() -> Result<(), anyhow::Error> {
     match &args.command {
         // Create an empty project file
         RunType::Create {
-            project_type,
             players,
             project_file,
         } => {
-            let new_project_type_data = match &project_type {
-                ProjectType::Marathon => ProjectTypeSettings::Marathon,
-                ProjectType::Relay => ProjectTypeSettings::Relay { teams: HashMap::new() },
-            };
-
             let new_project = Project {
-                project_type: new_project_type_data,
+                features: [].to_vec(),
                 players: players
                     .iter()
                     .map(|p| Player {
@@ -158,6 +151,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     })
                     .collect(),
                 integrations: [].to_vec(),
+                timer_source: None,
+                relay_teams: None,
+                therun_race_id: None,
             };
 
             let new_json = serde_json::to_string_pretty(&new_project).unwrap();
@@ -179,34 +175,44 @@ async fn main() -> Result<(), anyhow::Error> {
         }
 
         // Run a project
-        RunType::Run {
-            project_folder
-        } => {
+        RunType::Run { project_folder } => {
             // Load layouts
-            let layouts: Arc<LayoutFile> = Arc::new(serde_json::from_str::<LayoutFile>(
-                &read_to_string(project_folder.join("layouts.json"))?,
-            )?);
+            let layouts: Arc<LayoutFile> = Arc::new(
+                serde_json::from_str::<LayoutFile>(&read_to_string(
+                    project_folder.join("layouts.json"),
+                )?)
+                .map_err(|e| anyhow!(format!("Error while loading layouts.json: {:?}", e)))?,
+            );
 
             // Load project
-            let project: Arc<Project> = Arc::new(serde_json::from_str::<Project>(
-                &read_to_string(project_folder.join("project.json"))?,
-            )?);
+            let project: ProjectStore = Arc::new(RwLock::new(
+                serde_json::from_str::<Project>(&read_to_string(
+                    project_folder.join("project.json"),
+                )?)
+                .map_err(|e| anyhow!(format!("Error while loading project.json: {:?}", e)))?,
+            ));
 
             // Load settings
-            let settings: Arc<Settings> = Arc::new(serde_json::from_str::<Settings>(
-                &read_to_string(project_folder.join("settings.json"))?,
-            )?);
+            let settings: Arc<Settings> = Arc::new(
+                serde_json::from_str::<Settings>(&read_to_string(
+                    project_folder.join("settings.json"),
+                )?)
+                .map_err(|e| anyhow!(format!("Error while loading settings.json: {:?}", e)))?,
+            );
 
             log::info!("Loaded project");
 
             // Initialize OBS websocket
             log::info!("Connecting to OBS");
-            let obs = obws::Client::connect(
-                settings.obs_ip.to_owned().unwrap_or("localhost".to_owned()),
-                settings.obs_port.to_owned().unwrap_or(4455),
-                settings.obs_password.to_owned(),
-            )
-            .await?;
+            let obs_config = obws::client::ConnectConfig {
+                host: settings.obs_ip.to_owned().unwrap_or("localhost".to_owned()),
+                port: settings.obs_port.to_owned().unwrap_or(4455),
+                password: settings.obs_password.to_owned(),
+                event_subscriptions: Some(EventSubscription::NONE),
+                broadcast_capacity: None,
+                connect_timeout: Duration::from_secs(30),
+            };
+            let obs = obws::Client::connect_with_config(obs_config).await?;
 
             let obs_version = obs.general().version().await?;
             log::info!(
@@ -232,16 +238,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 layouts.clone(),
                 project.clone(),
                 state_actor.clone(),
-            );
+                obs_actor.clone(),
+            )
+            .await;
 
             // Spawn OBS task.
-            tasks.spawn(run_obs(
-                project.clone(),
-                settings,
-                layouts.clone(),
-                obs,
-                obs_rx,
-            ));
+            tasks.spawn(run_obs(settings, layouts.clone(), obs, obs_rx));
 
             // Spawn main task.
             tasks.spawn(run_state_manager(
@@ -254,8 +256,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
             loop {
                 match tasks.join_next().await {
-                    Some(Ok(_)) => log::info!("Service Done"),
-                    Some(Err(err)) => log::error!("{}", err.to_string()),
+                    Some(Ok(Ok(()))) => log::info!("Service Done"),
+                    Some(Ok(Err(err))) => log::error!("Service error: {}", err.to_string()),
+                    Some(Err(err)) => log::error!("Failed to join tasks: {}", err.to_string()),
                     None => break Ok(()),
                 }
             }

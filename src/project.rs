@@ -1,33 +1,38 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 use crate::{player::Player, error::Error};
 
+pub type ProjectStore = Arc<RwLock<Project>>;
+
 /// Contains the immutable state of a project.
-#[derive(PartialEq, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Serialize, Deserialize, Clone)]
 pub struct Project {
-    #[serde(flatten)]
-    pub project_type: ProjectTypeSettings,
+    pub features: Vec<Feature>,
     pub integrations: Vec<Integration>,
+    pub timer_source: Option<TimerSource>,
+    pub therun_race_id: Option<String>,
+    pub relay_teams: Option<HashMap<String, Vec<String>>>,
     pub players: Vec<Player>,
 }
 
-/// A type used to determine the project type
+/// Feature flags to enable certain AutoMarathon functionality
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
-pub enum ProjectType {
+pub enum Feature {
+    StreamControl,
     Marathon,
-    Relay
+    Timer,
+    Relay,
 }
 
-#[derive(PartialEq, Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ProjectTypeSettings {
-    Marathon,
-    Relay {
-        teams: HashMap<String, Vec<String>>
-    },
+/// Feature flags to enable certain AutoMarathon functionality
+#[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
+pub enum TimerSource {
+    TheRun,
+    Manual
 }
 
 /// A type used to determine the project type
@@ -35,6 +40,7 @@ pub enum ProjectTypeSettings {
 pub enum Integration {
     Discord,
     TheRun,
+    LadderLeague
 }
 
 impl Project {

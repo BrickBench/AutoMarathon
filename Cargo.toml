@@ -12,7 +12,7 @@ poise = "0.5.5"
 clap = { version = "4.0.15", features = ["derive"] }
 tokio = { version = "1.21.2", features = ["full"] }
 futures = "0.3.24"
-obws = "0.11.2"
+obws = "0.12.0"
 reqwest = { version = "0.11", features = ["json"]}
 tokio-tungstenite = { version = "*", features = ["native-tls"]}
 url = "2.4"

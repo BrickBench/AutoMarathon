@@ -1,22 +1,22 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use std::{collections::HashMap, path::PathBuf, process, sync::Arc, u64};
 use tokio::{fs, sync::mpsc::UnboundedReceiver};
 
+use crate::project::{Feature, ProjectStore};
 use crate::{
     error::Error,
     integrations::therun::Run,
     obs::{LayoutFile, ObsCommand},
     player::Player,
-    project::{Project, ProjectTypeSettings},
+    project::Project,
     ActorRef, ObsActor, Rto,
 };
 
 /// Holds the runtime project state for an active project.
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectState {
-    pub running: bool,
     pub active_players: Vec<String>,
     active_commentators: Vec<String>,
     ignored_commentators: Vec<String>,
@@ -24,29 +24,31 @@ pub struct ProjectState {
     pub event_fields: HashMap<String, String>,
     pub player_fields: HashMap<String, HashMap<String, String>>,
     pub layouts_by_count: HashMap<u32, String>,
-    pub event_state: ProjectTypeState,
+
+    // State locked behind features
+    pub marathon_pbs: Option<HashMap<String, Duration>>,
+    pub timer_state: Option<LiveRaceState>,
+    pub relay_state: Option<RelayState>
 }
 
-/// Project type dependent state
+/// State to store a timer
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ProjectTypeState {
-    Marathon { event_pbs: HashMap<String, f64> },
-    Relay(RelayState),
+pub struct LiveRaceState {
+    pub start_date_time: Option<u64>,
+    pub end_date_time: Option<u64>,
 }
 
 /// State specific to a relay project
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct RelayState {
-    pub start_date_time: u64,
-    pub end_date_time: Option<u64>,
-    pub runner_start_date_time: HashMap<String, u64>,
-    pub runner_split_times: HashMap<String, Vec<(String, Option<f64>)>>,
-    pub runner_end_time: HashMap<String, String>,
+    // pub runner_start_date_time: HashMap<String, u64>,
+    // pub runner_split_times: HashMap<String, Vec<(String, Option<Duration>)>>,
+    pub runner_end_time: HashMap<String, Duration>,
 }
 
 #[derive(Debug, Clone)]
-pub enum Command {
+pub enum StateCommand {
+    Reset,
     Toggle(String),
     Swap(String, String),
     SetPlayers(Vec<String>),
@@ -54,16 +56,17 @@ pub enum Command {
     Layout(String),
     Commentary(Vec<String>),
     CommentaryIgnore(Vec<String>),
-    SetRelayStartTime(u64),
+    SetStartTime(u64),
     SetRelayRunTime(String, String),
-    SetRelayEndTime(Option<u64>),
-    UpdateLiveData(String, Run),
+    SetEndTime(Option<u64>),
+    UpdateRunnerLiveData(String, Run),
 }
 
 /// Requests that can be sent to a StateActor
 pub enum StateRequest {
-    UpdateState(Command, Rto<()>),
+    UpdateState(StateCommand, Rto<()>),
     GetState(Rto<ProjectState>),
+    SetRunners(Vec<Player>, Rto<()>),
 }
 
 pub type StateActor = ActorRef<StateRequest>;
@@ -104,23 +107,28 @@ pub fn find_stream(player: &Player) -> Result<String, anyhow::Error> {
 }
 
 pub async fn run_state_manager(
-    project: Arc<Project>,
+    project_store: ProjectStore,
     layouts: Arc<LayoutFile>,
     state_file: PathBuf,
     mut rx: UnboundedReceiver<StateRequest>,
     obs: ObsActor,
 ) -> Result<(), anyhow::Error> {
     // Load or create project state
-    let mut state = ProjectState::load_project_state(&state_file, &project, &layouts).await?;
+    let mut state = {
+        let project = project_store.read().await;
+        ProjectState::load_project_state(&state_file, &project, &layouts).await?
+    };
 
+    log::debug!("Started state machine");
     while let Some(msg) = rx.recv().await {
         match msg {
             StateRequest::UpdateState(cmd, rto) => {
                 log::info!("Applying command {:?}", cmd);
+                let project = project_store.read().await;
                 match state.apply_cmd(&cmd, &project, &layouts) {
                     Ok((new_state, mods)) => {
                         let (tx, rrx) = Rto::<()>::new();
-                        obs.send(ObsCommand::UpdateObs(new_state.clone(), mods, tx));
+                        obs.send(ObsCommand::UpdateState(new_state.clone(), mods, tx));
 
                         let obs_resp = rrx.await.unwrap();
                         if obs_resp.is_ok() {
@@ -140,6 +148,11 @@ pub async fn run_state_manager(
                 }
             }
             StateRequest::GetState(rto) => rto.reply(Ok(state.clone())),
+            StateRequest::SetRunners(runners, rto) => {
+                let mut old_project = project_store.write().await;
+                old_project.players = runners;
+                rto.reply(Ok(()));
+            }
         }
     }
 
@@ -150,14 +163,14 @@ impl ProjectState {
     /// Apply a command onto the current project state, providing a new state.
     pub fn apply_cmd(
         &self,
-        cmd: &Command,
+        cmd: &StateCommand,
         project: &Project,
         layouts: &LayoutFile,
     ) -> Result<(ProjectState, Vec<ModifiedState>), anyhow::Error> {
         let mut new_state = self.clone();
         let mut modifications = Vec::<ModifiedState>::new();
         match cmd {
-            Command::Toggle(player_name) => {
+            StateCommand::Toggle(player_name) => {
                 let player = project.find_player(player_name)?;
 
                 modifications.push(ModifiedState::PlayerView(player.name.to_string()));
@@ -172,15 +185,13 @@ impl ProjectState {
 
                 modifications.push(ModifiedState::Layout);
             }
-            Command::Swap(p1_name, p2_name) => {
+            StateCommand::Swap(p1_name, p2_name) => {
                 let p1 = project.find_player(p1_name)?;
                 let p2 = project.find_player(p2_name)?;
 
                 let pos_p1 = self.active_players.iter().position(|p| p == &p1.name);
                 let pos_p2 = self.active_players.iter().position(|p| p == &p2.name);
 
-                modifications.push(ModifiedState::PlayerView(p1.name.to_string()));
-                modifications.push(ModifiedState::PlayerView(p2.name.to_string()));
 
                 if let (Some(pos_p1), Some(pos_p2)) = (pos_p1, pos_p2) {
                     new_state.active_players.swap(pos_p1, pos_p2);
@@ -188,6 +199,7 @@ impl ProjectState {
                     new_state.active_players.insert(pos_p1, p2.name.to_string());
                     new_state.active_players.remove(pos_p1 + 1);
 
+                    modifications.push(ModifiedState::PlayerView(p2.name.to_string()));
                     if new_state.update_stream(p2)? {
                         modifications.push(ModifiedState::PlayerStream(p2.name.to_string()));
                     }
@@ -195,12 +207,13 @@ impl ProjectState {
                     new_state.active_players.insert(pos_p2, p1.name.to_string());
                     new_state.active_players.remove(pos_p2 + 1);
 
+                    modifications.push(ModifiedState::PlayerView(p1.name.to_string()));
                     if new_state.update_stream(p1)? {
                         modifications.push(ModifiedState::PlayerStream(p1.name.to_string()));
                     }
                 }
             }
-            Command::SetPlayers(players_strs) => {
+            StateCommand::SetPlayers(players_strs) => {
                 let players = players_strs
                     .iter()
                     .map(|e| project.find_player(e))
@@ -225,7 +238,7 @@ impl ProjectState {
                     new_state.active_players.push(player.name.to_string());
                 }
             }
-            Command::Refresh(players_strs) if !players_strs.is_empty() => {
+            StateCommand::Refresh(players_strs) if !players_strs.is_empty() => {
                 let players = players_strs
                     .iter()
                     .map(|e| project.find_player(e))
@@ -238,7 +251,7 @@ impl ProjectState {
                     }
                 }
             }
-            Command::Refresh(_) => {
+            StateCommand::Refresh(_) => {
                 for player in &project.players {
                     if new_state.active_players.contains(&player.name) {
                         new_state.update_stream(player)?;
@@ -246,7 +259,7 @@ impl ProjectState {
                     }
                 }
             }
-            Command::Layout(layout_str) => {
+            StateCommand::Layout(layout_str) => {
                 let layout = layouts.get_layout_by_name(layout_str)?;
 
                 modifications.push(ModifiedState::Layout);
@@ -254,20 +267,21 @@ impl ProjectState {
                     .layouts_by_count
                     .insert(layout.players.try_into().unwrap(), layout_str.to_string());
             }
-            Command::CommentaryIgnore(ignored) => {
+            StateCommand::CommentaryIgnore(ignored) => {
                 if !new_state.ignored_commentators.eq(ignored) {
                     modifications.push(ModifiedState::Commentary);
                     new_state.ignored_commentators = ignored.clone();
                 }
             }
-            Command::Commentary(comms) => {
+            StateCommand::Commentary(comms) => {
                 if !new_state.active_commentators.eq(comms) {
                     modifications.push(ModifiedState::Commentary);
                     new_state.active_commentators = comms.clone();
                 }
             }
-            Command::UpdateLiveData(runner, run) => {
-                if let ProjectTypeSettings::Relay { teams: _ } = &project.project_type {
+            StateCommand::UpdateRunnerLiveData(_runner, _run) => {
+                /*
+                if let ProjectTypeSettings::Relay { teams: _ } = &project.features {
                     if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
                         if self.is_active(project.find_player(runner).unwrap()) {
                             relay_state
@@ -285,24 +299,34 @@ impl ProjectState {
                                 .insert(runner.to_string(), splits_vec);
                         }
                     }
+                } */
+            }
+            StateCommand::SetStartTime(time) => {
+                if project.features.contains(&Feature::Timer) {
+                    if let Some(ref mut timer_state) = new_state.timer_state {
+                        timer_state.start_date_time = Some(time.to_owned());
+                    }
                 }
             }
-            Command::SetRelayStartTime(time) => {
-                if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
-                    relay_state.start_date_time = *time;
+            StateCommand::SetEndTime(time) => {
+                if project.features.contains(&Feature::Timer) {
+                    if let Some(ref mut timer_state) = new_state.timer_state {
+                        timer_state.end_date_time = time.to_owned();
+                    }
                 }
             }
-            Command::SetRelayEndTime(time) => {
-                if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
-                    relay_state.end_date_time = time.clone();
+            StateCommand::SetRelayRunTime(_player, _time) => {
+                if project.features.contains(&Feature::Relay) {
+                    /*   self.relay_state.map(|r| {
+                        r.runner_end_time
+                        .insert(player.to_string(), time.clone())
+                    });*/
                 }
             }
-            Command::SetRelayRunTime(player, time) => {
-                if let ProjectTypeState::Relay(relay_state) = &mut new_state.event_state {
-                    relay_state
-                        .runner_end_time
-                        .insert(player.to_string(), time.clone());
-                }
+            StateCommand::Reset => {
+                new_state = Self::create_empty_project_state(project);
+                modifications.push(ModifiedState::Layout);
+                modifications.push(ModifiedState::Commentary);
             }
         };
 
@@ -331,30 +355,47 @@ impl ProjectState {
         self.active_players.iter().any(|a| a == &player.name)
     }
 
-    /// Load a project state from a file, creating a default state if the file does not exist 
+    /// Create a default project state
+    pub fn create_empty_project_state(project: &Project) -> ProjectState {
+        ProjectState {
+            active_players: vec![],
+            active_commentators: vec![],
+            ignored_commentators: vec![],
+            streams: HashMap::new(),
+            event_fields: HashMap::new(),
+            player_fields: HashMap::new(),
+            layouts_by_count: HashMap::new(),
+            marathon_pbs: if project.features.contains(&Feature::Marathon) {
+                Some(HashMap::new())
+            } else {
+                None
+            },
+            timer_state: if project.features.contains(&Feature::Timer) {
+                Some(LiveRaceState {
+                    start_date_time: None,
+                    end_date_time: None,
+                })
+            } else {
+                None
+            },
+            relay_state: if project.features.contains(&Feature::Relay) {
+                Some(RelayState {
+                    // runner_start_date_time: HashMap::new(),
+                    // runner_split_times: HashMap::new(),
+                    runner_end_time: HashMap::new(),
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Load a project state from a file, creating a default state if the file does not exist
     pub async fn load_project_state(
         path: &PathBuf,
         project: &Project,
         layouts: &LayoutFile,
     ) -> Result<ProjectState, anyhow::Error> {
-        let event_state_default = match &project.project_type {
-            crate::project::ProjectTypeSettings::Marathon => ProjectTypeState::Marathon {
-                event_pbs: HashMap::new(),
-            },
-            crate::project::ProjectTypeSettings::Relay { teams } => {
-                ProjectTypeState::Relay(RelayState {
-                    start_date_time: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64,
-                    end_date_time: None,
-                    runner_start_date_time: HashMap::new(),
-                    runner_split_times: HashMap::new(),
-                    runner_end_time: HashMap::new(),
-                })
-            }
-        };
-
         match tokio::fs::read_to_string(path).await {
             Ok(state_str) => {
                 let state = serde_json::from_str::<ProjectState>(&state_str)?;
@@ -363,19 +404,7 @@ impl ProjectState {
 
                 Ok(state)
             }
-            Err(_) => Ok({
-                ProjectState {
-                    running: false,
-                    active_players: vec![],
-                    active_commentators: vec![],
-                    ignored_commentators: vec![],
-                    streams: HashMap::new(),
-                    event_fields: HashMap::new(),
-                    player_fields: HashMap::new(),
-                    layouts_by_count: HashMap::new(),
-                    event_state: event_state_default,
-                }
-            }),
+            Err(_) => Ok(Self::create_empty_project_state(project)),
         }
     }
 
@@ -401,15 +430,16 @@ impl ProjectState {
     }
 }
 
+/*
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 struct RelayPosition {
     runner: usize,
     split: isize,
 }
-
+// TODO get therun to work well
 impl RelayState {
     pub fn calculate_deltas_to_leader(&self, project: &Project) -> HashMap<String, u64> {
-        if let ProjectTypeSettings::Relay { teams } = &project.project_type {
+        if let Some(teams) = &project.relay_teams {
             let first_place_splits = teams
                 .iter()
                 .map(|t| {
@@ -540,3 +570,4 @@ impl RelayState {
         }
     }
 }
+*/
