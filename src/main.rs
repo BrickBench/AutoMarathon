@@ -1,6 +1,6 @@
 use std::{
     env::consts,
-    fs::{self, read_to_string},
+    fs::read_to_string,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -10,6 +10,7 @@ use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 
 use obws::requests::EventSubscription;
+use sqlx::{migrate::MigrateDatabase, query, sqlite::Sqlite, SqlitePool};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -21,7 +22,6 @@ use tokio::{
 use crate::{
     integrations::discord::test_discord,
     obs::{run_obs, LayoutFile, ObsActor},
-    player::Player,
     project::{Project, ProjectStore},
     settings::Settings,
     state::{run_state_manager, StateActor},
@@ -95,13 +95,7 @@ struct Args {
 enum RunType {
     /// Create and initialize a new project.
     /// The output .json file will need to be manually edited to fill in details for players.
-    Create {
-        /// List of players to initialize.
-        #[arg(short = 'p', long, use_value_delimiter = true, value_delimiter = ',')]
-        players: Vec<String>,
-
-        project_file: PathBuf,
-    },
+    Create { project_file: PathBuf },
 
     /// Validate a configuration file.
     Test {
@@ -135,32 +129,15 @@ async fn main() -> anyhow::Result<()> {
 
     match &args.command {
         // Create an empty project file
-        RunType::Create {
-            players,
-            project_file,
-        } => {
-            let new_project = Project {
-                features: [].to_vec(),
-                players: players
-                    .iter()
-                    .map(|p| Player {
-                        name: p.to_owned(),
-                        nicks: Some(vec![]),
-                        stream: Some("FILL_THIS".to_owned()),
-                        therun: None,
-                    })
-                    .collect(),
-                integrations: [].to_vec(),
-                timer_source: None,
-                relay_teams: None,
-                therun_race_id: None,
-            };
+        RunType::Create { project_file } => {
+            let url = format!("sqlite://{}", project_file.to_str().unwrap());
+            Sqlite::create_database(&url).await?;
 
-            let new_json = serde_json::to_string_pretty(&new_project).unwrap();
+            let db = SqlitePool::connect(&url).await?;
+            let project_table = sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY NOT NULL,
+                    display_name VARCHAR(250) NOT NULL, stream VARCHAR(200) NOT NULL, therun VARCHAR(250));")
+                    .execute(&db).await.unwrap();
 
-            fs::write(project_file, new_json)?;
-
-            log::info!("Project created, please open the file in a text editor and fill in the missing fields.");
             Ok(())
         }
 

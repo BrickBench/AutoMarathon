@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::{
-    obs::ObsActor, player::Player, state::StateActor, ActorRef, Rto,
-};
+use crate::{obs::ObsActor, player::Player, state::StateActor, ActorRef, Rto};
 
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone)]
 struct LadderLeaguePlayer {
@@ -26,27 +24,50 @@ pub async fn run_ladder_league(
     loop {
         match rx.recv().await.unwrap() {
             LadderLeagueCommand::ActivateRace(race_id, rto) => {
-                let request_url = format!(
-                    "https://whatever.com/runnerstwitch?spreadsheet_id={}",
-                    race_id
-                );
-
-                let response = reqwest::get(&request_url).await?;
-                let users: Vec<Player> = response.json().await?;
-
-                let (rtx, rrx) = Rto::new();
-                let (rtx2, rrx2) = Rto::new();
-                let (rtx3, rrx3) = Rto::new();
-
-                obs_actor.send(crate::obs::ObsCommand::SetLadderLeagueId(race_id, rtx));
-                state_actor.send(crate::state::StateRequest::SetRunners(users, rtx2));
-                let _ = rrx2.await;
-
-                state_actor.send(crate::state::StateRequest::UpdateState(crate::state::StateCommand::Reset, rtx3));
-                let _ = rrx.await;
-                let _ = rrx3.await;
-                rto.reply(Ok(()))
+                rto.reply(activate_ladder_league_id(race_id, &state_actor, &obs_actor).await)
             }
         };
     }
+}
+
+pub async fn activate_ladder_league_id(
+    race_id: String,
+    state_actor: &StateActor,
+    obs_actor: &ObsActor,
+) -> anyhow::Result<()> {
+    log::info!("Activating race {}", race_id);
+    let request_url = format!(
+        "http://localhost:35065/runnerstwitch?spreadsheet_id={}",
+        race_id
+    );
+
+    let response = reqwest::get(&request_url).await?;
+    let users: Vec<LadderLeaguePlayer> = response.json().await?;
+
+    let good_users = users.iter().map(|p| Player {
+        name: p.name.clone(),
+        stream: Some(p.twitch.clone()),
+        nicks: None,
+        therun: None,
+
+    }).collect();
+
+    log::debug!("Got updated users: {:?}", users);
+
+    let (rtx, rrx) = Rto::new();
+    let (rtx2, rrx2) = Rto::new();
+    let (rtx3, rrx3) = Rto::new();
+
+    obs_actor.send(crate::obs::ObsCommand::SetLadderLeagueId(race_id, rtx));
+    state_actor.send(crate::state::StateRequest::SetRunners(good_users, rtx2));
+    let _ = rrx2.await;
+
+    state_actor.send(crate::state::StateRequest::UpdateState(
+        crate::state::StateCommand::Reset,
+        rtx3,
+    ));
+    let _ = rrx.await;
+    let _ = rrx3.await;
+
+    Ok(())
 }

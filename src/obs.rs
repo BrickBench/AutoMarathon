@@ -125,25 +125,78 @@ pub async fn run_obs(
             ObsCommand::EndStream(rto) => {
                 rto.reply(obs.streaming().stop().await.map_err(|e| e.into()))
             }
-            ObsCommand::SetLadderLeagueId(league, rto) => todo!(),
+            ObsCommand::SetLadderLeagueId(league, rto) => {
+                rto.reply(update_ladder_league_urls(&obs, &league, &settings).await)
+            }
         };
     }
 }
 
-pub async fn update_ladder_league_urls(obs: obws::Client, league_id: String) -> anyhow::Result<()> {
+pub async fn update_ladder_league_urls(
+    obs: &obws::Client,
+    league_id: &str,
+    settings: &Settings,
+) -> anyhow::Result<()> {
     log::debug!("Updating browser sources to use ID: {}", league_id);
-    let host_prefix = "https://obama.com/";
-    let site = format!("{}?spreadsheet_id={}", host_prefix, host_prefix);
+    let host_prefix = "http://localhost:35065/";
+    let site = format!("{}?spreadsheet_id={}", host_prefix, league_id);
 
-    let main_view = Browser { url: &site };
     obs.inputs()
         .set_settings(SetSettings {
             input: InputId::Name("league_view"),
-            settings: &main_view,
+            settings: &Browser { url: &site },
             overlay: Some(true),
         })
         .await?;
 
+    for i in 0..3 {
+        let post_info = format!(
+            "{}post_race_info?spreadsheet_id={}&runner={}",
+            host_prefix, league_id, i
+        );
+        let pictures = format!(
+            "{}pictures?spreadsheet_id={}&runner={}",
+            host_prefix, league_id, i
+        );
+        let name = format!(
+            "{}runnername?spreadsheet_id={}&runner={}",
+            host_prefix, league_id, i
+        );
+        let overlay = format!(
+            "{}runner_overlay?spreadsheet_id={}&runner={}",
+            host_prefix, league_id, i
+        );
+        obs.inputs()
+            .set_settings(SetSettings {
+                input: InputId::Name(&format!("runner_name_{}", i + 1)),
+                settings: &Browser { url: &name },
+                overlay: Some(true),
+            })
+            .await?;
+        obs.inputs()
+            .set_settings(SetSettings {
+                input: InputId::Name(&format!("post_info_{}", i + 1)),
+                settings: &Browser { url: &post_info },
+                overlay: Some(true),
+            })
+            .await?;
+        obs.inputs()
+            .set_settings(SetSettings {
+                input: InputId::Name(&format!("pictures_{}", i + 1)),
+                settings: &Browser { url: &pictures },
+                overlay: Some(true),
+            })
+            .await?;
+        obs.inputs()
+            .set_settings(SetSettings {
+                input: InputId::Name(&format!("overlay_{}", i + 1)),
+                settings: &Browser { url: &overlay },
+                overlay: Some(true),
+            })
+            .await?;
+    }
+
+    do_transition(obs, settings).await?;
 
     Ok(())
 }
@@ -160,6 +213,18 @@ pub async fn delete_scene_items_for_player(
         {
             obs.scene_items().remove(layout, old_item.id).await?;
         }
+    }
+    Ok(())
+}
+
+pub async fn do_transition(obs: &obws::Client, settings: &Settings) -> anyhow::Result<()> {
+    log::debug!("Triggering Studio Mode transition");
+    match &settings.obs_transition {
+        Some(name) => {
+            obs.transitions().set_current(name).await?;
+            obs.transitions().trigger().await?;
+        }
+        None => obs.transitions().trigger().await?,
     }
     Ok(())
 }
@@ -192,7 +257,7 @@ pub async fn update_obs_state(
             if modifications.contains(&ModifiedState::Commentary) {
                 log::debug!("Updating commentator list");
                 let comm_setting = SpecificFreetype {
-                    text: &state.get_commentators().join(" "),
+                    text: &state.get_commentators().join("\n"),
                 };
                 obs.inputs()
                     .set_settings(SetSettings {
@@ -386,6 +451,9 @@ pub async fn update_obs_state(
                     }
                     None => obs.transitions().trigger().await?,
                 }
+                obs.scenes()
+                    .set_current_preview_scene(target_layout_id)
+                    .await?;
             } else if modifications.contains(&ModifiedState::Layout)
                 && scenes.current_program_scene.unwrap().name != layout.name
             {

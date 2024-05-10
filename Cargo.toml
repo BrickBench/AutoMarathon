@@ -21,3 +21,4 @@ env_logger = "0.10.0"
 log = "0.4.19"
 anyhow = "1.0.75"
 thiserror = "1.0.50"
+sqlx = { version = "0.7.4", features = ["sqlite", "runtime-tokio", "macros", "json", "chrono"]}

@@ -56,7 +56,7 @@ pub enum StateCommand {
     Layout(String),
     Commentary(Vec<String>),
     CommentaryIgnore(Vec<String>),
-    SetStartTime(u64),
+    SetStartTime(Option<u64>),
     SetRelayRunTime(String, String),
     SetEndTime(Option<u64>),
     UpdateRunnerLiveData(String, Run),
@@ -304,7 +304,14 @@ impl ProjectState {
             StateCommand::SetStartTime(time) => {
                 if project.features.contains(&Feature::Timer) {
                     if let Some(ref mut timer_state) = new_state.timer_state {
-                        timer_state.start_date_time = Some(time.to_owned());
+                        timer_state.start_date_time = time.to_owned();
+                        if let Some(ref mut end_time) = timer_state.end_date_time {
+                            if let Some(start_time) = timer_state.start_date_time {
+                                if start_time > *end_time {
+                                    timer_state.end_date_time = None;
+                                }
+                            }
+                        }
                     }
                 }
             }

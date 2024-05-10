@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+  <head>
+    <!-- Required meta tags -->
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+
+    <title>relay</title>
+        <style>
+                tr{
+                        height: 100px;
+                }
+                tr:last-child td{
+                        border-bottom:0;
+                }
+                .col-side{
+                        width: 31%;
+                }
+                .deltaglow{
+                /*text-shadow:  0 0 1px #dc3545, 0 0 2px #dc3545, 0 0 3px #dc3545, 0 0 4px #dc3545, 0 0 5px #dc3545;*/
+                }
+}
+        </style>
+        <script>
+                function toTime(totalMillis, showDecimal=false, precision=2) {
+  
+                        const millis = Math.floor(totalMillis%1000);
+                        const totalSeconds = Math.floor(totalMillis / 1000)
+                        const totalMinutes = Math.floor(totalSeconds / 60);
+
+                        const seconds = totalSeconds % 60;
+                        const hours = Math.floor(totalMinutes / 60);
+                        const minutes = totalMinutes % 60;
+                        var timeOut = "";
+                        if(hours > 0){
+                                timeOut += hours.toString().padStart(2,'0') + ":";
+                        }else{
+                                timeOut += hours.toString().padStart(2,'0') + ":";
+                        }
+  
+                        if(hours == 0 && minutes == 0){
+                                timeOut += "00:";
+                        }else if (hours > 0 && minutes == 0){
+                                timeOut += "00:";
+                        }else if(minutes > 0){
+                                timeOut += minutes.toString().padStart(2,'0') + ":";
+                        }
+
+                        if(seconds > 0){
+                                timeOut += seconds.toString().padStart(2,'0');
+                        }else if (hours > 0 || minutes > 0){
+                                timeOut += "00";
+                        }else{
+                                timeOut += "00";
+                        }
+
+                        if(showDecimal){
+                                timeOut += "."+(millis.toString().padStart(precision, '0').substring(0,precision));
+                        }
+
+                        return timeOut;
+                }
+        </script>
+  </head>
+  <body>
+      <div class="col-3 text-center align-self-center">
+              <h1 id="globaltimer" class="fw-bold" style="font-size: 2.8em; ">23:21:23</h1>
+      </div>
+
+    <!-- Optional JavaScript; choose one of the two! -->
+
+    <!-- Option 1: Bootstrap Bundle with Popper -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
+        <script>
+                var timer = 1000;
+                var startDate = null;
+                var actualEnd = null;
+                
+                $( document ).ready(function() {
+                        setInterval(function() {
+                                $.ajax({
+                                        url: 'http://localhost:28010/event_state', 
+                                        type: 'GET',
+                                        headers: {'Access-Control-Allow-Origin':'*'}, // <-------- set this
+                                        dataType: 'text', // // <-------- use JSONP
+                                        success: function(data3){
+                                                data = JSON.parse(data3);
+                                                console.log(data)
+
+                                                if (data.hasOwnProperty('start_time')) {
+                                                    var startTime = data['start_time']
+                                                    if (startTime == null) {
+                                                        start_date = null
+                                                    } else {
+                                                        startDate = new Date(startTime)
+                                                    }
+                                                }
+                                                if(data.hasOwnProperty('end_time')){
+                                                        actualEnd =  data['end_time'] != null ? new Date(data['end_time']) : null;
+                                                }
+                                        }
+                                });
+                        }, 1000);
+                });
+                
+                function globaltimer() {
+                    if (startDate == null) {
+                        document.getElementById("globaltimer").innerHTML = toTime(0);
+                    } else {
+                        var endDate = actualEnd == null ? new Date() : actualEnd;
+                        var timer = (endDate.getTime() - startDate.getTime());
+                        document.getElementById("globaltimer").innerHTML = toTime(timer);
+                    }
+                }
+                setInterval(globaltimer, 500);
+        </script>
+
+    <!-- Option 2: Separate Popper and Bootstrap JS -->
+    <!--
+    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.9.2/dist/umd/popper.min.js" integrity="sha384-IQsoLXl5PILFhosVNubq5LC7Qb9DXgDA9i+tQ8Zj3iwWAwPtgFTxbJ8NT4GN1R8p" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.min.js" integrity="sha384-cVKIPhGWiC2Al4u+LWgxfKTRIcfu0JTxR+EQDz/bgldoEyl4H0zUF0QKbrJ0EcQF" crossorigin="anonymous"></script>
+    -->
+  </body>
+</html>

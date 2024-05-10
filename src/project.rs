@@ -22,6 +22,7 @@ pub struct Project {
 /// Feature flags to enable certain AutoMarathon functionality
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone, ValueEnum)]
 pub enum Feature {
+    Nametags,
     StreamControl,
     Marathon,
     Timer,

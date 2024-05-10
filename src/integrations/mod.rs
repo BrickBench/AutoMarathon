@@ -9,12 +9,12 @@ use crate::{
     state::StateActor,
 };
 
-use self::therun::{run_therun, TheRunActor};
+use self::{ladder_league::{run_ladder_league, LadderLeagueActor}, therun::{run_therun, TheRunActor}};
 
 pub mod discord;
+pub mod ladder_league;
 pub mod therun;
 pub mod web;
-pub mod ladder_league;
 
 pub async fn init_integrations(
     tasks: &mut JoinSet<Result<(), anyhow::Error>>,
@@ -36,6 +36,9 @@ pub async fn init_integrations(
         therun_actor = Some(therun_actor_2);
     }
 
+    let (ladder_actor, rx) = LadderLeagueActor::new();
+    tasks.spawn(run_ladder_league(rx, state_actor.clone(), obs_actor.clone()));
+
     // Add discord integration to tasks
     if project.integrations.contains(&Integration::Discord) {
         tasks.spawn(discord::init_discord(
@@ -44,9 +47,14 @@ pub async fn init_integrations(
             layouts.clone(),
             state_actor.clone(),
             obs_actor.clone(),
+            ladder_actor.clone()
         ));
     }
 
     // Add webserver to tasks
-    tasks.spawn(web::run_http_server(project_store.clone(), state_actor, therun_actor));
+    tasks.spawn(web::run_http_server(
+        project_store.clone(),
+        state_actor,
+        therun_actor,
+    ));
 }

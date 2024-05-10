@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use poise::serenity_prelude as serenity;
 
@@ -14,18 +18,21 @@ use serenity::{
 use crate::{
     error::Error,
     obs::LayoutFile,
-    project::{Feature, ProjectStore},
+    project::{Feature, Integration, ProjectStore},
     settings::Settings,
     state::{StateCommand, StateRequest},
-    Rto, StateActor, ObsActor
+    ObsActor, Rto, StateActor,
 };
+
+use super::ladder_league::LadderLeagueActor;
 
 struct Data {
     project: ProjectStore,
     layouts: Arc<LayoutFile>,
     settings: Arc<Settings>,
     state_actor: StateActor,
-    obs_actor: ObsActor
+    obs_actor: ObsActor,
+    ladder_actor: LadderLeagueActor,
 }
 
 type CError = Box<dyn std::error::Error + Sync + Send>;
@@ -342,15 +349,65 @@ async fn ignore(
     Ok(())
 }
 
+/// Start the timer now.
+///
+/// This may be a bit off due to input delay. For more accurate input, set a Unix timestamp with
+/// set_start_time.
+///
+/// ```
+/// /start_timer
+/// ```
+#[poise::command(prefix_command, slash_command)]
+async fn start_timer(context: Context<'_>) -> Result<(), CError> {
+    command_general(
+        &context,
+        StateCommand::SetStartTime(Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap(),
+        )),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Stop the timer now.
+///
+/// This may be a bit off due to input delay. For more accurate input, set a Unix timestamp with
+/// set_end_time.
+///
+/// ```
+/// /stop_timer
+/// ```
+#[poise::command(prefix_command, slash_command)]
+async fn stop_timer(context: Context<'_>) -> Result<(), CError> {
+    command_general(
+        &context,
+        StateCommand::SetEndTime(Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap(),
+        )),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Set the start time for a race as a Unix millis timestamp.
 ///
 /// ```
-/// /set_relay_start 1701125546192
+/// /set_start_time 1701125546192
 /// ```
 #[poise::command(prefix_command, slash_command)]
 async fn set_start_time(
     context: Context<'_>,
-    #[description = "Event start time in Unix time"] time: u64,
+    #[description = "Event start time in Unix time"] time: Option<u64>,
 ) -> Result<(), CError> {
     command_general(&context, StateCommand::SetStartTime(time)).await?;
     Ok(())
@@ -376,7 +433,7 @@ async fn start_stream(context: Context<'_>) -> Result<(), CError> {
     if !check_channel(&context).await? {
         return Ok(());
     }
-    
+
     let channel = &context.data().obs_actor;
     let _ = context.defer().await;
     let (rtx, rrx) = Rto::new();
@@ -395,7 +452,7 @@ async fn stop_stream(context: Context<'_>) -> Result<(), CError> {
     if !check_channel(&context).await? {
         return Ok(());
     }
-    
+
     let channel = &context.data().obs_actor;
     let _ = context.defer().await;
     let (rtx, rrx) = Rto::new();
@@ -426,12 +483,38 @@ async fn set_relay_time(
     Ok(())
 }
 
+/// Set up an event using a ladder league key.
+#[poise::command(prefix_command, slash_command)]
+async fn set_ladder_league(
+    context: Context<'_>,
+    #[description = "Ladder League Helper generated key"] race_id: String,
+) -> Result<(), CError> {
+    if !check_channel(&context).await? {
+        return Ok(());
+    }
+
+    log::debug!("Got league key {}", race_id);
+
+    let channel = &context.data().ladder_actor;
+    let _ = context.defer().await;
+    let (rtx, rrx) = Rto::new();
+    channel
+        .send(crate::integrations::ladder_league::LadderLeagueCommand::ActivateRace(race_id, rtx));
+
+    if let Ok(resp) = rrx.await {
+        send_discord_reply_from_response(&context, &resp).await
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn init_discord(
     settings: Arc<Settings>,
     project: ProjectStore,
     layouts: Arc<LayoutFile>,
     state_actor: StateActor,
     obs_actor: ObsActor,
+    ladder_actor: LadderLeagueActor,
 ) -> Result<(), anyhow::Error> {
     log::info!("Initializing Discord bot");
 
@@ -469,9 +552,21 @@ pub async fn init_discord(
 
     let mut commands = vec![toggle(), set(), swap(), layout(), refresh(), ignore()];
 
+    for integration in &project.read().await.integrations {
+        match integration {
+            Integration::LadderLeague => commands.push(set_ladder_league()),
+            _ => {}
+        };
+    }
+
     for feature in &project.read().await.features {
         match feature {
-            Feature::Timer => commands.extend(vec![set_start_time(), set_end_time()]),
+            Feature::Timer => commands.extend(vec![
+                set_start_time(),
+                set_end_time(),
+                start_timer(),
+                stop_timer(),
+            ]),
             Feature::StreamControl => commands.extend(vec![start_stream(), stop_stream()]),
             Feature::Relay => {
                 commands.extend(vec![set_relay_time()]);
@@ -512,7 +607,8 @@ pub async fn init_discord(
                     project,
                     layouts,
                     state_actor,
-                    obs_actor
+                    obs_actor,
+                    ladder_actor,
                 })
             })
         })

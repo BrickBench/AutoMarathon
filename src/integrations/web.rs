@@ -13,7 +13,6 @@ use super::therun::{Run, TheRunActor, TheRunRequest};
 
 #[derive(Serialize, Deserialize)]
 struct StateResponse {
-    #[serde(flatten)]
     start_time: Option<u64>,
     end_time: Option<u64>,
     runner_state: HashMap<String, PlayerResponse>,
