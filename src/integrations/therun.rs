@@ -9,7 +9,7 @@ use tokio_tungstenite;
 use url::Url;
 
 use crate::{
-    project::ProjectStore, state::{StateCommand, StateActor, StateRequest}, ActorRef, Rto
+    db::ProjectDb, stream::{StreamActor, StreamCommand, StreamRequest}, ActorRef, Rto
 };
 
 /// TheRun websocket return type
@@ -53,13 +53,13 @@ pub type TheRunActor = ActorRef<TheRunRequest>;
 type StatsStore = Arc<Mutex<Option<(Run, bool)>>>;
 
 pub async fn run_therun(
-    project: ProjectStore,
-    state_actor: StateActor,
+    db: Arc<ProjectDb>,
+    state_actor: StreamActor,
     mut rx: UnboundedReceiver<TheRunRequest>
 ) -> Result<(), anyhow::Error> {
     let mut stats_map: HashMap<String, StatsStore> = HashMap::new();
 
-    for player in &project.read().await.players {
+    for player in &db.get_runners().await? {
         let store = Arc::new(Mutex::new(None));
 
         tokio::spawn(create_player_websocket_monitor(
@@ -94,7 +94,7 @@ pub async fn run_therun(
 pub async fn create_player_websocket_monitor(
     player: String,
     therun: String,
-    state_actor: StateActor,
+    state_actor: StreamActor,
     dest: StatsStore,
 ) -> Result<(), anyhow::Error> {
     loop {
@@ -131,7 +131,7 @@ pub async fn create_player_websocket_monitor(
 async fn create_player_websocket(
     player: String,
     therun: String,
-    state_actor: StateActor,
+    state_actor: StreamActor,
     dest: StatsStore,
 ) -> Result<(), anyhow::Error> {
     let (stream, _) = tokio_tungstenite::connect_async(
@@ -149,9 +149,9 @@ async fn create_player_websocket(
                         msg.to_text().expect("Failed to get text"),
                     ) {
                         Ok(stats) => {
-                            let (rtx, rrx) = Rto::new();
-                            state_actor.send(StateRequest::UpdateState(StateCommand::UpdateRunnerLiveData(player.clone(), stats.run.clone()), rtx));
-                            let _ = rrx.await;
+                            //let (rtx, rrx) = Rto::new();
+                            //state_actor.send(StreamRequest::UpdateStream(StreamCommand::UpdateRunnerLiveData(player.clone(), stats.run.clone()), rtx));
+                           // let _ = rrx.await;
 
                             let mut stats_store = dest.lock().await;
                             *stats_store = Some((stats.run, true));

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use obws::{
@@ -8,34 +8,29 @@ use obws::{
             Bounds, CreateSceneItem, Position, SceneItemTransform, SetIndex, SetTransform,
         },
         scenes::SceneId,
+        EventSubscription,
     },
     responses::scene_items::SceneItem,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use sqlx::prelude::FromRow;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
+    db::ProjectDb,
     error::Error,
     settings::Settings,
-    state::{ModifiedState, ProjectState},
+    stream::{ModifiedStreamState, StreamState},
     ActorRef, Rto,
 };
 
-/// Json struct for OBS layout settings
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LayoutFile {
-    pub stream_name: Option<String>,
-    pub player_name: Option<String>,
-    pub layouts: Vec<ObsLayout>,
-}
-
 /// Individual layout settings
-#[derive(PartialEq, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, FromRow)]
 pub struct ObsLayout {
     pub name: String,
     /// Whether this layout should be the default layout for the provided player count
-    pub default: Option<bool>,
-    pub players: usize,
+    pub default_layout: bool,
+    pub runner_count: u32,
 }
 
 // OBS FreeType partial settings parameters
@@ -65,71 +60,166 @@ struct PlaylistItem<'a> {
     value: &'a str,
 }
 
-impl LayoutFile {
-    /// Return a layout in this layout file by name
-    pub fn get_layout_by_name(&self, name: &str) -> Result<&ObsLayout, anyhow::Error> {
-        for layout in &self.layouts {
-            if layout.name == name {
-                return Ok(layout);
-            }
-        }
-
-        Err(Error::UnknownLayout(name.to_owned()))?
-    }
-}
-
 /// Return the appropriate layout for the given project state
-fn get_layout<'a>(state: &ProjectState, layouts: &'a LayoutFile) -> Option<&'a ObsLayout> {
-    state
-        .layouts_by_count
-        .get(&state.active_players.len().try_into().unwrap()) // Use previous layout
-        .and_then(|l| layouts.get_layout_by_name(l).ok())
+fn get_layout<'a>(state: &StreamState, layouts: &'a [ObsLayout]) -> Option<&'a ObsLayout> {
+    layouts
+        .iter()
+        .find(|l| {
+            if let Some(name) = state.requested_layout.clone() {
+                l.name == name
+            } else {
+                false
+            }
+        })
+        .filter(|l| l.runner_count as usize == state.stream_runners.len())
         .or_else(|| {
             layouts
-                .layouts
                 .iter()
-                .find(|l| l.default.unwrap_or(false) && l.players == state.active_players.len())
-        }) // Use the default layout for the player count
+                .find(|l| l.default_layout && l.runner_count as usize == state.stream_runners.len())
+        }) // Use the default layout for the runner count
         .or_else(|| {
             layouts
-                .layouts
                 .iter()
-                .find(|l| l.players == state.active_players.len())
-        }) // Use any layout for the player count
+                .find(|l| l.runner_count as usize == state.stream_runners.len())
+        }) // Use any layout for the runner count
 }
 
 /// Requests for ObsActor
 pub enum ObsCommand {
-    UpdateState(ProjectState, Vec<ModifiedState>, Rto<()>),
-    SetLadderLeagueId(String, Rto<()>),
-    StartStream(Rto<()>),
-    EndStream(Rto<()>),
+    UpdateState(String, Vec<ModifiedStreamState>, Rto<()>),
+    SetLadderLeagueId(String, String, Rto<()>),
+    StartStream(String, Rto<()>),
+    EndStream(String, Rto<()>),
 }
 
 pub type ObsActor = ActorRef<ObsCommand>;
 
+type HostMap = HashMap<String, obws::Client>;
+
 pub async fn run_obs(
     settings: Arc<Settings>,
-    layouts: Arc<LayoutFile>,
-    obs: obws::Client,
+    db: Arc<ProjectDb>,
     mut rx: UnboundedReceiver<ObsCommand>,
 ) -> Result<(), anyhow::Error> {
+    let mut host_map: HostMap = HostMap::new();
+
     loop {
         match rx.recv().await.unwrap() {
-            ObsCommand::UpdateState(state, modifications, rto) => {
-                rto.reply(update_obs_state(&state, &settings, &modifications, &layouts, &obs).await)
+            ObsCommand::UpdateState(event, modifications, rto) => {
+                match db.get_stream(&event).await {
+                    Ok(stream) => {
+                        if let Err(e) =
+                            connect_client_for_host(&stream.obs_host, &mut host_map, &settings)
+                                .await
+                        {
+                            rto.reply(Err(e));
+                        } else {
+                            let obs = host_map.get_mut(&stream.obs_host).unwrap();
+                            rto.reply(
+                                update_obs_state(&event, &db, &settings, &modifications, &obs)
+                                    .await,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        rto.reply(Err(e));
+                    }
+                }
             }
-            ObsCommand::StartStream(rto) => {
-                rto.reply(obs.streaming().start().await.map_err(|e| e.into()))
-            }
-            ObsCommand::EndStream(rto) => {
-                rto.reply(obs.streaming().stop().await.map_err(|e| e.into()))
-            }
-            ObsCommand::SetLadderLeagueId(league, rto) => {
-                rto.reply(update_ladder_league_urls(&obs, &league, &settings).await)
+            ObsCommand::StartStream(event, rto) => match db.get_stream(&event).await {
+                Ok(stream) => {
+                    if let Err(e) =
+                        connect_client_for_host(&stream.obs_host, &mut host_map, &settings).await
+                    {
+                        rto.reply(Err(e));
+                    } else {
+                        let obs = host_map.get_mut(&stream.obs_host).unwrap();
+                        rto.reply(obs.streaming().start().await.map_err(|e| e.into()));
+                    }
+                }
+                Err(e) => {
+                    rto.reply(Err(e));
+                }
+            },
+            ObsCommand::EndStream(event, rto) => match db.get_stream(&event).await {
+                Ok(stream) => {
+                    if let Err(e) =
+                        connect_client_for_host(&stream.obs_host, &mut host_map, &settings).await
+                    {
+                        rto.reply(Err(e));
+                    } else {
+                        let obs = host_map.get_mut(&stream.obs_host).unwrap();
+                        rto.reply(obs.streaming().stop().await.map_err(|e| e.into()));
+                    }
+                }
+                Err(e) => {
+                    rto.reply(Err(e));
+                }
+            },
+            ObsCommand::SetLadderLeagueId(event, league, rto) => {
+                match db.get_stream(&event).await {
+                    Ok(stream) => {
+                        if let Err(e) =
+                            connect_client_for_host(&stream.obs_host, &mut host_map, &settings)
+                                .await
+                        {
+                            rto.reply(Err(e));
+                        } else {
+                            let obs = host_map.get_mut(&stream.obs_host).unwrap();
+                            rto.reply(update_ladder_league_urls(&obs, &league, &settings).await);
+                        }
+                    }
+                    Err(e) => {
+                        rto.reply(Err(e));
+                    }
+                }
             }
         };
     }
+}
+
+async fn connect_client_for_host(
+    host: &str,
+    host_map: &mut HostMap,
+    settings: &Settings,
+) -> anyhow::Result<()> {
+    let old_host = host_map.get(host);
+    if let Some(client) = old_host {
+        if client.general().version().await.is_ok() {
+            return Ok(());
+        } else {
+            log::debug!("Removing stale OBS client for host {}", host);
+            host_map.remove(host);
+        }
+    }
+
+    let config = settings
+        .obs_hosts
+        .get(host)
+        .ok_or_else(|| anyhow!(format!("No OBS host configuration found for host {}", host)))?;
+
+    let obs_config = obws::client::ConnectConfig {
+        host: config.obs_ip.to_owned(),
+        port: config.obs_port.to_owned(),
+        password: config.obs_password.to_owned(),
+        event_subscriptions: Some(EventSubscription::NONE),
+        broadcast_capacity: None,
+        connect_timeout: Duration::from_secs(30),
+    };
+    let obs = obws::Client::connect_with_config(obs_config).await?;
+
+    let obs_version = obs.general().version().await?;
+    log::info!(
+        "Connected to OBS version {}, websocket {}, running on {} ({})",
+        obs_version.obs_version.to_string(),
+        obs_version.obs_web_socket_version.to_string(),
+        obs_version.platform,
+        obs_version.platform_description
+    );
+
+    host_map.insert(host.to_owned(), obs);
+
+    Ok(())
 }
 
 pub async fn update_ladder_league_urls(
@@ -231,18 +321,19 @@ pub async fn do_transition(obs: &obws::Client, settings: &Settings) -> anyhow::R
 
 /// Apply project state to OBS
 pub async fn update_obs_state(
-    state: &ProjectState,
+    event: &str,
+    db: &ProjectDb,
     settings: &Settings,
-    modifications: &[ModifiedState],
-    layouts: &LayoutFile,
+    modifications: &[ModifiedStreamState],
     obs: &obws::Client,
 ) -> anyhow::Result<()> {
     log::debug!("Updating OBS: {:?}", modifications);
 
     let mut vlc_inputs = obs.inputs().list(Some("vlc_source")).await?;
     let scenes = obs.scenes().list().await?;
+    let state = &db.get_stream(event).await?;
 
-    match get_layout(state, layouts) {
+    match get_layout(state, &db.get_layouts().await?) {
         Some(layout) => {
             let target_layout_id = SceneId::Name(&layout.name);
 
@@ -254,7 +345,7 @@ pub async fn update_obs_state(
             }
 
             // Modify commentary text
-            if modifications.contains(&ModifiedState::Commentary) {
+            if modifications.contains(&ModifiedStreamState::Commentary) {
                 log::debug!("Updating commentator list");
                 let comm_setting = SpecificFreetype {
                     text: &state.get_commentators().join("\n"),
@@ -270,20 +361,25 @@ pub async fn update_obs_state(
 
             let scene_items = obs.scene_items().list(target_layout_id).await?;
 
-            for (idx, player) in state.active_players.iter().enumerate() {
-                log::debug!("Updating player {}", player);
-                let stream_source_id_name = format!("streamer_{}", player);
+            for (idx, runner) in state.stream_runners.iter().enumerate() {
+                log::debug!("Updating player {}", runner.name);
+                let stream_source_id_name = format!("streamer_{}", runner.name);
                 let stream_source_id = InputId::Name(&stream_source_id_name);
 
                 let mut just_created = false;
+                let good_url = runner
+                    .cached_stream_url
+                    .to_owned()
+                    .ok_or_else(|| anyhow!("No cached stream URL for runner {}", runner.name))?;
+
                 if !vlc_inputs.iter().any(|i| i.id.name == stream_source_id) {
                     // Source does not exist, create source
-                    log::debug!("Creating source for {}", player);
+                    log::debug!("Creating source for {}", runner.name);
                     let vlc_setting = VLC {
                         playlist: vec![PlaylistItem {
                             hidden: false,
                             selected: false,
-                            value: state.streams.get(player).unwrap(),
+                            value: &good_url,
                         }],
                     };
 
@@ -297,14 +393,16 @@ pub async fn update_obs_state(
 
                     obs.inputs().create(new_input).await?;
                     just_created = true;
-                } else if modifications.contains(&ModifiedState::PlayerStream(player.to_string())) {
+                } else if modifications
+                    .contains(&ModifiedStreamState::PlayerStream(runner.name.to_string()))
+                {
                     // Source exists but requires new stream
-                    log::debug!("Applying stream change to {}", player);
+                    log::debug!("Applying stream change to {}", runner.name);
                     let vlc_setting = VLC {
                         playlist: vec![PlaylistItem {
                             hidden: false,
                             selected: false,
-                            value: state.streams.get(player).unwrap(),
+                            value: &good_url,
                         }],
                     };
                     obs.inputs()
@@ -325,11 +423,11 @@ pub async fn update_obs_state(
                 }
 
                 // Update this player's view
-                if modifications.contains(&ModifiedState::PlayerView(player.to_string()))
-                    || modifications.contains(&ModifiedState::Layout)
+                if modifications.contains(&ModifiedStreamState::PlayerView(runner.name.to_string()))
+                    || modifications.contains(&ModifiedStreamState::Layout)
                     || just_created
                 {
-                    log::debug!("Deleting old items for {}", player);
+                    log::debug!("Deleting old items for {}", runner.name);
                     // Remove old scene_items
                     delete_scene_items_for_player(
                         obs,
@@ -339,10 +437,10 @@ pub async fn update_obs_state(
                     )
                     .await?;
 
-                    log::debug!("Updating name field for to {}", player);
+                    log::debug!("Updating name field for to {}", runner.name);
                     // Update name field
                     let name_setting = SpecificFreetype {
-                        text: &player.to_uppercase(),
+                        text: &runner.name.to_uppercase(),
                     };
 
                     obs.inputs()
@@ -353,7 +451,7 @@ pub async fn update_obs_state(
                         })
                         .await?;
 
-                    log::debug!("Creating new stream views for {}", player);
+                    log::debug!("Creating new stream views for {}", runner.name);
                     // Get the user-defined list of stream views in the layout
                     let stream_views: Vec<&obws::responses::scene_items::SceneItem> = scene_items
                         .iter()
@@ -454,7 +552,7 @@ pub async fn update_obs_state(
                 obs.scenes()
                     .set_current_preview_scene(target_layout_id)
                     .await?;
-            } else if modifications.contains(&ModifiedState::Layout)
+            } else if modifications.contains(&ModifiedStreamState::Layout)
                 && scenes.current_program_scene.unwrap().name != layout.name
             {
                 log::debug!("Activating new layout: {}", layout.name);

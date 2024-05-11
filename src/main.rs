@@ -1,39 +1,28 @@
-use std::{
-    env::consts,
-    fs::read_to_string,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env::consts, fs::{self, read_to_string}, path::PathBuf, sync::Arc};
 
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 
-use obws::requests::EventSubscription;
-use sqlx::{migrate::MigrateDatabase, query, sqlite::Sqlite, SqlitePool};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
-        oneshot, RwLock,
+        oneshot,
     },
     task::JoinSet,
 };
 
 use crate::{
-    integrations::discord::test_discord,
-    obs::{run_obs, LayoutFile, ObsActor},
-    project::{Project, ProjectStore},
-    settings::Settings,
-    state::{run_state_manager, StateActor},
+    db::ProjectDb, integrations::discord::test_discord, obs::{run_obs,ObsActor}, settings::Settings, stream::{run_state_manager, StreamActor}
 };
 
+mod db;
 mod error;
 mod integrations;
 mod obs;
-mod player;
-mod project;
+mod runner;
+mod event;
 mod settings;
-mod state;
+mod stream;
 
 const AUTOMARATHON_VER: &str = "0.1";
 
@@ -95,7 +84,7 @@ struct Args {
 enum RunType {
     /// Create and initialize a new project.
     /// The output .json file will need to be manually edited to fill in details for players.
-    Create { project_file: PathBuf },
+    Create { project_folder: PathBuf },
 
     /// Validate a configuration file.
     Test {
@@ -129,16 +118,10 @@ async fn main() -> anyhow::Result<()> {
 
     match &args.command {
         // Create an empty project file
-        RunType::Create { project_file } => {
-            let url = format!("sqlite://{}", project_file.to_str().unwrap());
-            Sqlite::create_database(&url).await?;
-
-            let db = SqlitePool::connect(&url).await?;
-            let project_table = sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY NOT NULL,
-                    display_name VARCHAR(250) NOT NULL, stream VARCHAR(200) NOT NULL, therun VARCHAR(250));")
-                    .execute(&db).await.unwrap();
-
-            Ok(())
+        RunType::Create { project_folder } => {
+                fs::create_dir_all(project_folder)?;
+                ProjectDb::init(&project_folder.join("project.db")).await?;
+            Ok(()) 
         }
 
         // Test for a valid project file
@@ -153,21 +136,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Run a project
         RunType::Run { project_folder } => {
-            // Load layouts
-            let layouts: Arc<LayoutFile> = Arc::new(
-                serde_json::from_str::<LayoutFile>(&read_to_string(
-                    project_folder.join("layouts.json"),
-                )?)
-                .map_err(|e| anyhow!(format!("Error while loading layouts.json: {:?}", e)))?,
-            );
-
-            // Load project
-            let project: ProjectStore = Arc::new(RwLock::new(
-                serde_json::from_str::<Project>(&read_to_string(
-                    project_folder.join("project.json"),
-                )?)
-                .map_err(|e| anyhow!(format!("Error while loading project.json: {:?}", e)))?,
-            ));
+            let db = Arc::new(ProjectDb::load(&project_folder.join("project.db")).await?);
 
             // Load settings
             let settings: Arc<Settings> = Arc::new(
@@ -177,56 +146,30 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow!(format!("Error while loading settings.json: {:?}", e)))?,
             );
 
-            log::info!("Loaded project");
-
-            // Initialize OBS websocket
-            log::info!("Connecting to OBS");
-            let obs_config = obws::client::ConnectConfig {
-                host: settings.obs_ip.to_owned().unwrap_or("localhost".to_owned()),
-                port: settings.obs_port.to_owned().unwrap_or(4455),
-                password: settings.obs_password.to_owned(),
-                event_subscriptions: Some(EventSubscription::NONE),
-                broadcast_capacity: None,
-                connect_timeout: Duration::from_secs(30),
-            };
-            let obs = obws::Client::connect_with_config(obs_config).await?;
-
-            let obs_version = obs.general().version().await?;
-            log::info!(
-                "Connected to OBS version {}, websocket {}, running on {} ({})",
-                obs_version.obs_version.to_string(),
-                obs_version.obs_web_socket_version.to_string(),
-                obs_version.platform,
-                obs_version.platform_description
-            );
-
             log::info!("AutoMarathon initialized");
 
             let mut tasks = JoinSet::<Result<(), anyhow::Error>>::new();
 
             // Set up messaging channels
-            let (state_actor, state_rx) = StateActor::new();
+            let (state_actor, state_rx) = StreamActor::new();
             let (obs_actor, obs_rx) = ObsActor::new();
 
             // Spawn optional integrations
             integrations::init_integrations(
                 &mut tasks,
                 settings.clone(),
-                layouts.clone(),
-                project.clone(),
+                db.clone(),
                 state_actor.clone(),
                 obs_actor.clone(),
             )
             .await;
 
             // Spawn OBS task.
-            tasks.spawn(run_obs(settings, layouts.clone(), obs, obs_rx));
+            tasks.spawn(run_obs(settings, db.clone(), obs_rx));
 
             // Spawn main task.
             tasks.spawn(run_state_manager(
-                project,
-                layouts,
-                project_folder.join("save.json").to_owned(),
+                db,
                 state_rx,
                 obs_actor.clone(),
             ));

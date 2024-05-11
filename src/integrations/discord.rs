@@ -1,12 +1,12 @@
 use std::{
     collections::HashSet,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use poise::serenity_prelude as serenity;
 
-use futures::{Stream, StreamExt};
+use futures::Stream;
+use futures::StreamExt;
 use serenity::{
     http::Http,
     model::{
@@ -16,21 +16,19 @@ use serenity::{
 };
 
 use crate::{
+    db::ProjectDb,
     error::Error,
-    obs::LayoutFile,
-    project::{Feature, Integration, ProjectStore},
     settings::Settings,
-    state::{StateCommand, StateRequest},
-    ObsActor, Rto, StateActor,
+    stream::{StreamCommand, StreamRequest},
+    ObsActor, Rto, StreamActor,
 };
 
 use super::ladder_league::LadderLeagueActor;
 
 struct Data {
-    project: ProjectStore,
-    layouts: Arc<LayoutFile>,
+    db: Arc<ProjectDb>,
     settings: Arc<Settings>,
-    state_actor: StateActor,
+    state_actor: StreamActor,
     obs_actor: ObsActor,
     ladder_actor: LadderLeagueActor,
 }
@@ -95,8 +93,9 @@ async fn handle_voice_state_event(
         let user_list: Vec<String> = users.iter().map(|u| u.display_name().to_string()).collect();
 
         let (rtx, rrx) = Rto::new();
-        tx.send(StateRequest::UpdateState(
-            StateCommand::Commentary(user_list),
+        tx.send(StreamRequest::UpdateStream(
+            None,
+            StreamCommand::Commentary(user_list),
             rtx,
         ));
 
@@ -159,7 +158,11 @@ async fn send_discord_reply_from_response<T>(
 }
 
 /// General command processor
-async fn command_general(context: &Context<'_>, cmd: StateCommand) -> Result<(), CError> {
+async fn command_general(
+    context: &Context<'_>,
+    cmd: StreamCommand,
+    event: Option<String>,
+) -> Result<(), CError> {
     log::debug!("Discord received command {:?}", cmd);
 
     if !check_channel(context).await? {
@@ -170,13 +173,41 @@ async fn command_general(context: &Context<'_>, cmd: StateCommand) -> Result<(),
     let _ = context.defer().await;
     let (rtx, rrx) = Rto::new();
     log::debug!("Sent valid command {:?}", cmd);
-    channel.send(StateRequest::UpdateState(cmd, rtx));
+    channel.send(StreamRequest::UpdateStream(event, cmd, rtx));
 
     if let Ok(resp) = rrx.await {
         send_discord_reply_from_response(context, &resp).await
     } else {
         Ok(())
     }
+}
+
+/// Create an autocomplete stream that matches streamed events
+async fn autocomplete_streamed_event_name<'a>(
+    ctx: Context<'_>,
+    partial: &'a str,
+) -> impl Stream<Item = String> + 'a {
+    let runners: Vec<String> = ctx.data().db.get_streamed_events().await.unwrap();
+
+    futures::stream::iter(runners)
+        .filter(move |name| {
+            futures::future::ready(name.to_lowercase().starts_with(&partial.to_lowercase()))
+        })
+        .map(|name| name.to_string())
+}
+
+/// Create an autocomplete stream that matches events
+async fn autocomplete_event_name<'a>(
+    ctx: Context<'_>,
+    partial: &'a str,
+) -> impl Stream<Item = String> + 'a {
+    let runners: Vec<String> = ctx.data().db.get_event_names().await.unwrap();
+
+    futures::stream::iter(runners)
+        .filter(move |name| {
+            futures::future::ready(name.to_lowercase().starts_with(&partial.to_lowercase()))
+        })
+        .map(|name| name.to_string())
 }
 
 /// Create an autocomplete stream that matches runner names
@@ -186,10 +217,10 @@ async fn autocomplete_runner_name<'a>(
 ) -> impl Stream<Item = String> + 'a {
     let runners: Vec<String> = ctx
         .data()
-        .project
-        .read()
+        .db
+        .get_runners()
         .await
-        .players
+        .unwrap()
         .iter()
         .map(|p| p.name.clone())
         .collect();
@@ -208,8 +239,10 @@ async fn autocomplete_layout_name<'a>(
 ) -> impl Stream<Item = String> + 'a {
     let runners: Vec<String> = ctx
         .data()
-        .layouts
-        .layouts
+        .db
+        .get_layouts()
+        .await
+        .unwrap()
         .iter()
         .map(|p| p.name.clone())
         .collect();
@@ -230,8 +263,11 @@ async fn toggle(
     #[description = "Runner to toggle"]
     #[autocomplete = "autocomplete_runner_name"]
     runner: String,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
-    command_general(&context, StateCommand::Toggle(runner)).await?;
+    command_general(&context, StreamCommand::Toggle(runner), event).await?;
     Ok(())
 }
 
@@ -248,14 +284,18 @@ async fn toggle(
 async fn refresh(
     context: Context<'_>,
     #[description = "Runners to refresh"] runners: Option<String>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
     command_general(
         &context,
-        StateCommand::Refresh(
+        StreamCommand::Refresh(
             runners
                 .map(|r| r.split(',').map(|s| s.to_owned()).collect())
                 .unwrap_or_default(),
         ),
+        event,
     )
     .await?;
     Ok(())
@@ -277,8 +317,11 @@ async fn swap(
     #[description = "Second runner"]
     #[autocomplete = "autocomplete_runner_name"]
     runner2: String,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
-    command_general(&context, StateCommand::Swap(runner1, runner2)).await?;
+    command_general(&context, StreamCommand::Swap(runner1, runner2), event).await?;
     Ok(())
 }
 
@@ -296,8 +339,11 @@ async fn layout(
     #[description = "Layout to use"]
     #[autocomplete = "autocomplete_layout_name"]
     layout: String,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
-    command_general(&context, StateCommand::Layout(layout)).await?;
+    command_general(&context, StreamCommand::Layout(layout), event).await?;
     Ok(())
 }
 
@@ -311,14 +357,18 @@ async fn layout(
 async fn set(
     context: Context<'_>,
     #[description = "Runners to enable"] runners: Option<String>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
     command_general(
         &context,
-        StateCommand::SetPlayers(
+        StreamCommand::SetPlayers(
             runners
                 .map(|r| r.split(',').map(|s| s.to_owned()).collect())
                 .unwrap_or_default(),
         ),
+        event,
     )
     .await?;
     Ok(())
@@ -336,14 +386,18 @@ async fn set(
 async fn ignore(
     context: Context<'_>,
     #[description = "Names to ignore"] ignored: Option<String>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
     command_general(
         &context,
-        StateCommand::CommentaryIgnore(
+        StreamCommand::CommentaryIgnore(
             ignored
                 .map(|r| r.split(',').map(|s| s.to_owned()).collect())
                 .unwrap_or_default(),
         ),
+        event,
     )
     .await?;
     Ok(())
@@ -358,10 +412,16 @@ async fn ignore(
 /// /start_timer
 /// ```
 #[poise::command(prefix_command, slash_command)]
-async fn start_timer(context: Context<'_>) -> Result<(), CError> {
+async fn start_timer(
+    context: Context<'_>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_event_name"]
+    event: Option<String>,
+) -> Result<(), CError> {
+    /*
     command_general(
         &context,
-        StateCommand::SetStartTime(Some(
+        StreamCommand::SetStartTime(Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -369,8 +429,9 @@ async fn start_timer(context: Context<'_>) -> Result<(), CError> {
                 .try_into()
                 .unwrap(),
         )),
+        event,
     )
-    .await?;
+    .await?;*/
     Ok(())
 }
 
@@ -383,10 +444,15 @@ async fn start_timer(context: Context<'_>) -> Result<(), CError> {
 /// /stop_timer
 /// ```
 #[poise::command(prefix_command, slash_command)]
-async fn stop_timer(context: Context<'_>) -> Result<(), CError> {
+async fn stop_timer(
+    context: Context<'_>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_event_name"]
+    event: Option<String>,
+) -> Result<(), CError> {/*
     command_general(
         &context,
-        StateCommand::SetEndTime(Some(
+        StreamCommand::SetEndTime(Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -394,8 +460,9 @@ async fn stop_timer(context: Context<'_>) -> Result<(), CError> {
                 .try_into()
                 .unwrap(),
         )),
+        event,
     )
-    .await?;
+    .await?;*/
     Ok(())
 }
 
@@ -408,8 +475,11 @@ async fn stop_timer(context: Context<'_>) -> Result<(), CError> {
 async fn set_start_time(
     context: Context<'_>,
     #[description = "Event start time in Unix time"] time: Option<u64>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
-    command_general(&context, StateCommand::SetStartTime(time)).await?;
+   // command_general(&context, StreamCommand::SetStartTime(time), event).await?;
     Ok(())
 }
 
@@ -422,14 +492,23 @@ async fn set_start_time(
 async fn set_end_time(
     context: Context<'_>,
     #[description = "Event start time in Unix time"] time: Option<u64>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_event_name"]
+    event: Option<String>,
 ) -> Result<(), CError> {
-    command_general(&context, StateCommand::SetEndTime(time)).await?;
+
+   // command_general(&context, StreamCommand::SetEndTime(time), event).await?;
     Ok(())
 }
 
 /// Start the OBS stream.
 #[poise::command(prefix_command, slash_command)]
-async fn start_stream(context: Context<'_>) -> Result<(), CError> {
+async fn start_stream(
+    context: Context<'_>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: String,
+) -> Result<(), CError> {
     if !check_channel(&context).await? {
         return Ok(());
     }
@@ -437,7 +516,7 @@ async fn start_stream(context: Context<'_>) -> Result<(), CError> {
     let channel = &context.data().obs_actor;
     let _ = context.defer().await;
     let (rtx, rrx) = Rto::new();
-    channel.send(crate::obs::ObsCommand::StartStream(rtx));
+    channel.send(crate::obs::ObsCommand::StartStream(event, rtx));
 
     if let Ok(resp) = rrx.await {
         send_discord_reply_from_response(&context, &resp).await
@@ -448,7 +527,12 @@ async fn start_stream(context: Context<'_>) -> Result<(), CError> {
 
 /// Stop the OBS stream.
 #[poise::command(prefix_command, slash_command)]
-async fn stop_stream(context: Context<'_>) -> Result<(), CError> {
+async fn stop_stream(
+    context: Context<'_>,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: String,
+) -> Result<(), CError> {
     if !check_channel(&context).await? {
         return Ok(());
     }
@@ -456,7 +540,7 @@ async fn stop_stream(context: Context<'_>) -> Result<(), CError> {
     let channel = &context.data().obs_actor;
     let _ = context.defer().await;
     let (rtx, rrx) = Rto::new();
-    channel.send(crate::obs::ObsCommand::EndStream(rtx));
+    channel.send(crate::obs::ObsCommand::EndStream(event, rtx));
 
     if let Ok(resp) = rrx.await {
         send_discord_reply_from_response(&context, &resp).await
@@ -465,29 +549,13 @@ async fn stop_stream(context: Context<'_>) -> Result<(), CError> {
     }
 }
 
-/// Set the event end time for a runner.
-///
-/// This time should be the time that the relay timer shows when the player's run ends.
-/// ```
-/// /set_relay_time javster101 01:30:20
-/// ```
-#[poise::command(prefix_command, slash_command)]
-async fn set_relay_time(
-    context: Context<'_>,
-    #[description = "Runner"]
-    #[autocomplete = "autocomplete_runner_name"]
-    runner: String,
-    #[description = "Run time"] time: String,
-) -> Result<(), CError> {
-    command_general(&context, StateCommand::SetRelayRunTime(runner, time)).await?;
-    Ok(())
-}
-
 /// Set up an event using a ladder league key.
 #[poise::command(prefix_command, slash_command)]
 async fn set_ladder_league(
     context: Context<'_>,
     #[description = "Ladder League Helper generated key"] race_id: String,
+    #[description = "Event to create from this ladder league race"] event: String,
+    #[description = "OBS host for this event"] obs_host: String,
 ) -> Result<(), CError> {
     if !check_channel(&context).await? {
         return Ok(());
@@ -498,8 +566,9 @@ async fn set_ladder_league(
     let channel = &context.data().ladder_actor;
     let _ = context.defer().await;
     let (rtx, rrx) = Rto::new();
-    channel
-        .send(crate::integrations::ladder_league::LadderLeagueCommand::ActivateRace(race_id, rtx));
+    channel.send(
+        crate::integrations::ladder_league::LadderLeagueCommand::ActivateRace(event, race_id, obs_host, rtx),
+    );
 
     if let Ok(resp) = rrx.await {
         send_discord_reply_from_response(&context, &resp).await
@@ -510,9 +579,8 @@ async fn set_ladder_league(
 
 pub async fn init_discord(
     settings: Arc<Settings>,
-    project: ProjectStore,
-    layouts: Arc<LayoutFile>,
-    state_actor: StateActor,
+    db: Arc<ProjectDb>,
+    state_actor: StreamActor,
     obs_actor: ObsActor,
     ladder_actor: LadderLeagueActor,
 ) -> Result<(), anyhow::Error> {
@@ -550,30 +618,21 @@ pub async fn init_discord(
         | serenity::GatewayIntents::MESSAGE_CONTENT
         | serenity::GatewayIntents::GUILD_VOICE_STATES;
 
-    let mut commands = vec![toggle(), set(), swap(), layout(), refresh(), ignore()];
-
-    for integration in &project.read().await.integrations {
-        match integration {
-            Integration::LadderLeague => commands.push(set_ladder_league()),
-            _ => {}
-        };
-    }
-
-    for feature in &project.read().await.features {
-        match feature {
-            Feature::Timer => commands.extend(vec![
-                set_start_time(),
-                set_end_time(),
-                start_timer(),
-                stop_timer(),
-            ]),
-            Feature::StreamControl => commands.extend(vec![start_stream(), stop_stream()]),
-            Feature::Relay => {
-                commands.extend(vec![set_relay_time()]);
-            }
-            _ => {}
-        };
-    }
+    let commands = vec![
+        toggle(),
+        set(),
+        swap(),
+        layout(),
+        refresh(),
+        ignore(),
+        set_ladder_league(),
+        start_stream(),
+        stop_stream(),
+        set_start_time(),
+        set_end_time(),
+        start_timer(),
+        stop_timer(),
+    ];
 
     let options = poise::FrameworkOptions::<Data, CError> {
         commands,
@@ -603,9 +662,8 @@ pub async fn init_discord(
                 log::info!("Logged in as {}", _ready.user.name);
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
                 Ok(Data {
+                    db,
                     settings,
-                    project,
-                    layouts,
                     state_actor,
                     obs_actor,
                     ladder_actor,
