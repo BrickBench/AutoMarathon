@@ -1,8 +1,9 @@
+use anyhow::anyhow;
 use std::path::PathBuf;
 
-use sqlx::{migrate::MigrateDatabase, query, sqlite::Sqlite, types::chrono, SqlitePool};
+use sqlx::{migrate::MigrateDatabase, query, sqlite::Sqlite, types::time, SqlitePool};
 
-use crate::{obs::ObsLayout, runner::Runner, event::Event, stream::StreamState};
+use crate::{event::Event, obs::ObsLayout, runner::Runner, stream::StreamState};
 
 pub struct ProjectDb {
     db: SqlitePool,
@@ -19,7 +20,8 @@ impl ProjectDb {
                         name text primary key not null collate nocase,
                         stream text, 
                         therun text,
-                        cached_stream_url text
+                        cached_stream_url text,
+                        volume_percent integer not null
                     );"
         )
         .execute(&db)
@@ -72,7 +74,7 @@ impl ProjectDb {
         query!(
             "create table streams(
                     event text primary key not null unique,
-                    stream_host text not null,
+                    obs_host text not null,
                     active_commentators text not null,
                     ignored_commentators text not null,
                     requested_layout text,
@@ -112,12 +114,14 @@ impl ProjectDb {
             .await?)
     }
 
-    pub async fn add_runner(&self, runner: &Runner, nicks: &[&str]) -> anyhow::Result<()> {
+    pub async fn add_runner(&self, runner: &Runner, nicks: &[String]) -> anyhow::Result<()> {
+        log::debug!("Creating new runner {}", runner.name);
         let mut tx = self.db.begin().await?;
-        sqlx::query("insert into runners(name, stream, therun) values(?, ?, ?)")
+        sqlx::query("insert into runners(name, stream, therun, volume_percent) values(?, ?, ?, ?)")
             .bind(&runner.name)
             .bind(&runner.stream)
             .bind(&runner.therun)
+            .bind(&runner.volume_percent)
             .execute(&mut *tx)
             .await?;
 
@@ -133,8 +137,17 @@ impl ProjectDb {
     }
 
     pub async fn update_runner_stream_url(&self, runner: &Runner) -> anyhow::Result<()> {
-        Ok(sqlx::query("update runners set stream = ? where name = ?")
-            .bind(&runner.stream)
+        Ok(sqlx::query("update runners set cached_stream_url = ? where name = ?")
+            .bind(&runner.cached_stream_url)
+            .bind(&runner.name)
+            .execute(&self.db)
+            .await
+            .map(|_| ())?)
+    }
+
+    pub async fn update_runner_volume(&self, runner: &Runner) -> anyhow::Result<()> {
+        Ok(sqlx::query("update runners set volume = ? where name = ?")
+            .bind(&runner.cached_stream_url)
             .bind(&runner.name)
             .execute(&self.db)
             .await
@@ -142,19 +155,32 @@ impl ProjectDb {
     }
 
     pub async fn find_runner(&self, name: &str) -> anyhow::Result<Runner> {
-        Ok(sqlx::query_as(
-            "select * from runners
-                        left join nicknames on runners.id = nicknames.runner
-                        where display_name = ?
-                        or nickname = ?",
+        log::debug!("Searching for runner {}", name);
+        sqlx::query_as(
+            "select * from runners 
+                        where name = ?
+                        limit 1",
+            /*"select * from runners r
+                        left join nicknames n on r.name = n.runner
+                        where r.name = '?' or n.nickname = '?'
+                        limit 1",*/
         )
         .bind(name)
-        .bind(name)
-        .fetch_one(&self.db)
-        .await?)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(anyhow!("Failed to find runner {}", name))
+    }
+
+    pub async fn delete_runner(&self, runner: &str) -> anyhow::Result<()> {
+        Ok(sqlx::query("delete from runners where name = ?")
+            .bind(runner)
+            .execute(&self.db)
+            .await
+            .map(|_| ())?)
     }
 
     pub async fn add_event(&self, event: &Event) -> anyhow::Result<()> {
+        log::debug!("Creating event {}", event.name);
         Ok(sqlx::query(
             "insert into events(name, therun_race_id, is_relay, is_marathon) values(?, ?, ?, ?)",
         )
@@ -185,11 +211,11 @@ impl ProjectDb {
     pub async fn set_event_start_time(
         &self,
         event_id: &str,
-        time: Option<chrono::DateTime<chrono::Utc>>,
+        time: Option<time::OffsetDateTime>,
     ) -> anyhow::Result<()> {
         Ok(
             sqlx::query("update events set start_time = ? where name = ?")
-                .bind(time.map(|t| t.timestamp()))
+                .bind(time.map(|t| t.unix_timestamp()))
                 .bind(event_id)
                 .execute(&self.db)
                 .await
@@ -200,10 +226,10 @@ impl ProjectDb {
     pub async fn set_event_end_time(
         &self,
         event_id: &str,
-        time: Option<chrono::DateTime<chrono::Utc>>,
+        time: Option<time::OffsetDateTime>,
     ) -> anyhow::Result<()> {
         Ok(sqlx::query("update events set end_time = ? where name = ?")
-            .bind(time.map(|t| t.timestamp()))
+            .bind(time.map(|t| t.unix_timestamp()))
             .bind(event_id)
             .execute(&self.db)
             .await
@@ -213,10 +239,21 @@ impl ProjectDb {
     pub async fn get_runners_for_event(&self, event_id: &str) -> anyhow::Result<Vec<Runner>> {
         Ok(sqlx::query_as(
             "select * from runners
-                        left join runners_in_event on runners.id = runners_in_event.runner
+                        inner join runners_in_event on runners.name = runners_in_event.runner
                         where event = ?",
         )
         .bind(event_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    pub async fn get_events_for_runner(&self, runner: &str) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "select e.name from events e
+                        inner join runners_in_event r on e.name = r.event
+                        where r.runner = ?",
+        )
+        .bind(runner)
         .fetch_all(&self.db)
         .await?)
     }
@@ -232,8 +269,8 @@ impl ProjectDb {
         )
     }
 
-    pub async fn remove_stream(&self, event_id: &str) -> anyhow::Result<()> {
-        Ok(sqlx::query("delete from streams where event = ?")
+    pub async fn delete_event(&self, event_id: &str) -> anyhow::Result<()> {
+        Ok(sqlx::query("delete from events where name = ?")
             .bind(event_id)
             .execute(&self.db)
             .await
@@ -245,26 +282,49 @@ impl ProjectDb {
             .fetch_one(&self.db)
             .await?)
     }
-    
+
     pub async fn get_streamed_events(&self) -> anyhow::Result<Vec<String>> {
         Ok(sqlx::query_scalar("select event from streams")
             .fetch_all(&self.db)
             .await?)
     }
 
+    pub async fn get_stream(&self, event_id: &str) -> anyhow::Result<StreamState> {
+        let mut state: StreamState =
+            sqlx::query_as("select * from streams where event = ? limit 1")
+                .bind(event_id)
+                .fetch_one(&self.db)
+                .await?;
+
+        state.stream_runners = sqlx::query_as(
+            "select *
+                from runners r
+                inner join runners_in_stream s on r.name = s.runner
+                where s.event = ?
+                order by s.stream_order",
+        )
+        .bind(event_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(state)
+    }
+
     pub async fn save_stream(&self, state: &StreamState) -> anyhow::Result<()> {
         let mut tx = self.db.begin().await?;
-        sqlx::query("insert or replace into streams(
-                        event, stream_host, active_commentators,
+        sqlx::query(
+            "insert or replace into streams(
+                        event, obs_host, active_commentators,
                         ignored_commentators, requested_layout
-                    ) values(?, ?, ?)")
-            .bind(&state.event)
-            .bind(&state.obs_host)
-            .bind(&state.active_commentators)
-            .bind(&state.ignored_commentators)
-            .bind(&state.requested_layout)
-            .execute(&mut *tx)
-            .await?;
+                    ) values(?, ?, ?, ?, ?)",
+        )
+        .bind(&state.event)
+        .bind(&state.obs_host)
+        .bind(&state.active_commentators)
+        .bind(&state.ignored_commentators)
+        .bind(&state.requested_layout)
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query("delete from runners_in_stream where event = ?")
             .bind(&state.event)
@@ -288,30 +348,57 @@ impl ProjectDb {
         Ok(())
     }
 
-    pub async fn get_stream(&self, event_id: &str) -> anyhow::Result<StreamState> {
-        let mut state: StreamState =
-            sqlx::query_as("select * from streams where event = ? limit 1")
-                .bind(event_id)
-                .fetch_one(&self.db)
-                .await?;
-
-        state.stream_runners = sqlx::query_as(
-            "select *
-                from runners r
-                inner join runners_in_stream s on r.id = s.runner
-                where s.event = ?
-                order by s.stream_order",
+    pub async fn is_host_in_use(&self, obs_host: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "select count(*) from streams 
+                                    where obs_host = ?",
         )
-        .bind(event_id)
-        .fetch_all(&self.db)
-        .await?;
+        .bind(obs_host)
+        .fetch_one(&self.db)
+        .await?)
+    }
 
-        Ok(state)
+    pub async fn get_event_by_obs_host(&self, obs_host: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "select event from streams 
+                                    where obs_host = ?",
+        )
+        .bind(obs_host)
+        .fetch_optional(&self.db)
+        .await?)
+    }
+
+    pub async fn delete_stream(&self, event_id: &str) -> anyhow::Result<()> {
+        Ok(sqlx::query("delete from streams where event = ?")
+            .bind(event_id)
+            .execute(&self.db)
+            .await
+            .map(|_| ())?)
+    }
+
+    pub async fn create_layout(&self, layout: &ObsLayout) -> anyhow::Result<()> {
+        Ok(sqlx::query(
+            "insert into layouts(name, runner_count, default_layout) values(?, ?, ?)",
+        )
+        .bind(&layout.name)
+        .bind(layout.runner_count)
+        .bind(layout.default_layout)
+        .execute(&self.db)
+        .await
+        .map(|_| ())?)
     }
 
     pub async fn get_layouts(&self) -> anyhow::Result<Vec<ObsLayout>> {
         Ok(sqlx::query_as("select * from layouts")
             .fetch_all(&self.db)
             .await?)
+    }
+
+    pub async fn delete_layout(&self, layout: &str) -> anyhow::Result<()> {
+        Ok(sqlx::query("delete from layouts where name = ?")
+            .bind(layout)
+            .execute(&self.db)
+            .await
+            .map(|_| ())?)
     }
 }

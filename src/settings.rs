@@ -10,7 +10,6 @@ pub struct Settings {
     pub keep_unused_streams: Option<bool>,
     pub discord_token: Option<String>,
     pub discord_command_channel: Option<String>,
-    pub discord_voice_channel: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -18,4 +17,5 @@ pub struct ObsHost {
     pub obs_ip: String,
     pub obs_port: u16,
     pub obs_password: Option<String>,
+    pub discord_voice_channel: Option<String>
 }

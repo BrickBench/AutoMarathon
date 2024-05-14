@@ -30,40 +30,55 @@ enum ProjectTypePlayerResponse {
     Relay { run_time: Option<String> },
 }
 
-async fn project_endpoint(event: String, db: &ProjectDb) -> Result<impl warp::Reply, Infallible> {
-    if let Ok(event) = db.get_event(&event).await {
-        Ok(warp::reply::with_status(
-            serde_json::to_string::<Event>(&event).unwrap(),
-            warp::http::StatusCode::OK,
-        ))
+async fn event_endpoint(
+    args: HashMap<String, String>,
+    db: &ProjectDb,
+) -> Result<impl warp::Reply, Infallible> {
+    if let Some(event) = args.get("name") {
+        if let Ok(event) = db.get_event(&event).await {
+            Ok(warp::reply::with_status(
+                serde_json::to_string::<Event>(&event).unwrap(),
+                warp::http::StatusCode::OK,
+            ))
+        } else {
+            Ok(warp::reply::with_status(
+                "Failed to find event by name".to_string(),
+                warp::http::StatusCode::BAD_REQUEST,
+            ))
+        }
     } else {
         Ok(warp::reply::with_status(
-            "Failed to find event by name".to_string(),
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Missing 'event' field".to_string(),
+            warp::http::StatusCode::BAD_REQUEST,
         ))
     }
 }
 
 async fn commentary_endpoint(
-    event: String,
+    args: HashMap<String, String>,
     db: &ProjectDb,
 ) -> Result<impl warp::Reply, Infallible> {
-    if let Ok(state) = db.get_stream(&event).await {
-        Ok(warp::reply::with_status(
-            serde_json::to_string(&state.get_commentators()).unwrap(),
-            warp::http::StatusCode::OK,
-        ))
+    if let Some(event) = args.get("event") {
+        if let Ok(state) = db.get_stream(&event).await {
+            Ok(warp::reply::with_status(
+                serde_json::to_string(&state.get_commentators()).unwrap(),
+                warp::http::StatusCode::OK,
+            ))
+        } else {
+            Ok(warp::reply::with_status(
+                "Failed to request value".to_string(),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
     } else {
         Ok(warp::reply::with_status(
-            "Failed to request value".to_string(),
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Missing 'event' field".to_string(),
+            warp::http::StatusCode::BAD_REQUEST,
         ))
     }
 }
 
-pub async fn run_http_server(
-    db: Arc<ProjectDb>,
-) -> Result<(), anyhow::Error> {
+pub async fn run_http_server(db: Arc<ProjectDb>) -> Result<(), anyhow::Error> {
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec![
@@ -79,16 +94,16 @@ pub async fn run_http_server(
         .allow_methods(&[Method::GET, Method::POST, Method::DELETE]);
 
     let db2 = db.clone();
-    let project_endpoint = warp::path("project")
-        .and(warp::query::<String>())
+    let project_endpoint = warp::path("event")
+        .and(warp::query::<HashMap<String, String>>())
         .and(warp::path::end())
         .and_then(move |event| {
             let db2 = db2.clone();
-            async move { project_endpoint(event, &db2).await }
+            async move { event_endpoint(event, &db2).await }
         });
 
     let commentary_endpoint = warp::path("commentators")
-        .and(warp::query::<String>())
+        .and(warp::query::<HashMap<String, String>>())
         .and(warp::path::end())
         .and_then(move |event| {
             let db = db.clone();
@@ -100,7 +115,7 @@ pub async fn run_http_server(
         .and(warp::fs::file("web/dashboard.html"));
 
     warp::serve(
-       project_endpoint 
+        project_endpoint
             .or(commentary_endpoint)
             .or(dashboard)
             .with(cors),

@@ -24,6 +24,9 @@ pub struct Runner {
 
     /// A cache of this runner's latest valid m3u8 link
     pub cached_stream_url: Option<String>,
+
+    /// User volume in percent
+    pub volume_percent: u32
 }
 
 #[derive(PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -72,7 +75,7 @@ impl Runner {
                 parsed_json["error"].to_string(),
             ))?
         } else {
-            let new_url = parsed_json["streams"]["best"]["url"]
+            let new_url = parsed_json["streams"]["720p"]["url"]
                 .to_string()
                 .replace('\"', "");
             if let Some(old_url) = &self.cached_stream_url {

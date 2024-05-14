@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::anyhow;
 use obws::{
     requests::{
-        inputs::{self, InputId, SetSettings},
+        inputs::{self, InputId, SetSettings, Volume},
         scene_items::{
             Bounds, CreateSceneItem, Position, SceneItemTransform, SetIndex, SetTransform,
         },
@@ -157,6 +157,7 @@ pub async fn run_obs(
                 }
             },
             ObsCommand::SetLadderLeagueId(event, league, rto) => {
+                log::debug!("Configuring ladder league URL for {}", event);
                 match db.get_stream(&event).await {
                     Ok(stream) => {
                         if let Err(e) =
@@ -206,6 +207,7 @@ async fn connect_client_for_host(
         broadcast_capacity: None,
         connect_timeout: Duration::from_secs(30),
     };
+
     let obs = obws::Client::connect_with_config(obs_config).await?;
 
     let obs_version = obs.general().version().await?;
@@ -228,7 +230,7 @@ pub async fn update_ladder_league_urls(
     settings: &Settings,
 ) -> anyhow::Result<()> {
     log::debug!("Updating browser sources to use ID: {}", league_id);
-    let host_prefix = "http://localhost:35065/";
+    let host_prefix = "http://10.10.0.4:35065/";
     let site = format!("{}?spreadsheet_id={}", host_prefix, league_id);
 
     obs.inputs()
@@ -258,28 +260,28 @@ pub async fn update_ladder_league_urls(
         );
         obs.inputs()
             .set_settings(SetSettings {
-                input: InputId::Name(&format!("runner_name_{}", i + 1)),
+                input: InputId::Name(&format!("runner_name_{}", i )),
                 settings: &Browser { url: &name },
                 overlay: Some(true),
             })
             .await?;
         obs.inputs()
             .set_settings(SetSettings {
-                input: InputId::Name(&format!("post_info_{}", i + 1)),
+                input: InputId::Name(&format!("post_info_{}", i)),
                 settings: &Browser { url: &post_info },
                 overlay: Some(true),
             })
             .await?;
         obs.inputs()
             .set_settings(SetSettings {
-                input: InputId::Name(&format!("pictures_{}", i + 1)),
+                input: InputId::Name(&format!("pictures_{}", i)),
                 settings: &Browser { url: &pictures },
                 overlay: Some(true),
             })
             .await?;
         obs.inputs()
             .set_settings(SetSettings {
-                input: InputId::Name(&format!("overlay_{}", i + 1)),
+                input: InputId::Name(&format!("overlay_{}", i)),
                 settings: &Browser { url: &overlay },
                 overlay: Some(true),
             })
@@ -418,6 +420,12 @@ pub async fn update_obs_state(
 
                 if idx == 0 {
                     obs.inputs().set_muted(stream_source_id, false).await?;
+                    obs.inputs()
+                        .set_volume(
+                            stream_source_id,
+                            Volume::Mul(0.01 * runner.volume_percent as f32),
+                        )
+                        .await?;
                 } else {
                     obs.inputs().set_muted(stream_source_id, true).await?;
                 }
@@ -437,19 +445,24 @@ pub async fn update_obs_state(
                     )
                     .await?;
 
-                    log::debug!("Updating name field for to {}", runner.name);
-                    // Update name field
-                    let name_setting = SpecificFreetype {
-                        text: &runner.name.to_uppercase(),
-                    };
+                    let name_field = &format!("name_{}", idx);
+                    if scene_items.iter().any(|s| &s.source_name == name_field) {
+                        log::debug!("Updating name field for to {}", runner.name);
+                        // Update name field
+                        let name_setting = SpecificFreetype {
+                            text: &runner.name.to_uppercase(),
+                        };
 
-                    obs.inputs()
-                        .set_settings(SetSettings {
-                            input: InputId::Name(&format!("name_{}", idx)),
-                            settings: &name_setting,
-                            overlay: Some(true),
-                        })
-                        .await?;
+                        obs.inputs()
+                            .set_settings(SetSettings {
+                                input: InputId::Name(name_field),
+                                settings: &name_setting,
+                                overlay: Some(true),
+                            })
+                            .await?;
+                    } else {
+                        log::debug!("{} has no nametag, skipping", runner.name);
+                    }
 
                     log::debug!("Creating new stream views for {}", runner.name);
                     // Get the user-defined list of stream views in the layout

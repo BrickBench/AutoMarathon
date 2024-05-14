@@ -6,6 +6,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::db::ProjectDb;
 use crate::runner::Runner;
+use crate::send_message;
 use crate::{obs::ObsCommand, ActorRef, ObsActor, Rto};
 
 #[derive(PartialEq, Debug, FromRow)]
@@ -69,6 +70,35 @@ pub enum ModifiedStreamState {
     Commentary,
 }
 
+/// Verify the name of a streamed event.
+///
+/// This function returns the contents of `event_name`,
+/// or attempts to get the name of the single active
+/// stream if `event_name` is `None`
+pub async fn validate_streamed_event_name(
+    db: &ProjectDb,
+    event_name: Option<String>,
+) -> anyhow::Result<String> {
+    if let Some(event_id) = event_name {
+        if db.get_stream(&event_id).await.is_ok() {
+            Ok(event_id)
+        } else {
+            Err(anyhow!("No stream for event '{}' exists.", &event_id))
+        }
+    } else {
+        let count = db.get_stream_count().await?;
+        if count == 1 {
+            Ok(db.get_streamed_events().await?[0].clone())
+        } else if count == 0 {
+            Err(anyhow!("Cannot determine event, no streams are active."))
+        } else {
+            Err(anyhow!(
+                "Multiple streams are active, please specify the streamed event to use."
+            ))
+        }
+    }
+}
+
 pub async fn run_state_manager(
     db: Arc<ProjectDb>,
     mut rx: UnboundedReceiver<StreamRequest>,
@@ -79,34 +109,35 @@ pub async fn run_state_manager(
         match msg {
             StreamRequest::UpdateStream(event_name, cmd, rto) => {
                 log::info!("Applying command {:?}", cmd);
-                
-                let event_name = match event_name {
-                    Some(name) => name,
-                    None if db.get_stream_count().await? == 1 => db.get_streamed_events().await?[0].clone(),
-                    None => {
-                        rto.reply(Err(anyhow!("No event specified and no streams are active.")));
+
+                let event_name = match validate_streamed_event_name(&db, event_name).await {
+                    Ok(name) => name,
+                    Err(err) => {
+                        rto.reply(Err(err));
                         continue;
                     }
                 };
 
-                if let Ok(_) = db.get_event(&event_name).await {
-                    if let Ok(mut stream) = db.get_stream(&event_name).await {
-                        match stream.apply_cmd(&db, &cmd).await {
-                            Ok(mods) => {
-                                let (tx, rrx) = Rto::<()>::new();
-                                obs.send(ObsCommand::UpdateState(event_name, mods, tx));
-                                rto.reply(rrx.await?);
-                            }
-                            Err(e) => rto.reply(Err(e)),
+                if let Ok(mut stream) = db.get_stream(&event_name).await {
+                    match stream.apply_cmd(&db, &cmd).await {
+                        Ok(mods) => {
+                            db.save_stream(&stream).await?;
+                            rto.reply(send_message!(
+                                obs,
+                                ObsCommand,
+                                UpdateState,
+                                event_name,
+                                mods
+                            ));
                         }
-                    } else {
-                        rto.reply(Err(anyhow!("No stream found for event '{}'.", event_name)));
+                        Err(e) => rto.reply(Err(e)),
                     }
                 } else {
-                    rto.reply(Err(anyhow!("Event '{}' not found.", event_name)));
+                    rto.reply(Err(anyhow!("No stream found for event '{}'.", event_name)));
                 }
             }
             StreamRequest::CreateStream(event, host, rto) => {
+                log::debug!("Creating stream for {}", event);
                 let state = StreamState {
                     event,
                     obs_host: host,
@@ -119,7 +150,7 @@ pub async fn run_state_manager(
                 rto.reply(db.save_stream(&state).await);
             }
             StreamRequest::DeleteStream(event, rto) => {
-                rto.reply(db.remove_stream(&event).await);
+                rto.reply(db.delete_stream(&event).await);
             }
         }
     }
@@ -235,30 +266,9 @@ impl StreamState {
             StreamCommand::Commentary(comms) => {
                 if !self.active_commentators.eq(&comms.join(";")) {
                     modifications.push(ModifiedStreamState::Commentary);
-                    self.active_commentators = comms.join(":");
+                    self.active_commentators = comms.join(";");
                 }
-            } /*
-              StreamCommand::SetStartTime(time) => {
-                  if project.features.contains(&Feature::Timer) {
-                      if let Some(ref mut timer_state) = self.timer_state {
-                          timer_state.start_date_time = time.to_owned();
-                          if let Some(ref mut end_time) = timer_state.end_date_time {
-                              if let Some(start_time) = timer_state.start_date_time {
-                                  if start_time > *end_time {
-                                      timer_state.end_date_time = None;
-                                  }
-                              }
-                          }
-                      }
-                  }
-              }
-              StreamCommand::SetEndTime(time) => {
-                  if project.features.contains(&Feature::Timer) {
-                      if let Some(ref mut timer_state) = self.timer_state {
-                          timer_state.end_date_time = time.to_owned();
-                      }
-                  }
-              }*/
+            }
         };
 
         Ok(modifications)

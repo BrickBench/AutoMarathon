@@ -1,4 +1,9 @@
-use std::{env::consts, fs::{self, read_to_string}, path::PathBuf, sync::Arc};
+use std::{
+    env::consts,
+    fs::{self, read_to_string},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
@@ -12,19 +17,37 @@ use tokio::{
 };
 
 use crate::{
-    db::ProjectDb, integrations::discord::test_discord, obs::{run_obs,ObsActor}, settings::Settings, stream::{run_state_manager, StreamActor}
+    db::ProjectDb,
+    integrations::discord::test_discord,
+    obs::{run_obs, ObsActor},
+    settings::Settings,
+    stream::{run_state_manager, StreamActor},
 };
 
 mod db;
 mod error;
+mod event;
 mod integrations;
 mod obs;
 mod runner;
-mod event;
 mod settings;
 mod stream;
 
 const AUTOMARATHON_VER: &str = "0.1";
+
+#[macro_export]
+macro_rules! send_message {
+    ($actor: expr, $type: ident, $msg: ident, $($vals: expr),*) => {
+        {
+            let (tx, rx) = Rto::new();
+            $actor.send($type::$msg($($vals),*, tx));
+            match rx.await {
+                Ok(val) => val,
+                Err(e) => Err(e.into())
+            }
+        }
+    };
+}
 
 /// Actor reference
 struct ActorRef<T> {
@@ -119,9 +142,9 @@ async fn main() -> anyhow::Result<()> {
     match &args.command {
         // Create an empty project file
         RunType::Create { project_folder } => {
-                fs::create_dir_all(project_folder)?;
-                ProjectDb::init(&project_folder.join("project.db")).await?;
-            Ok(()) 
+            fs::create_dir_all(project_folder)?;
+            ProjectDb::init(&project_folder.join("project.db")).await?;
+            Ok(())
         }
 
         // Test for a valid project file
@@ -140,9 +163,12 @@ async fn main() -> anyhow::Result<()> {
 
             // Load settings
             let settings: Arc<Settings> = Arc::new(
-                serde_json::from_str::<Settings>(&read_to_string(
-                    project_folder.join("settings.json"),
-                )?)
+                serde_json::from_str::<Settings>(
+                    &read_to_string(project_folder.join("settings.json")).map_err(|_| anyhow!(format!(
+                        "Failed to load settings.json file, could not read from {}/settings.json",
+                        project_folder.to_str().unwrap()
+                    )))?,
+                )
                 .map_err(|e| anyhow!(format!("Error while loading settings.json: {:?}", e)))?,
             );
 
@@ -168,11 +194,7 @@ async fn main() -> anyhow::Result<()> {
             tasks.spawn(run_obs(settings, db.clone(), obs_rx));
 
             // Spawn main task.
-            tasks.spawn(run_state_manager(
-                db,
-                state_rx,
-                obs_actor.clone(),
-            ));
+            tasks.spawn(run_state_manager(db, state_rx, obs_actor.clone()));
 
             loop {
                 match tasks.join_next().await {
