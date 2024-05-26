@@ -78,6 +78,7 @@ impl ProjectDb {
                     active_commentators text not null,
                     ignored_commentators text not null,
                     requested_layout text,
+                    audible_runner text,
                     foreign key(event) references events(name) on delete cascade
                     foreign key(requested_layout) references layouts(name) on delete cascade
                 );"
@@ -137,17 +138,19 @@ impl ProjectDb {
     }
 
     pub async fn update_runner_stream_url(&self, runner: &Runner) -> anyhow::Result<()> {
-        Ok(sqlx::query("update runners set cached_stream_url = ? where name = ?")
-            .bind(&runner.cached_stream_url)
-            .bind(&runner.name)
-            .execute(&self.db)
-            .await
-            .map(|_| ())?)
+        Ok(
+            sqlx::query("update runners set cached_stream_url = ? where name = ?")
+                .bind(&runner.cached_stream_url)
+                .bind(&runner.name)
+                .execute(&self.db)
+                .await
+                .map(|_| ())?,
+        )
     }
 
     pub async fn update_runner_volume(&self, runner: &Runner) -> anyhow::Result<()> {
-        Ok(sqlx::query("update runners set volume = ? where name = ?")
-            .bind(&runner.cached_stream_url)
+        Ok(sqlx::query("update runners set volume_percent = ? where name = ?")
+            .bind(&runner.volume_percent)
             .bind(&runner.name)
             .execute(&self.db)
             .await
@@ -161,9 +164,9 @@ impl ProjectDb {
                         where name = ?
                         limit 1",
             /*"select * from runners r
-                        left join nicknames n on r.name = n.runner
-                        where r.name = '?' or n.nickname = '?'
-                        limit 1",*/
+            left join nicknames n on r.name = n.runner
+            where r.name = '?' or n.nickname = '?'
+            limit 1",*/
         )
         .bind(name)
         .fetch_optional(&self.db)
@@ -315,14 +318,16 @@ impl ProjectDb {
         sqlx::query(
             "insert or replace into streams(
                         event, obs_host, active_commentators,
-                        ignored_commentators, requested_layout
-                    ) values(?, ?, ?, ?, ?)",
+                        ignored_commentators, requested_layout,
+                        audible_runner
+                    ) values(?, ?, ?, ?, ?, ?)",
         )
         .bind(&state.event)
         .bind(&state.obs_host)
         .bind(&state.active_commentators)
         .bind(&state.ignored_commentators)
         .bind(&state.requested_layout)
+        .bind(&state.audible_runner)
         .execute(&mut *tx)
         .await?;
 
@@ -358,14 +363,15 @@ impl ProjectDb {
         .await?)
     }
 
-    pub async fn get_event_by_obs_host(&self, obs_host: &str) -> anyhow::Result<Option<String>> {
-        Ok(sqlx::query_scalar(
+    pub async fn get_event_by_obs_host(&self, obs_host: &str) -> anyhow::Result<String> {
+        sqlx::query_scalar(
             "select event from streams 
                                     where obs_host = ?",
         )
         .bind(obs_host)
         .fetch_optional(&self.db)
-        .await?)
+        .await?
+        .ok_or(anyhow!("Failed to find event for host {}", obs_host))
     }
 
     pub async fn delete_stream(&self, event_id: &str) -> anyhow::Result<()> {
@@ -377,15 +383,15 @@ impl ProjectDb {
     }
 
     pub async fn create_layout(&self, layout: &ObsLayout) -> anyhow::Result<()> {
-        Ok(sqlx::query(
-            "insert into layouts(name, runner_count, default_layout) values(?, ?, ?)",
+        Ok(
+            sqlx::query("insert into layouts(name, runner_count, default_layout) values(?, ?, ?)")
+                .bind(&layout.name)
+                .bind(layout.runner_count)
+                .bind(layout.default_layout)
+                .execute(&self.db)
+                .await
+                .map(|_| ())?,
         )
-        .bind(&layout.name)
-        .bind(layout.runner_count)
-        .bind(layout.default_layout)
-        .execute(&self.db)
-        .await
-        .map(|_| ())?)
     }
 
     pub async fn get_layouts(&self) -> anyhow::Result<Vec<ObsLayout>> {

@@ -84,11 +84,7 @@ async fn update_voice_list(
             })
             .map(|m| m.0.to_owned())
         {
-            if let Some(stream) = db
-                .get_event_by_obs_host(&host)
-                .await
-                .expect("Failed to query for events by host")
-            {
+            if let Ok(stream) = db.get_event_by_obs_host(&host).await {
                 let users = channel.members(&context).await.unwrap();
 
                 let user_list: Vec<String> =
@@ -459,22 +455,13 @@ async fn create_stream(
     #[autocomplete = "autocomplete_obs_name"]
     host: String,
 ) -> Result<(), anyhow::Error> {
-    let event = wrap_fallible(
-        &context,
-        validate_streamed_event_name(&context.data().db, Some(event)).await,
-    )
-    .await?;
-    wrap_fallible(
-        &context,
-        send_message!(
-            &context.data().state_actor,
-            StreamRequest,
-            CreateStream,
-            event,
-            host
-        ),
-    )
-    .await?;
+    send_message!(
+        &context.data().state_actor,
+        StreamRequest,
+        CreateStream,
+        event,
+        host
+    );
     send_success_reply(&context).await
 }
 
@@ -611,13 +598,13 @@ async fn set_end_time(
 async fn start_stream(
     context: Context<'_>,
     #[description = "Event for this command"]
-    #[autocomplete = "autocomplete_streamed_event_name"]
-    event: String,
+    #[autocomplete = "autocomplete_obs_name"]
+    host: String,
 ) -> Result<(), anyhow::Error> {
     let _ = context.defer().await;
     wrap_fallible(
         &context,
-        send_message!(&context.data().obs_actor, ObsCommand, StartStream, event),
+        send_message!(&context.data().obs_actor, ObsCommand, StartStream, host),
     )
     .await?;
     send_success_reply(&context).await
@@ -628,13 +615,13 @@ async fn start_stream(
 async fn stop_stream(
     context: Context<'_>,
     #[description = "Event for this command"]
-    #[autocomplete = "autocomplete_streamed_event_name"]
-    event: String,
+    #[autocomplete = "autocomplete_obs_name"]
+    host: String,
 ) -> Result<(), anyhow::Error> {
     let _ = context.defer().await;
     wrap_fallible(
         &context,
-        send_message!(&context.data().obs_actor, ObsCommand, EndStream, event),
+        send_message!(&context.data().obs_actor, ObsCommand, EndStream, host),
     )
     .await?;
     send_success_reply(&context).await
@@ -653,18 +640,14 @@ async fn set_ladder_league(
     log::debug!("Got league key {}", race_id);
 
     let _ = context.defer().await;
-    wrap_fallible(
-        &context,
-        send_message!(
-            &context.data().ladder_actor,
-            LadderLeagueCommand,
-            ActivateRace,
-            event,
-            race_id,
-            obs_host
-        ),
-    )
-    .await?;
+    send_message!(
+        &context.data().ladder_actor,
+        LadderLeagueCommand,
+        ActivateRace,
+        event,
+        race_id,
+        obs_host
+    )?;
     send_success_reply(&context).await
 }
 
@@ -751,7 +734,7 @@ async fn create_runner(
         stream,
         therun,
         cached_stream_url: None,
-        volume_percent: 50
+        volume_percent: 50,
     };
 
     let db = &context.data().db;
@@ -786,6 +769,42 @@ async fn delete_runner(
 
     wrap_fallible(&context, db.delete_runner(&name).await).await?;
 
+    send_success_reply(&context).await
+}
+
+/// Set the audible runner.
+#[poise::command(prefix_command, slash_command)]
+async fn set_audible_runner(
+    context: Context<'_>,
+    #[description = "Name for this runner"]
+    #[autocomplete = "autocomplete_runner_name"]
+    name: String,
+    #[description = "Event for this command"]
+    #[autocomplete = "autocomplete_streamed_event_name"]
+    event: Option<String>,
+) -> Result<(), anyhow::Error> {
+    command_general(&context, StreamCommand::SetAudibleRunner(name), event).await?;
+    send_success_reply(&context).await
+}
+
+/// Set the volume for a runner.
+#[poise::command(prefix_command, slash_command)]
+async fn set_runner_volume(
+    context: Context<'_>,
+    #[description = "Name for this runner"]
+    #[autocomplete = "autocomplete_runner_name"]
+    name: String,
+    #[description = "Volume for this runner in percent"] volume: u32,
+) -> Result<(), anyhow::Error> {
+    let db = &context.data().db;
+
+    if volume > 100 || volume < 0 {
+        return Err(anyhow!("Volume must be between 0 and 100").into());
+    }
+
+    let mut runner = db.find_runner(&name).await?;
+    runner.volume_percent = volume;
+    db.update_runner_volume(&runner).await?;
     send_success_reply(&context).await
 }
 
@@ -864,6 +883,8 @@ pub async fn init_discord(
         delete_event(),
         create_runner(),
         delete_runner(),
+        set_audible_runner(),
+        set_runner_volume(),
         create_layout(),
         set_ladder_league(),
     ];

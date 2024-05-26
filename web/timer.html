@@ -83,7 +83,7 @@
                 $( document ).ready(function() {
                         setInterval(function() {
                                 $.ajax({
-                                        url: 'http://localhost:28010/event?name=Edward', 
+                                        url: 'http://10.10.0.221:28010/event?host=main', 
                                         type: 'GET',
                                         headers: {'Access-Control-Allow-Origin':'*'}, // <-------- set this
                                         dataType: 'text', // // <-------- use JSONP

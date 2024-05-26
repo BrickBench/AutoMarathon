@@ -75,9 +75,10 @@ impl Runner {
                 parsed_json["error"].to_string(),
             ))?
         } else {
-            let new_url = parsed_json["streams"]["720p"]["url"]
+            let new_url = parsed_json["streams"]["best"]["url"]
                 .to_string()
                 .replace('\"', "");
+            println!("{}", new_url);
             if let Some(old_url) = &self.cached_stream_url {
                 if old_url != &new_url {
                     self.cached_stream_url = Some(new_url);
@@ -94,6 +95,7 @@ impl Runner {
 
     pub async fn find_and_save_stream(&mut self, db: &ProjectDb) -> anyhow::Result<bool> {
         if self.find_stream()? {
+            println!("Updating stream url for {}: {:?}", self.name, self.cached_stream_url);
             db.update_runner_stream_url(self).await?;
             return Ok(true);
         }

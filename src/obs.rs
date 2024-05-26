@@ -126,36 +126,22 @@ pub async fn run_obs(
                     }
                 }
             }
-            ObsCommand::StartStream(event, rto) => match db.get_stream(&event).await {
-                Ok(stream) => {
-                    if let Err(e) =
-                        connect_client_for_host(&stream.obs_host, &mut host_map, &settings).await
-                    {
-                        rto.reply(Err(e));
-                    } else {
-                        let obs = host_map.get_mut(&stream.obs_host).unwrap();
-                        rto.reply(obs.streaming().start().await.map_err(|e| e.into()));
-                    }
-                }
-                Err(e) => {
+            ObsCommand::StartStream(host, rto) => {
+                if let Err(e) = connect_client_for_host(&host, &mut host_map, &settings).await {
                     rto.reply(Err(e));
+                } else {
+                    let obs = host_map.get_mut(&host).unwrap();
+                    rto.reply(obs.streaming().start().await.map_err(|e| e.into()));
                 }
-            },
-            ObsCommand::EndStream(event, rto) => match db.get_stream(&event).await {
-                Ok(stream) => {
-                    if let Err(e) =
-                        connect_client_for_host(&stream.obs_host, &mut host_map, &settings).await
-                    {
-                        rto.reply(Err(e));
-                    } else {
-                        let obs = host_map.get_mut(&stream.obs_host).unwrap();
-                        rto.reply(obs.streaming().stop().await.map_err(|e| e.into()));
-                    }
-                }
-                Err(e) => {
+            }
+            ObsCommand::EndStream(host, rto) => {
+                if let Err(e) = connect_client_for_host(&host, &mut host_map, &settings).await {
                     rto.reply(Err(e));
+                } else {
+                    let obs = host_map.get_mut(&host).unwrap();
+                    rto.reply(obs.streaming().stop().await.map_err(|e| e.into()));
                 }
-            },
+            }
             ObsCommand::SetLadderLeagueId(event, league, rto) => {
                 log::debug!("Configuring ladder league URL for {}", event);
                 match db.get_stream(&event).await {
@@ -167,7 +153,15 @@ pub async fn run_obs(
                             rto.reply(Err(e));
                         } else {
                             let obs = host_map.get_mut(&stream.obs_host).unwrap();
-                            rto.reply(update_ladder_league_urls(&obs, &league, &settings).await);
+                            rto.reply(
+                                update_ladder_league_urls(
+                                    &stream.obs_host,
+                                    &obs,
+                                    &league,
+                                    &settings,
+                                )
+                                .await,
+                            );
                         }
                     }
                     Err(e) => {
@@ -225,70 +219,53 @@ async fn connect_client_for_host(
 }
 
 pub async fn update_ladder_league_urls(
+    host: &str,
     obs: &obws::Client,
     league_id: &str,
     settings: &Settings,
 ) -> anyhow::Result<()> {
     log::debug!("Updating browser sources to use ID: {}", league_id);
-    let host_prefix = "http://10.10.0.4:35065/";
-    let site = format!("{}?spreadsheet_id={}", host_prefix, league_id);
+    let host_prefix = "http://10.10.0.221:35065/";
+    let opener = format!(
+        "{}opener?spreadsheet_id={}&automarathon_host={}",
+        host_prefix, league_id, host
+    );
+    let game_layout = format!(
+        "{}layout?spreadsheet_id={}&automarathon_host={}",
+        host_prefix, league_id, host
+    );
+    let summary = format!(
+        "{}summary?spreadsheet_id={}&automarathon_host={}",
+        host_prefix, league_id, host
+    );
 
     obs.inputs()
         .set_settings(SetSettings {
-            input: InputId::Name("league_view"),
-            settings: &Browser { url: &site },
+            input: InputId::Name("opener"),
+            settings: &Browser { url: &opener },
             overlay: Some(true),
         })
         .await?;
 
-    for i in 0..3 {
-        let post_info = format!(
-            "{}post_race_info?spreadsheet_id={}&runner={}",
-            host_prefix, league_id, i
-        );
-        let pictures = format!(
-            "{}pictures?spreadsheet_id={}&runner={}",
-            host_prefix, league_id, i
-        );
-        let name = format!(
-            "{}runnername?spreadsheet_id={}&runner={}",
-            host_prefix, league_id, i
-        );
-        let overlay = format!(
-            "{}runner_overlay?spreadsheet_id={}&runner={}",
-            host_prefix, league_id, i
-        );
-        obs.inputs()
-            .set_settings(SetSettings {
-                input: InputId::Name(&format!("runner_name_{}", i )),
-                settings: &Browser { url: &name },
-                overlay: Some(true),
-            })
-            .await?;
-        obs.inputs()
-            .set_settings(SetSettings {
-                input: InputId::Name(&format!("post_info_{}", i)),
-                settings: &Browser { url: &post_info },
-                overlay: Some(true),
-            })
-            .await?;
-        obs.inputs()
-            .set_settings(SetSettings {
-                input: InputId::Name(&format!("pictures_{}", i)),
-                settings: &Browser { url: &pictures },
-                overlay: Some(true),
-            })
-            .await?;
-        obs.inputs()
-            .set_settings(SetSettings {
-                input: InputId::Name(&format!("overlay_{}", i)),
-                settings: &Browser { url: &overlay },
-                overlay: Some(true),
-            })
-            .await?;
-    }
+    obs.inputs()
+        .set_settings(SetSettings {
+            input: InputId::Name("overlay"),
+            settings: &Browser { url: &game_layout },
+            overlay: Some(true),
+        })
+        .await?;
 
-    do_transition(obs, settings).await?;
+    obs.inputs()
+        .set_settings(SetSettings {
+            input: InputId::Name("postgame"),
+            settings: &Browser { url: &summary },
+            overlay: Some(true),
+        })
+        .await?;
+
+    if obs.ui().studio_mode_enabled().await? {
+        do_transition(obs, settings).await?;
+    }
 
     Ok(())
 }
@@ -346,22 +323,24 @@ pub async fn update_obs_state(
                 )));
             }
 
+            let scene_items = obs.scene_items().list(target_layout_id).await?;
+
             // Modify commentary text
             if modifications.contains(&ModifiedStreamState::Commentary) {
-                log::debug!("Updating commentator list");
-                let comm_setting = SpecificFreetype {
-                    text: &state.get_commentators().join("\n"),
-                };
-                obs.inputs()
-                    .set_settings(SetSettings {
-                        input: InputId::Name("commentary"),
-                        settings: &comm_setting,
-                        overlay: Some(true),
-                    })
-                    .await?;
+                if scene_items.iter().any(|s| &s.source_name == "commentary") {
+                    log::debug!("Updating commentator list");
+                    let comm_setting = SpecificFreetype {
+                        text: &state.get_commentators().join("\n"),
+                    };
+                    obs.inputs()
+                        .set_settings(SetSettings {
+                            input: InputId::Name("commentary"),
+                            settings: &comm_setting,
+                            overlay: Some(true),
+                        })
+                        .await?;
+                }
             }
-
-            let scene_items = obs.scene_items().list(target_layout_id).await?;
 
             for (idx, runner) in state.stream_runners.iter().enumerate() {
                 log::debug!("Updating player {}", runner.name);
@@ -418,7 +397,12 @@ pub async fn update_obs_state(
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
 
-                if idx == 0 {
+                if state
+                    .audible_runner
+                    .as_ref()
+                    .map(|r| r == &runner.name)
+                    .unwrap_or(idx == 0)
+                {
                     obs.inputs().set_muted(stream_source_id, false).await?;
                     obs.inputs()
                         .set_volume(
@@ -554,14 +538,7 @@ pub async fn update_obs_state(
                 obs.scenes()
                     .set_current_preview_scene(target_layout_id)
                     .await?;
-                log::debug!("Triggering Studio Mode transition");
-                match &settings.obs_transition {
-                    Some(name) => {
-                        obs.transitions().set_current(name).await?;
-                        obs.transitions().trigger().await?;
-                    }
-                    None => obs.transitions().trigger().await?,
-                }
+                do_transition(obs, settings).await?;
                 obs.scenes()
                     .set_current_preview_scene(target_layout_id)
                     .await?;

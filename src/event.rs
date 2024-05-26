@@ -6,7 +6,7 @@ where
     S: Serializer,
 {
     if let Some(x) = x {
-        return s.serialize_i64(x.unix_timestamp());
+        return s.serialize_u64((x.unix_timestamp_nanos() / 1_000_000) as u64);
     } else {
         return s.serialize_none();
     }

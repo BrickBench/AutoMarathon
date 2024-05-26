@@ -9,7 +9,7 @@ use crate::{
     obs::{ObsActor, ObsCommand},
     runner::Runner,
     send_message,
-    stream::{StreamActor, StreamRequest},
+    stream::{StreamActor, StreamCommand, StreamRequest},
     ActorRef, Rto,
 };
 
@@ -60,26 +60,41 @@ pub async fn activate_ladder_league_id(
 ) -> anyhow::Result<()> {
     log::info!("Activating race {}", race_id);
     let request_url = format!(
-        "http://10.10.0.4:35065/runnerstwitch?spreadsheet_id={}",
+        "http://localhost:35065/runnerstwitch?spreadsheet_id={}",
         race_id
     );
 
-    let response = reqwest::get(&request_url).await?;
-    let users: Vec<LadderLeaguePlayer> = response.json().await?;
+    let response = reqwest::get(&request_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query ladder league players: {:?}", e))?;
+
+    let users: Vec<LadderLeaguePlayer> = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to parse ladder league players: {:?}", e))?;
+
     log::debug!("Got users: {:?}", users);
 
     let existing_users = db.get_runners().await?;
-    let good_users: Vec<_> = users
+    let users: Vec<_> = users
         .iter()
-        .filter(|r| !existing_users.iter().any(|r2| r.name == r2.name))
         .map(|p| Runner {
             name: p.name.clone(),
-            stream: Some("shroud".to_owned()),//Some(p.twitch.clone()),
+            stream: Some(p.twitch.clone()),
             therun: None,
             cached_stream_url: None,
-            volume_percent: 50
+            volume_percent: 50,
         })
         .collect();
+
+    // Add new runners
+    for runner in &users
+        .iter()
+        .filter(|r| !existing_users.iter().any(|r2| r.name == r2.name))
+        .collect::<Vec<_>>()
+    {
+        db.add_runner(&runner, &[]).await?;
+    }
 
     if !db
         .get_event_names()
@@ -96,11 +111,10 @@ pub async fn activate_ladder_league_id(
             is_marathon: false,
         })
         .await?;
-    }
 
-    for runner in &good_users {
-        db.add_runner(&runner, &[]).await?;
-        db.add_runner_to_event(event_id, &runner.name).await?;
+        for runner in &users {
+            db.add_runner_to_event(event_id, &runner.name).await?;
+        }
     }
 
     if !db
@@ -117,6 +131,22 @@ pub async fn activate_ladder_league_id(
             obs_host.to_owned()
         )?;
     }
+
+    send_message!(
+        state_actor,
+        StreamRequest,
+        UpdateStream,
+        Some(event_id.to_owned()),
+        StreamCommand::Layout("pregame".to_owned())
+    );
+
+    send_message!(
+        state_actor,
+        StreamRequest,
+        UpdateStream,
+        Some(event_id.to_owned()),
+        StreamCommand::SetPlayers(vec![])
+    );
 
     send_message!(
         obs_actor,

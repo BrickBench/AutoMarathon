@@ -16,6 +16,7 @@ pub struct StreamState {
     /// Semicolon-separated list of commentators
     pub active_commentators: String,
     pub ignored_commentators: String,
+    pub audible_runner: Option<String>,
     pub requested_layout: Option<String>,
     #[sqlx(skip)]
     pub stream_runners: Vec<Runner>,
@@ -46,6 +47,7 @@ pub enum StreamCommand {
     Toggle(String),
     Swap(String, String),
     SetPlayers(Vec<String>),
+    SetAudibleRunner(String),
     Refresh(Vec<String>),
     Layout(String),
     Commentary(Vec<String>),
@@ -80,10 +82,13 @@ pub async fn validate_streamed_event_name(
     event_name: Option<String>,
 ) -> anyhow::Result<String> {
     if let Some(event_id) = event_name {
-        if db.get_stream(&event_id).await.is_ok() {
-            Ok(event_id)
-        } else {
-            Err(anyhow!("No stream for event '{}' exists.", &event_id))
+        match db.get_stream(&event_id).await {
+            Ok(_) => Ok(event_id),
+            Err(e) => Err(anyhow!(
+                "No stream for event '{}' exists: {:?}.",
+                &event_id,
+                e
+            )),
         }
     } else {
         let count = db.get_stream_count().await?;
@@ -118,8 +123,8 @@ pub async fn run_state_manager(
                     }
                 };
 
-                if let Ok(mut stream) = db.get_stream(&event_name).await {
-                    match stream.apply_cmd(&db, &cmd).await {
+                match db.get_stream(&event_name).await {
+                    Ok(mut stream) => match stream.apply_cmd(&db, &cmd).await {
                         Ok(mods) => {
                             db.save_stream(&stream).await?;
                             rto.reply(send_message!(
@@ -131,13 +136,29 @@ pub async fn run_state_manager(
                             ));
                         }
                         Err(e) => rto.reply(Err(e)),
+                    },
+                    Err(e) => {
+                        rto.reply(Err(anyhow!(
+                            "No stream found for event '{}': {:?}.",
+                            event_name,
+                            e
+                        )));
                     }
-                } else {
-                    rto.reply(Err(anyhow!("No stream found for event '{}'.", event_name)));
                 }
             }
             StreamRequest::CreateStream(event, host, rto) => {
                 log::debug!("Creating stream for {}", event);
+                if let Ok(host_in_use) = db.is_host_in_use(&host).await {
+                    if host_in_use {
+                        rto.reply(Err(anyhow!(
+                            "Host '{}' is already in use, cannot create stream for event {}.",
+                            host,
+                            event
+                        )));
+                        continue;
+                    }
+                }
+
                 let state = StreamState {
                     event,
                     obs_host: host,
@@ -145,6 +166,7 @@ pub async fn run_state_manager(
                     ignored_commentators: "".to_string(),
                     requested_layout: None,
                     stream_runners: vec![],
+                    audible_runner: None,
                 };
 
                 rto.reply(db.save_stream(&state).await);
@@ -234,6 +256,11 @@ impl StreamState {
                     modifications.push(ModifiedStreamState::PlayerView(player.name.to_string()));
                     self.stream_runners.push(player);
                 }
+            }
+            StreamCommand::SetAudibleRunner(runner) => {
+                let _ = db.find_runner(runner).await?;
+
+                self.audible_runner = Some(runner.to_string());
             }
             StreamCommand::Refresh(players_strs) if !players_strs.is_empty() => {
                 let mut players = vec![];
