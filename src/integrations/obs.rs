@@ -17,10 +17,8 @@ use sqlx::prelude::FromRow;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
-    db::ProjectDb,
+    core::{db::ProjectDb, settings::Settings, stream::{ModifiedStreamState, StreamState}},
     error::Error,
-    settings::Settings,
-    stream::{ModifiedStreamState, StreamState},
     ActorRef, Rto,
 };
 
@@ -87,7 +85,6 @@ fn get_layout<'a>(state: &StreamState, layouts: &'a [ObsLayout]) -> Option<&'a O
 /// Requests for ObsActor
 pub enum ObsCommand {
     UpdateState(String, Vec<ModifiedStreamState>, Rto<()>),
-    SetLadderLeagueId(String, String, Rto<()>),
     StartStream(String, Rto<()>),
     EndStream(String, Rto<()>),
 }
@@ -142,33 +139,6 @@ pub async fn run_obs(
                     rto.reply(obs.streaming().stop().await.map_err(|e| e.into()));
                 }
             }
-            ObsCommand::SetLadderLeagueId(event, league, rto) => {
-                log::debug!("Configuring ladder league URL for {}", event);
-                match db.get_stream(&event).await {
-                    Ok(stream) => {
-                        if let Err(e) =
-                            connect_client_for_host(&stream.obs_host, &mut host_map, &settings)
-                                .await
-                        {
-                            rto.reply(Err(e));
-                        } else {
-                            let obs = host_map.get_mut(&stream.obs_host).unwrap();
-                            rto.reply(
-                                update_ladder_league_urls(
-                                    &stream.obs_host,
-                                    &obs,
-                                    &league,
-                                    &settings,
-                                )
-                                .await,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        rto.reply(Err(e));
-                    }
-                }
-            }
         };
     }
 }
@@ -217,59 +187,6 @@ async fn connect_client_for_host(
 
     Ok(())
 }
-
-pub async fn update_ladder_league_urls(
-    host: &str,
-    obs: &obws::Client,
-    league_id: &str,
-    settings: &Settings,
-) -> anyhow::Result<()> {
-    log::debug!("Updating browser sources to use ID: {}", league_id);
-    let host_prefix = "http://10.10.0.221:35065/";
-    let opener = format!(
-        "{}opener?spreadsheet_id={}&automarathon_host={}",
-        host_prefix, league_id, host
-    );
-    let game_layout = format!(
-        "{}layout?spreadsheet_id={}&automarathon_host={}",
-        host_prefix, league_id, host
-    );
-    let summary = format!(
-        "{}summary?spreadsheet_id={}&automarathon_host={}",
-        host_prefix, league_id, host
-    );
-
-    obs.inputs()
-        .set_settings(SetSettings {
-            input: InputId::Name("opener"),
-            settings: &Browser { url: &opener },
-            overlay: Some(true),
-        })
-        .await?;
-
-    obs.inputs()
-        .set_settings(SetSettings {
-            input: InputId::Name("overlay"),
-            settings: &Browser { url: &game_layout },
-            overlay: Some(true),
-        })
-        .await?;
-
-    obs.inputs()
-        .set_settings(SetSettings {
-            input: InputId::Name("postgame"),
-            settings: &Browser { url: &summary },
-            overlay: Some(true),
-        })
-        .await?;
-
-    if obs.ui().studio_mode_enabled().await? {
-        do_transition(obs, settings).await?;
-    }
-
-    Ok(())
-}
-
 pub async fn delete_scene_items_for_player(
     obs: &obws::Client,
     layout: SceneId<'_>,

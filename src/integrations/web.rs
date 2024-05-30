@@ -1,11 +1,18 @@
 use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast::Receiver;
 use warp::{http::Method, reply::WithStatus, Filter};
 
-use crate::{db::ProjectDb, event::Event};
+use crate::core::{db::ProjectDb, event::Event};
 
 use super::therun::Run;
+
+#[derive(Clone, Serialize, Deserialize)]
+enum StateUpdate {
+     
+}
 
 #[derive(Serialize, Deserialize)]
 struct StateResponse {
@@ -69,9 +76,9 @@ async fn get_event_by_args(
 
 async fn event_endpoint(
     args: HashMap<String, String>,
-    db: &ProjectDb,
+    db: Arc<ProjectDb>,
 ) -> Result<impl warp::Reply, Infallible> {
-    match get_event_by_args(args, db).await {
+    match get_event_by_args(args, &db).await {
         Ok(event) => Ok(warp::reply::with_status(
             serde_json::to_string::<Event>(&event).unwrap(),
             warp::http::StatusCode::OK,
@@ -82,9 +89,9 @@ async fn event_endpoint(
 
 async fn commentary_endpoint(
     args: HashMap<String, String>,
-    db: &ProjectDb,
+    db: Arc<ProjectDb>,
 ) -> Result<impl warp::Reply, Infallible> {
-    match get_event_by_args(args, db).await {
+    match get_event_by_args(args, &db).await {
         Ok(event) => match db.get_stream(&event.name).await {
             Ok(stream) => Ok(warp::reply::with_status(
                 serde_json::to_string::<Vec<String>>(&stream.get_commentators()).unwrap(),
@@ -96,6 +103,26 @@ async fn commentary_endpoint(
             )),
         },
         Err(reply) => Ok(reply),
+    }
+}
+
+async fn run_dashboard_websocket(socket: warp::ws::WebSocket, db: Arc<ProjectDb>, state_rx: Receiver<StateUpdate>) {
+    let (mut tx, mut rx) = socket.split();
+
+    tokio::spawn(async move {
+
+    });
+
+    while let Ok(update) = state_rx.recv().await {
+        if let Ok(update) = serde_json::to_string(&update) {
+            if let Err(e) = tx.send(warp::ws::Message::text(update)).await {
+                log::error!("Failed to send state update: {}", e);
+                break;
+            }
+        } else {
+            log::error!("Failed to serialize state update");
+            break;
+        }
     }
 }
 
@@ -114,35 +141,48 @@ pub async fn run_http_server(db: Arc<ProjectDb>) -> Result<(), anyhow::Error> {
         ])
         .allow_methods(&[Method::GET, Method::POST, Method::DELETE]);
 
-    let db2 = db.clone();
-    let project_endpoint = warp::path("event")
-        .and(warp::query::<HashMap<String, String>>())
+    let (update_tx, _) = tokio::sync::broadcast::channel::<StateUpdate>(256);
+
+    let socket = warp::path("ws")
+        .and(warp::ws())
+        .and(with_db(db.clone()))
+        .and(warp::any().map(move || update_tx.subscribe()))
         .and(warp::path::end())
-        .and_then(move |args| {
-            let db2 = db2.clone();
-            async move { event_endpoint(args, &db2).await }
+        .map(|ws: warp::ws::Ws, db: Arc<ProjectDb>, state_rx: Receiver<StateUpdate>| {
+            ws.on_upgrade(move |socket| run_dashboard_websocket(socket, db, state_rx))
         });
+
+    let project_endpoint = warp::path("event")
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_db(db.clone()))
+        .and(warp::path::end())
+        .and_then(event_endpoint);
 
     let commentary_endpoint = warp::path("commentators")
+        .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        .and(with_db(db.clone()))
         .and(warp::path::end())
-        .and_then(move |args| {
-            let db = db.clone();
-            async move { commentary_endpoint(args, &db).await }
-        });
+        .and_then(commentary_endpoint);
 
-    let dashboard = warp::path("timer")
-        .and(warp::path::end())
-        .and(warp::fs::file("web/timer.html"));
+    let dashboard = warp::path("static")
+        .and(warp::get())
+        .and(warp::fs::dir("web/static/timer.html"));
 
     warp::serve(
         project_endpoint
             .or(commentary_endpoint)
             .or(dashboard)
+            .or(socket)
             .with(cors),
     )
     .run(([0, 0, 0, 0], 28010))
     .await;
 
     Ok(())
+}
+
+fn with_db(db: Arc<ProjectDb>) -> impl Filter<Extract = (Arc<ProjectDb>,), Error = Infallible> + Clone {
+    warp::any().map(move || db.clone())
 }

@@ -17,21 +17,16 @@ use tokio::{
 };
 
 use crate::{
-    db::ProjectDb,
+    core::db::ProjectDb,
     integrations::discord::test_discord,
-    obs::{run_obs, ObsActor},
-    settings::Settings,
-    stream::{run_state_manager, StreamActor},
+    integrations::obs::{run_obs, ObsActor},
+    core::settings::Settings,
+    core::stream::{run_state_manager, StreamActor},
 };
 
-mod db;
 mod error;
-mod event;
 mod integrations;
-mod obs;
-mod runner;
-mod settings;
-mod stream;
+mod core;
 
 const AUTOMARATHON_VER: &str = "0.1";
 

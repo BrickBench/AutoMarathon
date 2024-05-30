@@ -8,9 +8,11 @@ use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 use tokio_tungstenite;
 use url::Url;
 
-use crate::{
-    db::ProjectDb, stream::{StreamActor, StreamCommand, StreamRequest}, ActorRef, Rto
+use crate::core::{
+    db::ProjectDb, stream::StreamActor
 };
+use crate::Rto;
+use crate::ActorRef;
 
 /// TheRun websocket return type
 #[derive(Serialize, Deserialize)]

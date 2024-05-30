@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use sqlx::{migrate::MigrateDatabase, query, sqlite::Sqlite, types::time, SqlitePool};
 
-use crate::{event::Event, obs::ObsLayout, runner::Runner, stream::StreamState};
+use crate::{core::{event::Event, runner::Runner, stream::StreamState}, integrations::obs::ObsLayout};
 
 pub struct ProjectDb {
     db: SqlitePool,
@@ -21,8 +21,19 @@ impl ProjectDb {
                         stream text, 
                         therun text,
                         cached_stream_url text,
+                        location text,
+                        photo blob,
                         volume_percent integer not null
                     );"
+        )
+        .execute(&db)
+        .await?;
+
+        query!(
+            "create table tournaments(
+                        name text primary key not null collate nocase,
+                        format text not null
+            );"
         )
         .execute(&db)
         .await?;
@@ -32,7 +43,7 @@ impl ProjectDb {
                         name text primary key not null collate nocase,
                         runner_count integer not null,
                         default_layout boolean not null
-                    );"
+            );"
         )
         .execute(&db)
         .await?;
@@ -50,11 +61,13 @@ impl ProjectDb {
         query!(
             "create table events(
                     name text primary key unique not null collate nocase,
+                    tournament text,
                     therun_race_id text,
                     start_time integer,
                     end_time integer,
                     is_relay boolean not null, 
-                    is_marathon boolean not null
+                    is_marathon boolean not null,
+                    foreign key(tournament) references tournaments(name) on delete set null
                 );"
         )
         .execute(&db)
@@ -64,6 +77,7 @@ impl ProjectDb {
             "create table runners_in_event(
                     event text not null,
                     runner text not null, 
+                    result integer,
                     foreign key(event) references events(name) on delete cascade,
                     foreign key(runner) references runners(name) on delete cascade
                 );"

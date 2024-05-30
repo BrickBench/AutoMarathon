@@ -1,6 +1,6 @@
 use std::process;
 
-use crate::{db::ProjectDb, error::Error};
+use crate::{core::db::ProjectDb, error::Error};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
@@ -21,6 +21,12 @@ pub struct Runner {
     ///
     /// This is assumed to be the same as the name if None
     pub therun: Option<String>,
+
+    /// Player's location in ISO 3166-2
+    pub location: Option<String>,
+
+    /// Encoded player photo
+    pub photo: Option<Vec<u8>>,
 
     /// A cache of this runner's latest valid m3u8 link
     pub cached_stream_url: Option<String>,

@@ -16,6 +16,9 @@ where
 #[derive(PartialEq, Debug, FromRow, Serialize)]
 pub struct Event {
     pub name: String,
+
+    /// The tournament this event is associated with
+    pub tournament_id: Option<String>,
     pub therun_race_id: Option<String>,
     #[serde(serialize_with = "serialize_datetime")]
     pub start_time: Option<time::OffsetDateTime>,

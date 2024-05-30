@@ -3,8 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use anyhow::anyhow;
 use poise::serenity_prelude as serenity;
 
-use futures::Stream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serenity::{
     http::Http,
     model::{
@@ -14,29 +13,21 @@ use serenity::{
 };
 use sqlx::types::time::OffsetDateTime;
 
-use crate::event::Event;
-use crate::integrations::ladder_league::LadderLeagueCommand;
-use crate::obs::ObsCommand;
-use crate::obs::ObsLayout;
-use crate::runner::Runner;
-use crate::send_message;
-use crate::stream::validate_streamed_event_name;
-use crate::{
+use crate::{core::{
     db::ProjectDb,
-    error::Error,
+    event::Event,
+    runner::Runner,
     settings::Settings,
-    stream::{StreamCommand, StreamRequest},
-    ObsActor, Rto, StreamActor,
-};
+    stream::{validate_streamed_event_name, StreamActor, StreamCommand, StreamRequest},
+}, error::Error, integrations::obs::{ObsCommand, ObsLayout}, send_message, Rto};
 
-use super::ladder_league::LadderLeagueActor;
+use super::obs::ObsActor;
 
 struct Data {
     db: Arc<ProjectDb>,
     settings: Arc<Settings>,
     state_actor: StreamActor,
     obs_actor: ObsActor,
-    ladder_actor: LadderLeagueActor,
 }
 
 type Context<'a> = poise::Context<'a, Data, anyhow::Error>;
@@ -126,7 +117,7 @@ async fn handle_voice_state_event(
     update_voice_list(db, context, actor, new_state, settings).await;
 }
 
-async fn check_channel(context: &Context<'_>) -> Result<bool, anyhow::Error> {
+async fn check_channel(context: &Context<'_>) -> anyhow::Result<bool> {
     let settings = &context.data().settings;
     let _ = context.defer().await;
 
@@ -139,7 +130,7 @@ async fn check_channel(context: &Context<'_>) -> Result<bool, anyhow::Error> {
                 log::debug!("Command ignored, incorrect channel '{}'", channel.name());
                 return if let Err(why) = context.say("Commands are not read on this channel.").await
                 {
-                    Err(Box::new(Error::Unknown(why.to_string())).into())
+                    Err(anyhow!(why.to_string()))
                 } else {
                     Ok(false)
                 };
@@ -627,30 +618,6 @@ async fn stop_stream(
     send_success_reply(&context).await
 }
 
-/// Set up an event using a ladder league key.
-#[poise::command(prefix_command, slash_command)]
-async fn set_ladder_league(
-    context: Context<'_>,
-    #[description = "Ladder League Helper generated key"] race_id: String,
-    #[description = "Event to create from this ladder league race"] event: String,
-    #[description = "OBS host for this event"]
-    #[autocomplete = "autocomplete_obs_name"]
-    obs_host: String,
-) -> Result<(), anyhow::Error> {
-    log::debug!("Got league key {}", race_id);
-
-    let _ = context.defer().await;
-    send_message!(
-        &context.data().ladder_actor,
-        LadderLeagueCommand,
-        ActivateRace,
-        event,
-        race_id,
-        obs_host
-    )?;
-    send_success_reply(&context).await
-}
-
 /// Create a new event.
 #[poise::command(prefix_command, slash_command)]
 async fn create_event(
@@ -834,7 +801,6 @@ pub async fn init_discord(
     db: Arc<ProjectDb>,
     state_actor: StreamActor,
     obs_actor: ObsActor,
-    ladder_actor: LadderLeagueActor,
 ) -> Result<(), anyhow::Error> {
     log::info!("Initializing Discord bot");
 
@@ -886,7 +852,6 @@ pub async fn init_discord(
         set_audible_runner(),
         set_runner_volume(),
         create_layout(),
-        set_ladder_league(),
     ];
 
     let options = poise::FrameworkOptions::<Data, anyhow::Error> {
@@ -930,7 +895,6 @@ pub async fn init_discord(
                     settings,
                     state_actor,
                     obs_actor,
-                    ladder_actor,
                 })
             })
         })

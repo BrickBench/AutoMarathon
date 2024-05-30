@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use tokio::task::JoinSet;
 
-use crate::{db::ProjectDb, obs::ObsActor, settings::Settings, stream::StreamActor};
+use crate::core::{db::ProjectDb, settings::Settings, stream::StreamActor};
 
 use self::{
-    ladder_league::{run_ladder_league, LadderLeagueActor},
+    obs::ObsActor,
     therun::TheRunActor,
 };
 
 pub mod discord;
-pub mod ladder_league;
+pub mod obs;
 pub mod therun;
 pub mod web;
 
@@ -33,21 +33,12 @@ pub async fn init_integrations(
         therun_actor = Some(therun_actor_2);
     }*/
 
-    let (ladder_actor, rx) = LadderLeagueActor::new();
-    tasks.spawn(run_ladder_league(
-        rx,
-        db.clone(),
-        state_actor.clone(),
-        obs_actor.clone(),
-    ));
-
     // Add discord integration to tasks
     tasks.spawn(discord::init_discord(
         settings.clone(),
         db.clone(),
         state_actor.clone(),
         obs_actor.clone(),
-        ladder_actor.clone(),
     ));
 
     // Add webserver to tasks
