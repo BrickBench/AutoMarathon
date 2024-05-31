@@ -2,17 +2,15 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast::Receiver;
+use tokio::sync::{broadcast::Receiver, mpsc::UnboundedReceiver};
 use warp::{http::Method, reply::WithStatus, Filter};
 
-use crate::core::{db::ProjectDb, event::Event};
+use crate::{core::{db::ProjectDb, event::Event}, ActorRef};
 
 use super::therun::Run;
 
 #[derive(Clone, Serialize, Deserialize)]
-enum StateUpdate {
-     
-}
+enum StateUpdate {}
 
 #[derive(Serialize, Deserialize)]
 struct StateResponse {
@@ -36,6 +34,12 @@ enum ProjectTypePlayerResponse {
     Marathon { event_pb: Option<f64> },
     Relay { run_time: Option<String> },
 }
+
+pub enum WebCommand {
+    SendStateUpdate(StateUpdate)
+}
+
+pub type WebActor = ActorRef<WebCommand>;
 
 async fn get_event_by_args(
     args: HashMap<String, String>,
@@ -106,12 +110,10 @@ async fn commentary_endpoint(
     }
 }
 
-async fn run_dashboard_websocket(socket: warp::ws::WebSocket, db: Arc<ProjectDb>, state_rx: Receiver<StateUpdate>) {
+async fn run_dashboard_websocket(socket: warp::ws::WebSocket, mut state_rx: Receiver<StateUpdate>) {
     let (mut tx, mut rx) = socket.split();
 
-    tokio::spawn(async move {
-
-    });
+    tokio::spawn(async move {});
 
     while let Ok(update) = state_rx.recv().await {
         if let Ok(update) = serde_json::to_string(&update) {
@@ -126,7 +128,7 @@ async fn run_dashboard_websocket(socket: warp::ws::WebSocket, db: Arc<ProjectDb>
     }
 }
 
-pub async fn run_http_server(db: Arc<ProjectDb>) -> Result<(), anyhow::Error> {
+pub async fn run_http_server(db: Arc<ProjectDb>, mut rx: UnboundedReceiver<WebCommand>) -> Result<(), anyhow::Error> {
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec![
@@ -145,11 +147,10 @@ pub async fn run_http_server(db: Arc<ProjectDb>) -> Result<(), anyhow::Error> {
 
     let socket = warp::path("ws")
         .and(warp::ws())
-        .and(with_db(db.clone()))
         .and(warp::any().map(move || update_tx.subscribe()))
         .and(warp::path::end())
-        .map(|ws: warp::ws::Ws, db: Arc<ProjectDb>, state_rx: Receiver<StateUpdate>| {
-            ws.on_upgrade(move |socket| run_dashboard_websocket(socket, db, state_rx))
+        .map(|ws: warp::ws::Ws, state_rx: Receiver<StateUpdate>| {
+            ws.on_upgrade(move |socket| run_dashboard_websocket(socket, state_rx))
         });
 
     let project_endpoint = warp::path("event")
@@ -170,19 +171,27 @@ pub async fn run_http_server(db: Arc<ProjectDb>) -> Result<(), anyhow::Error> {
         .and(warp::get())
         .and(warp::fs::dir("web/static/timer.html"));
 
-    warp::serve(
-        project_endpoint
-            .or(commentary_endpoint)
-            .or(dashboard)
-            .or(socket)
-            .with(cors),
-    )
-    .run(([0, 0, 0, 0], 28010))
-    .await;
+    tokio::spawn(async move {
+        warp::serve(
+            project_endpoint
+                .or(commentary_endpoint)
+                .or(dashboard)
+                .or(socket)
+                .with(cors),
+        )
+        .run(([0, 0, 0, 0], 28010))
+        .await;
+    });
 
-    Ok(())
+    loop {
+        match rx.recv().await.unwrap() {
+
+        }
+    }
 }
 
-fn with_db(db: Arc<ProjectDb>) -> impl Filter<Extract = (Arc<ProjectDb>,), Error = Infallible> + Clone {
+fn with_db(
+    db: Arc<ProjectDb>,
+) -> impl Filter<Extract = (Arc<ProjectDb>,), Error = Infallible> + Clone {
     warp::any().map(move || db.clone())
 }

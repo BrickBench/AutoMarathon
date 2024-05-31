@@ -22,14 +22,14 @@ pub struct Runner {
     /// This is assumed to be the same as the name if None
     pub therun: Option<String>,
 
+    /// A cache of this runner's latest valid m3u8 link
+    pub cached_stream_url: Option<String>,
+
     /// Player's location in ISO 3166-2
     pub location: Option<String>,
 
     /// Encoded player photo
     pub photo: Option<Vec<u8>>,
-
-    /// A cache of this runner's latest valid m3u8 link
-    pub cached_stream_url: Option<String>,
 
     /// User volume in percent
     pub volume_percent: u32
@@ -49,7 +49,7 @@ impl Runner {
     pub fn get_stream(&self) -> String {
         match &self.stream {
             Some(stream) => {
-                if stream.starts_with("https://") {
+                if stream.starts_with("https://") || stream.starts_with("http://") {
                     stream.to_string()
                 } else {
                     format!("https://twitch.tv/{}", stream)
@@ -102,7 +102,7 @@ impl Runner {
     pub async fn find_and_save_stream(&mut self, db: &ProjectDb) -> anyhow::Result<bool> {
         if self.find_stream()? {
             println!("Updating stream url for {}: {:?}", self.name, self.cached_stream_url);
-            db.update_runner_stream_url(self).await?;
+            db.update_runner(self).await?;
             return Ok(true);
         }
         Ok(false)

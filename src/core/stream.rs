@@ -4,10 +4,11 @@ use anyhow::anyhow;
 use sqlx::prelude::FromRow;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::db::ProjectDb;
-use crate::runner::Runner;
-use crate::send_message;
-use crate::{obs::ObsCommand, ActorRef, ObsActor, Rto};
+use crate::{
+    core::{db::ProjectDb, runner::Runner},
+    integrations::obs::ObsCommand,
+    send_message, ActorRef, ObsActor, Rto,
+};
 
 #[derive(PartialEq, Debug, FromRow)]
 pub struct StreamState {
@@ -18,6 +19,7 @@ pub struct StreamState {
     pub ignored_commentators: String,
     pub audible_runner: Option<String>,
     pub requested_layout: Option<String>,
+
     #[sqlx(skip)]
     pub stream_runners: Vec<Runner>,
 }
