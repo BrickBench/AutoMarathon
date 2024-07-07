@@ -13,21 +13,23 @@ use serenity::{
 };
 use sqlx::types::time::OffsetDateTime;
 
-use crate::{core::{
-    db::ProjectDb,
-    event::Event,
-    runner::Runner,
-    settings::Settings,
-    stream::{validate_streamed_event_name, StreamActor, StreamCommand, StreamRequest},
-}, error::Error, integrations::obs::{ObsCommand, ObsLayout}, send_message, Rto};
-
-use super::obs::ObsActor;
+use crate::{
+    core::{
+        db::ProjectDb,
+        event::{Event, EventRequest, RunnerEventState},
+        runner::{Runner, RunnerRequest},
+        settings::Settings,
+        stream::{validate_streamed_event_id, StreamActor, StreamRequest},
+    },
+    error::Error,
+    integrations::obs::{ObsCommand, ObsLayout},
+    send_message, Directory, Rto,
+};
 
 struct Data {
     db: Arc<ProjectDb>,
     settings: Arc<Settings>,
-    state_actor: StreamActor,
-    obs_actor: ObsActor,
+    directory: Directory,
 }
 
 type Context<'a> = poise::Context<'a, Data, anyhow::Error>;
@@ -57,6 +59,25 @@ async fn to_guild_channel(
     }
 }
 
+/// Return the event ID corresponding to the given name, or None if None
+async fn get_event_id(name: Option<String>, db: &ProjectDb) -> anyhow::Result<Option<i64>> {
+    match name {
+        Some(name) => Ok(Some(db.get_id_for_event(&name).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Return the stream ID for the given name, or try retrieving the single active stream
+async fn get_stream_id(name: Option<String>, db: &ProjectDb) -> anyhow::Result<i64> {
+    match get_event_id(name, db).await {
+        Ok(name) => match validate_streamed_event_id(db, name).await {
+            Ok(id) => Ok(id),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 async fn update_voice_list(
     db: &ProjectDb,
     context: &serenity::Context,
@@ -81,13 +102,10 @@ async fn update_voice_list(
                 let user_list: Vec<String> =
                     users.iter().map(|u| u.display_name().to_string()).collect();
 
-                let resp = send_message!(
-                    actor,
-                    StreamRequest,
-                    UpdateStream,
-                    Some(stream.to_string()),
-                    StreamCommand::Commentary(user_list)
-                );
+                let mut stream_data = db.get_stream(stream).await.expect("Stream not found");
+                stream_data.active_commentators = user_list.join(";");
+
+                let resp = send_message!(actor, StreamRequest, UpdateStream, stream_data);
 
                 match resp {
                     Ok(_) => {}
@@ -108,7 +126,7 @@ async fn handle_voice_state_event(
 ) {
     let db = &data.db;
     let settings = &data.settings;
-    let actor = &data.state_actor;
+    let actor = &data.directory.stream_actor;
 
     if let Some(old_state) = old_state {
         update_voice_list(db, context, actor, old_state, settings).await;
@@ -141,16 +159,6 @@ async fn check_channel(context: &Context<'_>) -> anyhow::Result<bool> {
     return Ok(true);
 }
 
-async fn wrap_fallible<T>(context: &Context<'_>, result: anyhow::Result<T>) -> anyhow::Result<T> {
-    if let Err(err) = &result {
-        if let Err(why) = context.say(format!("Failed to run command: {}", err)).await {
-            log::warn!("Failed to react: {}", why);
-        }
-    }
-
-    result
-}
-
 async fn send_success_reply(context: &Context<'_>) -> Result<(), anyhow::Error> {
     if let Err(why) = context.say("\u{1F44D}").await {
         log::warn!("Failed to react: {}", why);
@@ -160,32 +168,14 @@ async fn send_success_reply(context: &Context<'_>) -> Result<(), anyhow::Error> 
     }
 }
 
-/// General command processor
-async fn command_general(
-    context: &Context<'_>,
-    cmd: StreamCommand,
-    event: Option<String>,
-) -> Result<(), anyhow::Error> {
-    log::debug!("Discord received command {:?}", cmd);
-    let _ = context.defer().await;
-    send_message!(
-        &context.data().state_actor,
-        StreamRequest,
-        UpdateStream,
-        event,
-        cmd
-    )?;
-    send_success_reply(&context).await
-}
-
 /// Create an autocomplete stream that matches streamed events
 async fn autocomplete_streamed_event_name<'a>(
     ctx: Context<'_>,
     partial: &'a str,
 ) -> impl Stream<Item = String> + 'a {
-    let runners: Vec<String> = ctx.data().db.get_streamed_events().await.unwrap();
+    let events: Vec<String> = ctx.data().db.get_streamed_event_names().await.unwrap();
 
-    futures::stream::iter(runners)
+    futures::stream::iter(events)
         .filter(move |name| {
             futures::future::ready(name.to_lowercase().starts_with(&partial.to_lowercase()))
         })
@@ -281,11 +271,24 @@ async fn toggle(
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    wrap_fallible(
-        &context,
-        command_general(&context, StreamCommand::Toggle(runner), event).await,
-    )
-    .await
+    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
+    let mut stream = context.data().db.get_stream(stream_id).await?;
+    let runner = context.data().db.find_runner(&runner).await?;
+
+    if stream.stream_runners.iter().any(|r| *r == runner.id) {
+        stream.stream_runners.retain(|r| *r != runner.id);
+    } else {
+        stream.stream_runners.push(runner.id);
+    }
+
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        UpdateStream,
+        stream
+    )?;
+
+    send_success_reply(&context).await
 }
 
 /// Refresh the stream of an active runner, or all runners if no names are provided.
@@ -300,25 +303,28 @@ async fn toggle(
 #[poise::command(prefix_command, slash_command)]
 async fn refresh(
     context: Context<'_>,
-    #[description = "Runners to refresh"] runners: Option<String>,
+    #[autocomplete = "autocomplete_runner_name"]
+    #[description = "Runner to refresh"]
+    runner: String,
     #[description = "Event for this command"]
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    wrap_fallible(
-        &context,
-        command_general(
-            &context,
-            StreamCommand::Refresh(
-                runners
-                    .map(|r| r.split(',').map(|s| s.trim().to_owned()).collect())
-                    .unwrap_or_default(),
-            ),
-            event,
-        )
-        .await,
-    )
-    .await
+    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
+    let runner = context.data().db.find_runner(&runner).await?;
+    send_message!(
+        &context.data().directory.runner_actor,
+        RunnerRequest,
+        RefreshStream,
+        runner.id
+    )?;
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        ReloadStream,
+        stream_id
+    )?;
+    send_success_reply(&context).await
 }
 
 /// Swap two runners.
@@ -341,11 +347,33 @@ async fn swap(
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    wrap_fallible(
-        &context,
-        command_general(&context, StreamCommand::Swap(runner1, runner2), event).await,
-    )
-    .await
+    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
+    let mut stream = context.data().db.get_stream(stream_id).await?;
+
+    let runner1 = context.data().db.find_runner(&runner1).await?;
+    let runner2 = context.data().db.find_runner(&runner2).await?;
+
+    let pos_p1 = stream.stream_runners.iter().position(|p| *p == runner1.id);
+    let pos_p2 = stream.stream_runners.iter().position(|p| *p == runner2.id);
+
+    if let (Some(pos_p1), Some(pos_p2)) = (pos_p1, pos_p2) {
+        stream.stream_runners.swap(pos_p1, pos_p2);
+    } else if let Some(pos_p1) = pos_p1 {
+        stream.stream_runners.insert(pos_p1, runner2.id);
+        stream.stream_runners.remove(pos_p1 + 1);
+    } else if let Some(pos_p2) = pos_p2 {
+        stream.stream_runners.insert(pos_p2, runner1.id);
+        stream.stream_runners.remove(pos_p2 + 1);
+    }
+
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        UpdateStream,
+        stream
+    )?;
+
+    send_success_reply(&context).await
 }
 
 /// Enable a certain layout.
@@ -366,11 +394,16 @@ async fn layout(
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    wrap_fallible(
-        &context,
-        command_general(&context, StreamCommand::Layout(layout), event).await,
-    )
-    .await
+    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
+    let mut stream = context.data().db.get_stream(stream_id).await?;
+    stream.requested_layout = Some(layout.clone());
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        UpdateStream,
+        stream
+    )?;
+    send_success_reply(&context).await
 }
 
 /// Set the active runners.
@@ -387,20 +420,32 @@ async fn set(
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    wrap_fallible(
-        &context,
-        command_general(
-            &context,
-            StreamCommand::SetPlayers(
-                runners
-                    .map(|r| r.split(',').map(|s| s.trim().to_owned()).collect())
-                    .unwrap_or_default(),
-            ),
-            event,
-        )
-        .await,
-    )
-    .await
+    let runner_ids = match runners {
+        Some(runners) => {
+            let mut res = vec![];
+            let runners: Vec<String> = runners.split(',').map(|s| s.trim().to_owned()).collect();
+            for runner in runners {
+                res.push(context.data().db.find_runner(&runner).await?.id);
+            }
+
+            res
+        }
+        None => {
+            vec![]
+        }
+    };
+    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
+    let mut stream = context.data().db.get_stream(stream_id).await?;
+    stream.stream_runners = runner_ids;
+
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        UpdateStream,
+        stream
+    )?;
+
+    send_success_reply(&context).await
 }
 
 /// Set a list of commentator names to ignore.
@@ -419,20 +464,16 @@ async fn ignore(
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    wrap_fallible(
-        &context,
-        command_general(
-            &context,
-            StreamCommand::CommentaryIgnore(
-                ignored
-                    .map(|r| r.split(',').map(|s| s.to_owned()).collect())
-                    .unwrap_or_default(),
-            ),
-            event,
-        )
-        .await,
-    )
-    .await
+    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
+    let mut stream = context.data().db.get_stream(stream_id).await?;
+    stream.ignored_commentators = ignored.unwrap_or_default();
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        UpdateStream,
+        stream
+    )?;
+    send_success_reply(&context).await
 }
 
 /// Create a stream for an event.
@@ -446,13 +487,14 @@ async fn create_stream(
     #[autocomplete = "autocomplete_obs_name"]
     host: String,
 ) -> Result<(), anyhow::Error> {
+    let event = context.data().db.get_id_for_event(&event).await?;
     send_message!(
-        &context.data().state_actor,
+        &context.data().directory.stream_actor,
         StreamRequest,
         CreateStream,
         event,
         host
-    );
+    )?;
     send_success_reply(&context).await
 }
 
@@ -466,21 +508,13 @@ async fn delete_stream(
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: String,
 ) -> Result<(), anyhow::Error> {
-    let event = wrap_fallible(
-        &context,
-        validate_streamed_event_name(&context.data().db, Some(event)).await,
-    )
-    .await?;
-    wrap_fallible(
-        &context,
-        send_message!(
-            &context.data().state_actor,
-            StreamRequest,
-            DeleteStream,
-            event
-        ),
-    )
-    .await?;
+    let event = context.data().db.get_id_for_event(&event).await?;
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        DeleteStream,
+        event
+    )?;
     send_success_reply(&context).await
 }
 
@@ -497,12 +531,17 @@ async fn start_timer(
     context: Context<'_>,
     #[description = "Event for this command"]
     #[autocomplete = "autocomplete_event_name"]
-    event: Option<String>,
+    event: String,
 ) -> Result<(), anyhow::Error> {
-    let db = &context.data().db;
     let time = OffsetDateTime::now_utc();
-    let event = wrap_fallible(&context, validate_streamed_event_name(&db, event).await).await?;
-    wrap_fallible(&context, db.set_event_start_time(&event, Some(time)).await).await?;
+    let event = context.data().db.get_id_for_event(&event).await?;
+    send_message!(
+        &context.data().directory.event_actor,
+        EventRequest,
+        SetStartTime,
+        event,
+        Some(time)
+    )?;
     send_success_reply(&context).await
 }
 
@@ -519,12 +558,17 @@ async fn stop_timer(
     context: Context<'_>,
     #[description = "Event for this command"]
     #[autocomplete = "autocomplete_event_name"]
-    event: Option<String>,
+    event: String,
 ) -> Result<(), anyhow::Error> {
-    let db = &context.data().db;
     let time = OffsetDateTime::now_utc();
-    let event = wrap_fallible(&context, validate_streamed_event_name(&db, event).await).await?;
-    wrap_fallible(&context, db.set_event_end_time(&event, Some(time)).await).await?;
+    let event = context.data().db.get_id_for_event(&event).await?;
+    send_message!(
+        &context.data().directory.event_actor,
+        EventRequest,
+        SetEndTime,
+        event,
+        Some(time)
+    )?;
     send_success_reply(&context).await
 }
 
@@ -539,20 +583,20 @@ async fn set_start_time(
     #[description = "Event start time in Unix time"] time: Option<u64>,
     #[description = "Event for this command"]
     #[autocomplete = "autocomplete_event_name"]
-    event: Option<String>,
+    event: String,
 ) -> Result<(), anyhow::Error> {
-    let db = &context.data().db;
-    let event = wrap_fallible(&context, validate_streamed_event_name(&db, event).await).await?;
-    wrap_fallible(
-        &context,
-        db.set_event_start_time(
-            &event,
-            time.map(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok())
-                .flatten(),
-        )
-        .await,
-    )
-    .await?;
+    let event = context.data().db.get_id_for_event(&event).await?;
+    let time = time
+        .map(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok())
+        .flatten();
+
+    send_message!(
+        &context.data().directory.event_actor,
+        EventRequest,
+        SetStartTime,
+        event,
+        time
+    )?;
     send_success_reply(&context).await
 }
 
@@ -567,20 +611,20 @@ async fn set_end_time(
     #[description = "Event start time in Unix time"] time: Option<u64>,
     #[description = "Event for this command"]
     #[autocomplete = "autocomplete_event_name"]
-    event: Option<String>,
+    event: String,
 ) -> Result<(), anyhow::Error> {
-    let db = &context.data().db;
-    let event = wrap_fallible(&context, validate_streamed_event_name(&db, event).await).await?;
-    wrap_fallible(
-        &context,
-        db.set_event_end_time(
-            &event,
-            time.map(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok())
-                .flatten(),
-        )
-        .await,
-    )
-    .await?;
+    let event = context.data().db.get_id_for_event(&event).await?;
+    let time = time
+        .map(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok())
+        .flatten();
+
+    send_message!(
+        &context.data().directory.event_actor,
+        EventRequest,
+        SetEndTime,
+        event,
+        time
+    )?;
     send_success_reply(&context).await
 }
 
@@ -593,11 +637,12 @@ async fn start_stream(
     host: String,
 ) -> Result<(), anyhow::Error> {
     let _ = context.defer().await;
-    wrap_fallible(
-        &context,
-        send_message!(&context.data().obs_actor, ObsCommand, StartStream, host),
-    )
-    .await?;
+    send_message!(
+        &context.data().directory.obs_actor,
+        ObsCommand,
+        StartStream,
+        host
+    )?;
     send_success_reply(&context).await
 }
 
@@ -610,11 +655,14 @@ async fn stop_stream(
     host: String,
 ) -> Result<(), anyhow::Error> {
     let _ = context.defer().await;
-    wrap_fallible(
-        &context,
-        send_message!(&context.data().obs_actor, ObsCommand, EndStream, host),
-    )
-    .await?;
+
+    send_message!(
+        &context.data().directory.obs_actor,
+        ObsCommand,
+        EndStream,
+        host
+    )?;
+
     send_success_reply(&context).await
 }
 
@@ -626,13 +674,16 @@ async fn create_event(
     #[description = "Runners to add to this event"] runners: Option<String>,
 ) -> Result<(), anyhow::Error> {
     log::debug!("Creating event {}", event_name);
-    let new_event = Event {
+    let mut new_event = Event {
+        id: -1,
         name: event_name,
         therun_race_id: None,
         start_time: None,
         end_time: None,
         is_relay: false,
         is_marathon: false,
+        tournament: None,
+        runner_state: vec![],
     };
 
     let db = &context.data().db;
@@ -640,20 +691,19 @@ async fn create_event(
         .map(|r| r.split(',').map(|s| s.trim().to_owned()).collect())
         .unwrap_or_default();
 
-    let mut runners = vec![];
     for name in runners_names_list {
-        runners.push(wrap_fallible(&context, db.find_runner(&name).await).await?);
+        new_event.runner_state.push(RunnerEventState {
+            runner: db.find_runner(&name).await?.id,
+            result: None,
+        });
     }
 
-    wrap_fallible(&context, db.add_event(&new_event).await).await?;
-
-    for runner in runners {
-        wrap_fallible(
-            &context,
-            db.add_runner_to_event(&new_event.name, &runner.name).await,
-        )
-        .await?;
-    }
+    send_message!(
+        &context.data().directory.event_actor,
+        EventRequest,
+        Create,
+        new_event.clone()
+    )?;
 
     send_success_reply(&context).await
 }
@@ -667,21 +717,14 @@ async fn delete_event(
     event_name: String,
 ) -> Result<(), anyhow::Error> {
     log::debug!("Deleting event {}", event_name);
+    let event = context.data().db.get_id_for_event(&event_name).await?;
 
-    let db = &context.data().db;
-    if wrap_fallible(&context, db.get_streamed_events().await)
-        .await?
-        .contains(&event_name)
-    {
-        return Err(anyhow!(
-            "Cannot delete event {} as it currently has an associated stream.
-             Please end the stream first.",
-            event_name
-        )
-        .into());
-    }
-
-    wrap_fallible(&context, db.delete_event(&event_name).await).await?;
+    send_message!(
+        context.data().directory.event_actor,
+        EventRequest,
+        Delete,
+        event
+    )?;
 
     send_success_reply(&context).await
 }
@@ -696,20 +739,28 @@ async fn create_runner(
     #[description = "Nicknames for this runner"] nicknames: Option<String>,
 ) -> Result<(), anyhow::Error> {
     log::debug!("Creating runner {}", name);
+    let nicknames: Vec<_> = nicknames
+        .map(|r| r.split(',').map(|s| s.trim().to_owned()).collect())
+        .unwrap_or_default();
+
     let runner = Runner {
+        id: -1,
         name,
         stream,
         therun,
         cached_stream_url: None,
         volume_percent: 50,
+        location: None,
+        photo: None,
+        nicks: nicknames,
     };
 
-    let db = &context.data().db;
-    let nicknames: Vec<_> = nicknames
-        .map(|r| r.split(',').map(|s| s.trim().to_owned()).collect())
-        .unwrap_or_default();
-
-    wrap_fallible(&context, db.add_runner(&runner, &nicknames).await).await?;
+    send_message!(
+        &context.data().directory.runner_actor,
+        RunnerRequest,
+        Create,
+        runner.clone()
+    )?;
 
     send_success_reply(&context).await
 }
@@ -722,19 +773,13 @@ async fn delete_runner(
     #[autocomplete = "autocomplete_runner_name"]
     name: String,
 ) -> Result<(), anyhow::Error> {
-    log::debug!("Deleting runner {}", name);
-    let db = &context.data().db;
-    let runner_events = wrap_fallible(&context, db.get_events_for_runner(&name).await).await?;
-    if !runner_events.is_empty() {
-        return Err(anyhow!(
-            "Cannot delete runner {}, as they are used in the following events: {:?}",
-            name,
-            runner_events
-        )
-        .into());
-    }
-
-    wrap_fallible(&context, db.delete_runner(&name).await).await?;
+    let runner = context.data().db.find_runner(&name).await?;
+    send_message!(
+        &context.data().directory.runner_actor,
+        RunnerRequest,
+        Delete,
+        runner.id
+    )?;
 
     send_success_reply(&context).await
 }
@@ -750,7 +795,18 @@ async fn set_audible_runner(
     #[autocomplete = "autocomplete_streamed_event_name"]
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    command_general(&context, StreamCommand::SetAudibleRunner(name), event).await?;
+    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
+    let mut stream = context.data().db.get_stream(stream_id).await?;
+
+    let runner = context.data().db.find_runner(&name).await?;
+    stream.audible_runner = Some(runner.id);
+
+    send_message!(
+        &context.data().directory.stream_actor,
+        StreamRequest,
+        UpdateStream,
+        stream
+    )?;
     send_success_reply(&context).await
 }
 
@@ -765,13 +821,18 @@ async fn set_runner_volume(
 ) -> Result<(), anyhow::Error> {
     let db = &context.data().db;
 
-    if volume > 100 || volume < 0 {
+    if volume > 100 {
         return Err(anyhow!("Volume must be between 0 and 100").into());
     }
 
     let mut runner = db.find_runner(&name).await?;
     runner.volume_percent = volume;
-    db.update_runner_volume(&runner).await?;
+    send_message!(
+        &context.data().directory.runner_actor,
+        RunnerRequest,
+        Update,
+        runner.clone()
+    )?;
     send_success_reply(&context).await
 }
 
@@ -792,15 +853,14 @@ async fn create_layout(
     };
 
     let db = &context.data().db;
-    wrap_fallible(&context, db.create_layout(&layout).await).await?;
+    db.create_layout(&layout).await?;
     send_success_reply(&context).await
 }
 
 pub async fn init_discord(
     settings: Arc<Settings>,
     db: Arc<ProjectDb>,
-    state_actor: StreamActor,
-    obs_actor: ObsActor,
+    directory: Directory,
 ) -> Result<(), anyhow::Error> {
     log::info!("Initializing Discord bot");
 
@@ -893,8 +953,7 @@ pub async fn init_discord(
                 Ok(Data {
                     db,
                     settings,
-                    state_actor,
-                    obs_actor,
+                    directory,
                 })
             })
         })
@@ -905,15 +964,3 @@ pub async fn init_discord(
     Ok(())
 }
 
-pub async fn test_discord(token: &str) -> Result<(), Error> {
-    let http = Http::new(token);
-
-    let bot_user = http
-        .get_current_user()
-        .await
-        .map_err(|why| format!("Could not access user info: {:?}", why))?;
-
-    log::info!("Found user {}", bot_user.name);
-
-    Ok(())
-}

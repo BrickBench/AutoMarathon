@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum Error {
     #[error("Failed to aquire stream for {0}: {1}")]
     FailedStreamAcq(String, String),
-    #[error("Unknown player {0}")]
-    UnknownPlayer(String),
     #[error("Failed to load project: {0}")]
     Unknown(String),
     #[error("Unknown layout {0}")]

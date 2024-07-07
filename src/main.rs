@@ -1,13 +1,13 @@
-use std::{
-    env::consts,
-    fs::{self, read_to_string},
-    path::PathBuf,
-    sync::Arc,
+use core::{
+    event::{run_event_actor, EventActor},
+    runner::{run_runner_actor, RunnerActor},
 };
+use std::{env::consts, fs::read_to_string, path::PathBuf, sync::Arc};
 
 use anyhow::anyhow;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
+use integrations::web::{run_http_server, WebActor};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -18,15 +18,14 @@ use tokio::{
 
 use crate::{
     core::db::ProjectDb,
-    integrations::discord::test_discord,
-    integrations::obs::{run_obs, ObsActor},
     core::settings::Settings,
-    core::stream::{run_state_manager, StreamActor},
+    core::stream::{run_stream_manager, StreamActor},
+    integrations::obs::{run_obs, ObsActor},
 };
 
+mod core;
 mod error;
 mod integrations;
-mod core;
 
 const AUTOMARATHON_VER: &str = "0.1";
 
@@ -35,7 +34,30 @@ macro_rules! send_message {
     ($actor: expr, $type: ident, $msg: ident, $($vals: expr),*) => {
         {
             let (tx, rx) = Rto::new();
+            if log::log_enabled!(log::Level::Debug) {
+                let mut log_str =
+                        format!("Sending message {}::{} to actor {} with contents:",
+                        stringify!($type), stringify!($msg), stringify!($actor));
+                $(log_str.push_str(&format!(" `{:?}`", &$vals));)*
+                log::debug!("{}", log_str);
+            }
+
             $actor.send($type::$msg($($vals),*, tx));
+            match rx.await {
+                Ok(val) => val,
+                Err(e) => Err(e.into())
+            }
+        }
+    };
+    ($actor: expr, $type: ident, $msg: ident) => {
+        {
+            let (tx, rx) = Rto::new();
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!("Sending message {}::{} to actor {}",
+                        stringify!($type), stringify!($msg), stringify!($actor));
+            }
+
+            $actor.send($type::$msg(tx));
             match rx.await {
                 Ok(val) => val,
                 Err(e) => Err(e.into())
@@ -44,8 +66,29 @@ macro_rules! send_message {
     };
 }
 
+#[macro_export]
+macro_rules! send_nonblocking {
+    ($actor: expr, $type: ident, $msg: ident, $($vals: expr),*) => {
+        {
+            let (tx, rx) = Rto::new();
+            $actor.send($type::$msg($($vals),*, tx));
+            rx
+        }
+    };
+}
+
+/// Directory containing all actors
+#[derive(Clone)]
+pub struct Directory {
+    pub stream_actor: StreamActor,
+    pub obs_actor: ObsActor,
+    pub runner_actor: RunnerActor,
+    pub event_actor: EventActor,
+    pub web_actor: WebActor,
+}
+
 /// Actor reference
-struct ActorRef<T> {
+pub struct ActorRef<T> {
     tx: UnboundedSender<T>,
 }
 
@@ -72,7 +115,7 @@ impl<T> Clone for ActorRef<T> {
 }
 
 /// Oneshot fallible return channel
-struct Rto<T> {
+pub struct Rto<T> {
     rto: oneshot::Sender<anyhow::Result<T>>,
 }
 
@@ -94,25 +137,8 @@ impl<T> Rto<T> {
 #[command(version = AUTOMARATHON_VER)]
 #[command(about = "An automation tool for speedrunning events.", long_about = None)]
 struct Args {
-    #[command(subcommand)]
-    command: RunType,
-}
-
-#[derive(Subcommand, Debug)]
-enum RunType {
-    /// Create and initialize a new project.
-    /// The output .json file will need to be manually edited to fill in details for players.
-    Create { project_folder: PathBuf },
-
-    /// Validate a configuration file.
-    Test {
-        /// Configuration file to validate.
-        #[arg(short, long)]
-        settings_file: PathBuf,
-    },
-
-    /// Run a project sourced from a project file.
-    Run { project_folder: PathBuf },
+    /// The folder containing the project files.
+    project_folder: PathBuf,
 }
 
 #[tokio::main]
@@ -125,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(Some("hyper"), log::LevelFilter::Warn)
         .filter(Some("h2"), log::LevelFilter::Warn)
         .filter(Some("rustls"), log::LevelFilter::Warn)
+        .filter(Some("sqlx"), log::LevelFilter::Info)
         .filter_level(log::LevelFilter::Debug)
         .init();
 
@@ -134,71 +161,71 @@ async fn main() -> anyhow::Result<()> {
         consts::OS
     );
 
-    match &args.command {
-        // Create an empty project file
-        RunType::Create { project_folder } => {
-            fs::create_dir_all(project_folder)?;
-            ProjectDb::init(&project_folder.join("project.db")).await?;
-            Ok(())
-        }
+    if !args.project_folder.exists() {
+        return Err(anyhow!(
+            "Project folder {} does not exist",
+            args.project_folder.to_str().unwrap()
+        ));
+    }
 
-        // Test for a valid project file
-        RunType::Test { settings_file } => {
-            let settings: Settings =
-                serde_json::from_str::<Settings>(&read_to_string(settings_file)?)?;
+    // Set up messaging channels
+    let (state_actor, state_rx) = StreamActor::new();
+    let (obs_actor, obs_rx) = ObsActor::new();
+    let (runner_actor, runner_rx) = RunnerActor::new();
+    let (event_actor, event_rx) = EventActor::new();
+    let (web_actor, web_rx) = WebActor::new();
 
-            test_discord(&settings.discord_token.unwrap()).await?;
+    let directory = Directory {
+        stream_actor: state_actor.clone(),
+        obs_actor: obs_actor.clone(),
+        runner_actor: runner_actor.clone(),
+        event_actor: event_actor.clone(),
+        web_actor: web_actor.clone(),
+    };
 
-            Ok(())
-        }
+    let db = Arc::new(
+        ProjectDb::load(&args.project_folder.join("project.db"), directory.clone()).await?,
+    );
 
-        // Run a project
-        RunType::Run { project_folder } => {
-            let db = Arc::new(ProjectDb::load(&project_folder.join("project.db")).await?);
+    // Load settings
+    let settings: Arc<Settings> = Arc::new(
+        serde_json::from_str::<Settings>(
+            &read_to_string(args.project_folder.join("settings.json")).map_err(|_| {
+                anyhow!(format!(
+                    "Failed to load settings.json file, could not read from {}/settings.json",
+                    args.project_folder.to_str().unwrap()
+                ))
+            })?,
+        )
+        .map_err(|e| anyhow!(format!("Error while loading settings.json: {:?}", e)))?,
+    );
 
-            // Load settings
-            let settings: Arc<Settings> = Arc::new(
-                serde_json::from_str::<Settings>(
-                    &read_to_string(project_folder.join("settings.json")).map_err(|_| anyhow!(format!(
-                        "Failed to load settings.json file, could not read from {}/settings.json",
-                        project_folder.to_str().unwrap()
-                    )))?,
-                )
-                .map_err(|e| anyhow!(format!("Error while loading settings.json: {:?}", e)))?,
-            );
+    let mut tasks = JoinSet::<Result<(), anyhow::Error>>::new();
 
-            log::info!("AutoMarathon initialized");
+    // Spawn core tasks
+    tasks.spawn(run_obs(settings.clone(), db.clone(), obs_rx));
+    tasks.spawn(run_stream_manager(db.clone(), state_rx, directory.clone()));
+    tasks.spawn(run_event_actor(db.clone(), event_rx, directory.clone()));
+    tasks.spawn(run_http_server(db.clone(), directory.clone(), web_rx));
+    tasks.spawn(run_runner_actor(db.clone(), runner_rx));
 
-            let mut tasks = JoinSet::<Result<(), anyhow::Error>>::new();
+    // Spawn integrations
+    if settings.discord_token.is_some() {
+        tasks.spawn(integrations::discord::init_discord(
+            settings.clone(),
+            db.clone(),
+            directory.clone(),
+        ));
+    }
 
-            // Set up messaging channels
-            let (state_actor, state_rx) = StreamActor::new();
-            let (obs_actor, obs_rx) = ObsActor::new();
+    log::info!("AutoMarathon initialized");
 
-            // Spawn optional integrations
-            integrations::init_integrations(
-                &mut tasks,
-                settings.clone(),
-                db.clone(),
-                state_actor.clone(),
-                obs_actor.clone(),
-            )
-            .await;
-
-            // Spawn OBS task.
-            tasks.spawn(run_obs(settings, db.clone(), obs_rx));
-
-            // Spawn main task.
-            tasks.spawn(run_state_manager(db, state_rx, obs_actor.clone()));
-
-            loop {
-                match tasks.join_next().await {
-                    Some(Ok(Ok(()))) => log::info!("Service Done"),
-                    Some(Ok(Err(err))) => log::error!("Service error: {}", err.to_string()),
-                    Some(Err(err)) => log::error!("Failed to join tasks: {}", err.to_string()),
-                    None => break Ok(()),
-                }
-            }
+    loop {
+        match tasks.join_next().await {
+            Some(Ok(Ok(()))) => log::info!("Service Done"),
+            Some(Ok(Err(err))) => log::error!("Service error: {}", err.to_string()),
+            Some(Err(err)) => log::error!("Failed to join tasks: {}", err.to_string()),
+            None => break Ok(()),
         }
     }
 }
