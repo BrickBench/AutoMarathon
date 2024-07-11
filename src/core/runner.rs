@@ -71,7 +71,7 @@ async fn create_therun_websocket_monitor(
     loop {
         let res = tokio::spawn(run_runner_websocket(
             db.clone(),
-            runner.clone(),
+            runner,
             therun.clone(),
             death_monitor.subscribe(),
         ))
@@ -182,7 +182,7 @@ pub async fn run_runner_actor(
                 }
             }
             RunnerRequest::Update(runner, rto) => {
-                let old_runner = db.find_runner(&runner.name).await;
+                let old_runner = db.get_runner(runner.id).await;
                 match old_runner {
                     Ok(old_runner) => {
                         // Check for changes in TheRun.gg username
@@ -197,22 +197,24 @@ pub async fn run_runner_actor(
                             }
                         }
 
-                        rto.reply(db.update_runner(&runner).await);
+                        match db.update_runner(&runner).await {
+                            Ok(_) => rto.reply(Ok(())),
+                            Err(e) => {
+                                log::error!("Failed to update runner {} ({}): {}", runner.name, runner.id, e);
+                                rto.reply(Err(e))
+                            },
+                        }
                     }
                     Err(e) => rto.reply(Err(e)),
                 }
             }
-            RunnerRequest::RefreshStream(runner, rto) => {
-                match db.get_runner(runner).await {
-                    Ok(mut runner) => {
-                        match runner.find_and_save_stream(&db).await {
-                            Ok(changed) => rto.reply(Ok(changed)),
-                            Err(e) => rto.reply(Err(e)),
-                        }
-                    }
-                    Err(_) => rto.reply(Err(anyhow!("Runner {} not found", runner))),
-                }
-            }
+            RunnerRequest::RefreshStream(runner, rto) => match db.get_runner(runner).await {
+                Ok(mut runner) => match runner.find_and_save_stream(&db).await {
+                    Ok(changed) => rto.reply(Ok(changed)),
+                    Err(e) => rto.reply(Err(e)),
+                },
+                Err(_) => rto.reply(Err(anyhow!("Runner {} not found", runner))),
+            },
             RunnerRequest::Delete(id, rto) => match db.get_events_for_runner(id).await {
                 Err(e) => rto.reply(Err(e)),
                 Ok(ev) => {
@@ -231,10 +233,7 @@ pub async fn run_runner_actor(
                             "Cannot delete runner {} as they are associated with
                              the following events: {:?}",
                             runner_name,
-                            ev.iter()
-                                .map(|e| e.clone())
-                                .collect::<Vec<String>>()
-                                .join(", ")
+                            ev.to_vec()
                         )))
                     }
                 }
@@ -262,6 +261,7 @@ pub struct Runner {
     ///
     /// This is assumed to be the same as the name if None
     pub stream: Option<String>,
+
     /// Player's TheRun.gg username.
     ///
     /// This is assumed to be the same as the name if None
@@ -331,7 +331,6 @@ impl Runner {
             let new_url = parsed_json["streams"]["best"]["url"]
                 .to_string()
                 .replace('\"', "");
-            println!("{}", new_url);
             if let Some(old_url) = &self.cached_stream_url {
                 if old_url != &new_url {
                     self.cached_stream_url = Some(new_url);
@@ -348,10 +347,7 @@ impl Runner {
 
     async fn find_and_save_stream(&mut self, db: &ProjectDb) -> anyhow::Result<bool> {
         if self.find_stream()? {
-            println!(
-                "Updating stream url for {}: {:?}",
-                self.name, self.cached_stream_url
-            );
+            println!("Updating stream url for {}", self.name);
             db.update_runner(self).await?;
             return Ok(true);
         }

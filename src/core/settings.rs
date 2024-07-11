@@ -10,6 +10,7 @@ pub struct Settings {
     pub keep_unused_streams: Option<bool>,
     pub discord_token: Option<String>,
     pub discord_command_channel: Option<String>,
+    pub web_port: Option<u16>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

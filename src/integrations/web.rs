@@ -1,3 +1,4 @@
+use crate::core::settings::Settings;
 use crate::core::{runner::RunnerRequest, stream::StreamRequest};
 use crate::Rto;
 use std::{collections::HashMap, convert::Infallible, sync::Arc};
@@ -18,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    obs::{ObsCommand, ObsLayout, ObsHostState},
+    obs::{ObsCommand, ObsHostState},
     therun::Run,
 };
 
@@ -26,9 +27,8 @@ use super::{
 struct StateUpdate {
     streams: Vec<StreamState>,
     events: Vec<Event>,
-    runners: Vec<Runner>,
-    layouts: Vec<ObsLayout>,
-    active_runs: HashMap<String, Run>,
+    runners: HashMap<i64, Runner>,
+    active_runs: HashMap<i64, Run>,
     hosts: HashMap<String, ObsHostState>,
 }
 
@@ -63,9 +63,9 @@ async fn get_event_by_args(
     db: &ProjectDb,
 ) -> Result<Event, WithStatus<String>> {
     if let Some(event) = args.get("id") {
-        match i64::from_str_radix(event, 10) {
+        match event.parse::<i64>() {
             Ok(id) => match db.get_event(id).await {
-                Ok(event) => return Ok(event),
+                Ok(event) => Ok(event),
                 Err(_) => Err(warp::reply::with_status(
                     "Failed to find event by ID".to_string(),
                     warp::http::StatusCode::BAD_REQUEST,
@@ -77,7 +77,7 @@ async fn get_event_by_args(
             )),
         }
     } else if let Some(host) = args.get("host") {
-        match db.get_event_by_obs_host(&host).await {
+        match db.get_event_by_obs_host(host).await {
             Ok(event) => match db.get_event(event).await {
                 Ok(event) => Ok(event),
                 Err(_) => Err(warp::reply::with_status(
@@ -124,7 +124,16 @@ fn to_http_output<T: Serialize>(result: anyhow::Result<T>) -> Result<impl warp::
     }
 }
 
-async fn get_event_endpoint(
+async fn create_event(event: Event, directory: Directory) -> Result<impl warp::Reply, Infallible> {
+    to_http_none_or_error(send_message!(
+        directory.event_actor,
+        EventRequest,
+        Create,
+        event
+    ))
+}
+
+async fn get_event(
     args: HashMap<String, String>,
     db: Arc<ProjectDb>,
 ) -> Result<impl warp::Reply, Infallible> {
@@ -135,15 +144,6 @@ async fn get_event_endpoint(
         )),
         Err(reply) => Ok(reply),
     }
-}
-
-async fn create_event(event: Event, directory: Directory) -> Result<impl warp::Reply, Infallible> {
-    to_http_none_or_error(send_message!(
-        directory.event_actor,
-        EventRequest,
-        Create,
-        event
-    ))
 }
 
 async fn update_event(event: Event, directory: Directory) -> Result<impl warp::Reply, Infallible> {
@@ -210,7 +210,7 @@ async fn create_stream(
     to_http_none_or_error(send_message!(
         directory.stream_actor,
         StreamRequest,
-        CreateStream,
+        Create,
         stream.event,
         stream.host
     ))
@@ -223,7 +223,7 @@ async fn update_stream(
     to_http_none_or_error(send_message!(
         directory.stream_actor,
         StreamRequest,
-        UpdateStream,
+        Update,
         stream
     ))
 }
@@ -232,7 +232,7 @@ async fn delete_stream(event: Id, directory: Directory) -> Result<impl warp::Rep
     to_http_none_or_error(send_message!(
         directory.stream_actor,
         StreamRequest,
-        DeleteStream,
+        Delete,
         event.id
     ))
 }
@@ -332,10 +332,16 @@ async fn assemble_state_update(
     }
 
     let mut runs = HashMap::new();
-    let runners = db.get_runners().await?;
+    let runners: HashMap<i64, Runner> = db
+        .get_runners()
+        .await?
+        .into_iter()
+        .map(|r| (r.id, r))
+        .collect();
+
     for runner in &runners {
-        if let Ok(run) = db.get_runner_run_data(runner.id).await {
-            runs.insert(runner.name.clone(), run);
+        if let Ok(run) = db.get_runner_run_data(*runner.0).await {
+            runs.insert(*runner.0, run);
         }
     }
 
@@ -345,14 +351,12 @@ async fn assemble_state_update(
         streams.push(db.get_stream(stream).await?);
     }
 
-    let layouts = db.get_layouts().await?;
     let hosts = send_message!(directory.obs_actor, ObsCommand, GetState)?;
 
     Ok(StateUpdate {
         events,
         runners,
         streams,
-        layouts,
         active_runs: runs,
         hosts,
     })
@@ -361,6 +365,7 @@ async fn assemble_state_update(
 pub async fn run_http_server(
     db: Arc<ProjectDb>,
     directory: Directory,
+    settings: Arc<Settings>,
     mut rx: UnboundedReceiver<WebCommand>,
 ) -> Result<(), anyhow::Error> {
     let cors = warp::cors()
@@ -370,22 +375,23 @@ pub async fn run_http_server(
             "Sec-Fetch-Mode",
             "Referer",
             "Origin",
+            "Content-Type",
             "Access-Control-Allow-Origin",
             "Access-Control-Request-Method",
             "Access-Control-Request-Headers",
             "Access-Control-Allow-Headers",
         ])
-        .allow_methods(&[Method::GET, Method::POST, Method::DELETE]);
+        .allow_methods(&[Method::GET, Method::POST, Method::PUT, Method::DELETE]);
 
     let (update_tx, _) = tokio::sync::broadcast::channel::<StateUpdate>(256);
 
     let reader_tx = update_tx.clone();
     let socket = warp::path("ws")
+        .and(warp::path::end())
         .and(warp::ws())
         .and(with_db(db.clone()))
         .and(with_directory(directory.clone()))
         .and(warp::any().map(move || update_tx.subscribe()))
-        .and(warp::path::end())
         .map(
             |ws: warp::ws::Ws,
              db: Arc<ProjectDb>,
@@ -397,80 +403,92 @@ pub async fn run_http_server(
             },
         );
 
-    let project_endpoint = warp::path("event")
-        .and(warp::get())
-        .and(warp::query::<HashMap<String, String>>())
-        .and(with_db(db.clone()))
-        .and(warp::path::end())
-        .and_then(get_event_endpoint);
-
     let commentary_endpoint = warp::path("commentators")
+        .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
         .and(with_db(db.clone()))
-        .and(warp::path::end())
         .and_then(commentary_endpoint);
 
     let create_runner = warp::path("runner")
+        .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(create_runner);
 
     let update_runner = warp::path("runner")
+        .and(warp::path::end())
         .and(warp::put())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(update_runner);
 
     let delete_runner = warp::path("runner")
+        .and(warp::path::end())
         .and(warp::delete())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(delete_runner);
 
     let create_event = warp::path("event")
+        .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(create_event);
 
+    let read_event = warp::path("event")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_db(db.clone()))
+        .and(warp::path::end())
+        .and_then(get_event);
+
     let update_event = warp::path("event")
+        .and(warp::path::end())
         .and(warp::put())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(update_event);
 
     let delete_event = warp::path("event")
+        .and(warp::path::end())
         .and(warp::delete())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(delete_event);
 
     let create_stream = warp::path("stream")
+        .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(create_stream);
 
     let update_stream = warp::path("stream")
+        .and(warp::path::end())
         .and(warp::put())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(update_stream);
 
     let delete_stream = warp::path("stream")
+        .and(warp::path::end())
         .and(warp::delete())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(delete_stream);
 
     let get_hosts = warp::path("hosts")
+        .and(warp::path::end())
         .and(warp::get())
         .and(with_directory(directory.clone()))
         .and_then(get_hosts);
 
     let set_streaming_state = warp::path("hosts")
+        .and(warp::path::end())
         .and(warp::put())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
@@ -482,7 +500,7 @@ pub async fn run_http_server(
 
     tokio::spawn(async move {
         warp::serve(
-            project_endpoint
+            read_event
                 .or(commentary_endpoint)
                 .or(dashboard)
                 .or(socket)
@@ -499,7 +517,7 @@ pub async fn run_http_server(
                 .or(set_streaming_state)
                 .with(cors),
         )
-        .run(([0, 0, 0, 0], 28010))
+        .run(([0, 0, 0, 0], settings.web_port.unwrap_or(28010)))
         .await;
     });
 

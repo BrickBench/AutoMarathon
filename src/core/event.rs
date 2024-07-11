@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::anyhow;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::{prelude::FromRow, types::time};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -14,9 +14,21 @@ where
     S: Serializer,
 {
     if let Some(x) = x {
-        return s.serialize_u64((x.unix_timestamp_nanos() / 1_000_000) as u64);
+        s.serialize_u64((x.unix_timestamp_nanos() / 1_000_000) as u64)
     } else {
-        return s.serialize_none();
+        s.serialize_none()
+    }
+}
+
+fn deserialize_datetime<'de, D>(d: D) -> Result<Option<time::OffsetDateTime>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let x = Option::<u64>::deserialize(d)?;
+    let time = x.map(|x| time::OffsetDateTime::from_unix_timestamp_nanos(x as i128 * 1_000_000));
+    match time {
+        Some(Ok(x)) => Ok(Some(x)),
+        _ => Ok(None),
     }
 }
 
@@ -43,23 +55,47 @@ pub struct Event {
     /// Name of the event
     pub name: String,
 
+    /// Game for this event
+    pub game: Option<String>,
+
+    /// Category for this event
+    pub category: Option<String>,
+
+    /// Time estimate for the event in seconds
+    pub estimate: Option<i64>,
+
     /// The tournament this event is associated with
-    pub tournament: Option<String>,
+    pub tournament: Option<i64>,
 
     /// The four-character therun.gg race ID
     pub therun_race_id: Option<String>,
 
+    /// The scheduled start time for this event
     #[serde(serialize_with = "serialize_datetime")]
-    pub start_time: Option<time::OffsetDateTime>,
+    #[serde(deserialize_with = "deserialize_datetime")]
+    pub event_start_time: Option<time::OffsetDateTime>,
 
+    /// The start time of the event timer
     #[serde(serialize_with = "serialize_datetime")]
-    pub end_time: Option<time::OffsetDateTime>,
+    #[serde(deserialize_with = "deserialize_datetime")]
+    pub timer_start_time: Option<time::OffsetDateTime>,
+
+    /// The end time of the event timer
+    #[serde(serialize_with = "serialize_datetime")]
+    #[serde(deserialize_with = "deserialize_datetime")]
+    pub timer_end_time: Option<time::OffsetDateTime>,
+
+    /// The default layouts to be used for this event.
+    /// Note that these layouts are not checked for validity,
+    /// as they may or may not exist in OBS when the event is made.
+    #[sqlx(json)]
+    pub preferred_layouts: Vec<String>,
 
     pub is_relay: bool,
     pub is_marathon: bool,
 
     #[sqlx(skip)]
-    pub runner_state: Vec<RunnerEventState>,
+    pub runner_state: HashMap<i64, RunnerEventState>,
 }
 
 pub enum EventRequest {
@@ -84,7 +120,7 @@ pub async fn run_event_actor(
             EventRequest::Create(mut event, rto) => {
                 log::info!("Creating event {}", event.name);
                 rto.reply(db.add_event(&mut event).await)
-            },
+            }
             EventRequest::Update(event, rto) => rto.reply(db.update_event(&event).await),
             EventRequest::SetStartTime(id, time, rto) => {
                 rto.reply(db.update_event_start_time(id, time).await);
@@ -94,13 +130,16 @@ pub async fn run_event_actor(
             }
             EventRequest::AddRunner(id, runner, rto) => match db.get_event(id).await {
                 Ok(mut event) => {
-                    if event.runner_state.iter().any(|r| r.runner == runner) {
+                    if event.runner_state.iter().any(|(r, _)| *r == runner) {
                         rto.reply(Ok(()));
                     } else {
-                        event.runner_state.push(RunnerEventState {
-                            runner: runner.clone(),
-                            result: None,
-                        });
+                        event.runner_state.insert(
+                            runner,
+                            RunnerEventState {
+                                runner,
+                                result: None,
+                            },
+                        );
                         rto.reply(db.update_event(&event).await);
                     }
                 }
@@ -108,17 +147,10 @@ pub async fn run_event_actor(
             },
             EventRequest::RemoveRunner(id, runner, rto) => match db.get_event(id).await {
                 Ok(mut event) => {
-                    if event.runner_state.iter().all(|r| r.runner != runner) {
+                    if event.runner_state.iter().all(|(r, _)| *r != runner) {
                         rto.reply(Ok(()));
                     } else {
-                        event.runner_state.remove(
-                            event
-                                .runner_state
-                                .iter()
-                                .position(|r| r.runner == runner)
-                                .unwrap(),
-                        );
-
+                        event.runner_state.remove(&id);
                         rto.reply(db.update_event(&event).await);
                     }
                 }
@@ -127,16 +159,11 @@ pub async fn run_event_actor(
             EventRequest::Delete(id, rto) => match db.get_streamed_events().await {
                 Ok(ev) => {
                     if ev.iter().any(|e| *e == id) {
-                        match send_message!(
-                            directory.stream_actor,
-                            StreamRequest,
-                            DeleteStream,
-                            id.clone()
-                        ) {
+                        match send_message!(directory.stream_actor, StreamRequest, Delete, id) {
                             Ok(_) => {
                                 log::info!("Deleting event with ID {}", id);
                                 rto.reply(db.delete_event(id).await)
-                            },
+                            }
                             Err(e) => rto.reply(Err(anyhow!(
                                 "Error in deleting stream while deleting event {}: {:?}",
                                 id,

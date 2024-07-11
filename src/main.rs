@@ -138,6 +138,7 @@ impl<T> Rto<T> {
 #[command(about = "An automation tool for speedrunning events.", long_about = None)]
 struct Args {
     /// The folder containing the project files.
+    #[clap(default_value = "/var/home/javst/Documents/AutoMarathonTest/")]
     project_folder: PathBuf,
 }
 
@@ -206,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(run_obs(settings.clone(), db.clone(), obs_rx));
     tasks.spawn(run_stream_manager(db.clone(), state_rx, directory.clone()));
     tasks.spawn(run_event_actor(db.clone(), event_rx, directory.clone()));
-    tasks.spawn(run_http_server(db.clone(), directory.clone(), web_rx));
+    tasks.spawn(run_http_server(db.clone(), directory.clone(), settings.clone(), web_rx));
     tasks.spawn(run_runner_actor(db.clone(), runner_rx));
 
     // Spawn integrations

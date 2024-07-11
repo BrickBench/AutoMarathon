@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use anyhow::anyhow;
 use poise::serenity_prelude as serenity;
@@ -22,7 +22,7 @@ use crate::{
         stream::{validate_streamed_event_id, StreamActor, StreamRequest},
     },
     error::Error,
-    integrations::obs::{ObsCommand, ObsLayout},
+    integrations::obs::ObsCommand,
     send_message, Directory, Rto,
 };
 
@@ -105,7 +105,7 @@ async fn update_voice_list(
                 let mut stream_data = db.get_stream(stream).await.expect("Stream not found");
                 stream_data.active_commentators = user_list.join(";");
 
-                let resp = send_message!(actor, StreamRequest, UpdateStream, stream_data);
+                let resp = send_message!(actor, StreamRequest, Update, stream_data);
 
                 match resp {
                     Ok(_) => {}
@@ -144,7 +144,7 @@ async fn check_channel(context: &Context<'_>) -> anyhow::Result<bool> {
     // Check for desired channel
     if let Some(channel) = _msg_channel {
         if let Some(desired_channel) = &settings.discord_command_channel {
-            if !channel.name().eq_ignore_ascii_case(&desired_channel) {
+            if !channel.name().eq_ignore_ascii_case(desired_channel) {
                 log::debug!("Command ignored, incorrect channel '{}'", channel.name());
                 return if let Err(why) = context.say("Commands are not read on this channel.").await
                 {
@@ -156,7 +156,7 @@ async fn check_channel(context: &Context<'_>) -> anyhow::Result<bool> {
         }
     }
 
-    return Ok(true);
+    Ok(true)
 }
 
 async fn send_success_reply(context: &Context<'_>) -> Result<(), anyhow::Error> {
@@ -219,37 +219,11 @@ async fn autocomplete_runner_name<'a>(
 }
 
 /// Create an autocomplete stream that matches layout names
-async fn autocomplete_layout_name<'a>(
-    ctx: Context<'_>,
-    partial: &'a str,
-) -> impl Stream<Item = String> + 'a {
-    let layouts: Vec<String> = ctx
-        .data()
-        .db
-        .get_layouts()
-        .await
-        .unwrap()
-        .iter()
-        .map(|p| p.name.clone())
-        .collect();
-
-    futures::stream::iter(layouts)
-        .filter(move |name| futures::future::ready(name.starts_with(partial)))
-        .map(|name| name.to_string())
-}
-
-/// Create an autocomplete stream that matches layout names
 async fn autocomplete_obs_name<'a>(
     ctx: Context<'_>,
     partial: &'a str,
 ) -> impl Stream<Item = String> + 'a {
-    let hosts: Vec<String> = ctx
-        .data()
-        .settings
-        .obs_hosts
-        .keys()
-        .map(|k| k.clone())
-        .collect();
+    let hosts: Vec<String> = ctx.data().settings.obs_hosts.keys().cloned().collect();
 
     futures::stream::iter(hosts)
         .filter(move |name| futures::future::ready(name.starts_with(partial)))
@@ -275,16 +249,19 @@ async fn toggle(
     let mut stream = context.data().db.get_stream(stream_id).await?;
     let runner = context.data().db.find_runner(&runner).await?;
 
-    if stream.stream_runners.iter().any(|r| *r == runner.id) {
-        stream.stream_runners.retain(|r| *r != runner.id);
-    } else {
-        stream.stream_runners.push(runner.id);
+    match stream.get_runner_slot(runner.id) {
+        Some(pos) => {
+            stream.stream_runners.remove(&pos);
+        }
+        None => {
+            stream.stream_runners.insert(stream.get_first_empty_slot(), runner.id);
+        }
     }
-
+       
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        UpdateStream,
+        Update,
         stream
     )?;
 
@@ -321,7 +298,7 @@ async fn refresh(
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        ReloadStream,
+        Reload,
         stream_id
     )?;
     send_success_reply(&context).await
@@ -353,23 +330,22 @@ async fn swap(
     let runner1 = context.data().db.find_runner(&runner1).await?;
     let runner2 = context.data().db.find_runner(&runner2).await?;
 
-    let pos_p1 = stream.stream_runners.iter().position(|p| *p == runner1.id);
-    let pos_p2 = stream.stream_runners.iter().position(|p| *p == runner2.id);
+    let pos_p1 = stream.get_runner_slot(runner1.id);
+    let pos_p2 = stream.get_runner_slot(runner2.id);
 
     if let (Some(pos_p1), Some(pos_p2)) = (pos_p1, pos_p2) {
-        stream.stream_runners.swap(pos_p1, pos_p2);
+        stream.stream_runners.insert(pos_p1, runner2.id);
+        stream.stream_runners.insert(pos_p2, runner1.id);
     } else if let Some(pos_p1) = pos_p1 {
         stream.stream_runners.insert(pos_p1, runner2.id);
-        stream.stream_runners.remove(pos_p1 + 1);
     } else if let Some(pos_p2) = pos_p2 {
         stream.stream_runners.insert(pos_p2, runner1.id);
-        stream.stream_runners.remove(pos_p2 + 1);
     }
 
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        UpdateStream,
+        Update,
         stream
     )?;
 
@@ -388,7 +364,7 @@ async fn swap(
 async fn layout(
     context: Context<'_>,
     #[description = "Layout to use"]
-    #[autocomplete = "autocomplete_layout_name"]
+    //  #[autocomplete = "autocomplete_layout_name"]
     layout: String,
     #[description = "Event for this command"]
     #[autocomplete = "autocomplete_streamed_event_name"]
@@ -400,7 +376,7 @@ async fn layout(
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        UpdateStream,
+        Update,
         stream
     )?;
     send_success_reply(&context).await
@@ -436,12 +412,12 @@ async fn set(
     };
     let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
     let mut stream = context.data().db.get_stream(stream_id).await?;
-    stream.stream_runners = runner_ids;
+    stream.stream_runners = runner_ids.iter().enumerate().map(|(i, r)| ((i as i64), *r)).collect();
 
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        UpdateStream,
+        Update,
         stream
     )?;
 
@@ -470,7 +446,7 @@ async fn ignore(
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        UpdateStream,
+        Update,
         stream
     )?;
     send_success_reply(&context).await
@@ -491,7 +467,7 @@ async fn create_stream(
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        CreateStream,
+        Create,
         event,
         host
     )?;
@@ -512,7 +488,7 @@ async fn delete_stream(
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        DeleteStream,
+        Delete,
         event
     )?;
     send_success_reply(&context).await
@@ -586,9 +562,7 @@ async fn set_start_time(
     event: String,
 ) -> Result<(), anyhow::Error> {
     let event = context.data().db.get_id_for_event(&event).await?;
-    let time = time
-        .map(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok())
-        .flatten();
+    let time = time.and_then(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok());
 
     send_message!(
         &context.data().directory.event_actor,
@@ -614,9 +588,7 @@ async fn set_end_time(
     event: String,
 ) -> Result<(), anyhow::Error> {
     let event = context.data().db.get_id_for_event(&event).await?;
-    let time = time
-        .map(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok())
-        .flatten();
+    let time = time.and_then(|t| OffsetDateTime::from_unix_timestamp(t.try_into().unwrap()).ok());
 
     send_message!(
         &context.data().directory.event_actor,
@@ -677,13 +649,18 @@ async fn create_event(
     let mut new_event = Event {
         id: -1,
         name: event_name,
+        game: None,
+        category: None,
+        estimate: None,
         therun_race_id: None,
-        start_time: None,
-        end_time: None,
+        event_start_time: None,
+        timer_start_time: None,
+        timer_end_time: None,
         is_relay: false,
         is_marathon: false,
+        preferred_layouts: vec![],
         tournament: None,
-        runner_state: vec![],
+        runner_state: HashMap::new(),
     };
 
     let db = &context.data().db;
@@ -692,8 +669,9 @@ async fn create_event(
         .unwrap_or_default();
 
     for name in runners_names_list {
-        new_event.runner_state.push(RunnerEventState {
-            runner: db.find_runner(&name).await?.id,
+        let runner = db.find_runner(&name).await?.id;
+        new_event.runner_state.insert(runner, RunnerEventState {
+            runner,
             result: None,
         });
     }
@@ -804,7 +782,7 @@ async fn set_audible_runner(
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
-        UpdateStream,
+        Update,
         stream
     )?;
     send_success_reply(&context).await
@@ -822,7 +800,7 @@ async fn set_runner_volume(
     let db = &context.data().db;
 
     if volume > 100 {
-        return Err(anyhow!("Volume must be between 0 and 100").into());
+        return Err(anyhow!("Volume must be between 0 and 100"));
     }
 
     let mut runner = db.find_runner(&name).await?;
@@ -833,27 +811,6 @@ async fn set_runner_volume(
         Update,
         runner.clone()
     )?;
-    send_success_reply(&context).await
-}
-
-/// Create a layout
-#[poise::command(prefix_command, slash_command)]
-async fn create_layout(
-    context: Context<'_>,
-    #[description = "OBS scene name"] scene: String,
-    #[description = "Supported runners"] size: u32,
-    #[description = "Default for this runner count"] default: bool,
-) -> Result<(), anyhow::Error> {
-    log::debug!("Creating layout {}", scene);
-
-    let layout = ObsLayout {
-        name: scene,
-        runner_count: size,
-        default_layout: default,
-    };
-
-    let db = &context.data().db;
-    db.create_layout(&layout).await?;
     send_success_reply(&context).await
 }
 
@@ -911,7 +868,6 @@ pub async fn init_discord(
         delete_runner(),
         set_audible_runner(),
         set_runner_volume(),
-        create_layout(),
     ];
 
     let options = poise::FrameworkOptions::<Data, anyhow::Error> {
@@ -963,4 +919,3 @@ pub async fn init_discord(
 
     Ok(())
 }
-
