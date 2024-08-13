@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use futures::StreamExt;
-use std::{process, sync::Arc, time};
+use std::{collections::HashMap, process, sync::Arc, time};
 use tokio::{sync::broadcast, time::sleep};
 use url::Url;
 
@@ -38,11 +38,14 @@ async fn therun_poller(
     while let Some(alert) = therun_rx.recv().await {
         match alert {
             TheRunAlert::AddRunner(runner) => {
-                live_runners.lock().await.push(runner.get_therun_username());
+                live_runners
+                    .lock()
+                    .await
+                    .push(runner.get_therun_username().expect("No username"));
                 tokio::spawn(create_therun_websocket_monitor(
                     db.clone(),
                     runner.id,
-                    runner.get_therun_username(),
+                    runner.get_therun_username().expect("No username"),
                     live_runners.clone(),
                     death_tx.clone(),
                 ));
@@ -51,8 +54,10 @@ async fn therun_poller(
                 live_runners
                     .lock()
                     .await
-                    .retain(|r| r != &runner.get_therun_username());
-                death_tx.send(runner.get_therun_username()).ok();
+                    .retain(|r| r != &runner.get_therun_username().expect("No username"));
+                death_tx
+                    .send(runner.get_therun_username().expect("No username"))
+                    .ok();
             }
         }
     }
@@ -162,7 +167,7 @@ pub async fn run_runner_actor(
 
     // Add all existing runners to TheRun.gg poller.
     for runner in db.get_runners().await? {
-        if !runner.get_therun_username().is_empty() {
+        if runner.get_therun_username().is_some() {
             let _ = therun_tx.send(TheRunAlert::AddRunner(runner.clone()));
         }
     }
@@ -173,7 +178,7 @@ pub async fn run_runner_actor(
                 log::info!("Creating runner {}", runner.name);
                 match db.add_runner(&mut runner).await {
                     Ok(_) => {
-                        if !runner.get_therun_username().is_empty() {
+                        if runner.get_therun_username().is_some() {
                             let _ = therun_tx.send(TheRunAlert::AddRunner(runner.clone()));
                         }
                         rto.reply(Ok(()));
@@ -187,12 +192,8 @@ pub async fn run_runner_actor(
                     Ok(old_runner) => {
                         // Check for changes in TheRun.gg username
                         if old_runner.get_therun_username() != runner.get_therun_username() {
-                            if !old_runner.get_therun_username().is_empty() {
-                                let _ =
-                                    therun_tx.send(TheRunAlert::RemoveRunner(old_runner.clone()));
-                            }
-
-                            if !runner.get_therun_username().is_empty() {
+                            let _ = therun_tx.send(TheRunAlert::RemoveRunner(old_runner.clone()));
+                            if runner.get_therun_username().is_some() {
                                 let _ = therun_tx.send(TheRunAlert::AddRunner(runner.clone()));
                             }
                         }
@@ -200,9 +201,14 @@ pub async fn run_runner_actor(
                         match db.update_runner(&runner).await {
                             Ok(_) => rto.reply(Ok(())),
                             Err(e) => {
-                                log::error!("Failed to update runner {} ({}): {}", runner.name, runner.id, e);
+                                log::error!(
+                                    "Failed to update runner {} ({}): {}",
+                                    runner.name,
+                                    runner.id,
+                                    e
+                                );
                                 rto.reply(Err(e))
-                            },
+                            }
                         }
                     }
                     Err(e) => rto.reply(Err(e)),
@@ -226,7 +232,9 @@ pub async fn run_runner_actor(
                     log::info!("Deleting runner {}", runner_name);
                     if ev.is_empty() {
                         let runner = db.get_runner(id).await?;
-                        let _ = therun_tx.send(TheRunAlert::RemoveRunner(runner));
+                        if runner.get_therun_username().is_some() {
+                            let _ = therun_tx.send(TheRunAlert::RemoveRunner(runner));
+                        }
                         rto.reply(db.delete_runner(id).await)
                     } else {
                         rto.reply(Err(anyhow!(
@@ -267,8 +275,9 @@ pub struct Runner {
     /// This is assumed to be the same as the name if None
     pub therun: Option<String>,
 
-    /// A cache of this runner's latest valid m3u8 link
-    pub cached_stream_url: Option<String>,
+    /// A value to manually specify a .m3u8 link in case Streamlink
+    /// fails to acquire it
+    pub override_stream_url: Option<String>,
 
     /// Player's location in ISO 3166-2
     pub location: Option<String>,
@@ -282,6 +291,11 @@ pub struct Runner {
 
     #[sqlx(skip)]
     pub nicks: Vec<String>,
+
+    #[sqlx(skip)]
+    /// A map of streamlink resolutions (including `best`) to .m3u8 links.
+    /// This is None if streamlink does not return values.
+    pub stream_urls: HashMap<String, String>,
 }
 
 #[derive(PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -291,8 +305,8 @@ pub struct FieldDefault {
 }
 
 impl Runner {
-    pub fn get_therun_username(&self) -> String {
-        self.therun.clone().unwrap_or(self.name.clone())
+    pub fn get_therun_username(&self) -> Option<String> {
+        self.therun.clone()
     }
 
     pub fn get_stream(&self) -> String {
@@ -328,29 +342,38 @@ impl Runner {
                 parsed_json["error"].to_string(),
             ))?
         } else {
-            let new_url = parsed_json["streams"]["best"]["url"]
-                .to_string()
-                .replace('\"', "");
-            if let Some(old_url) = &self.cached_stream_url {
-                if old_url != &new_url {
-                    self.cached_stream_url = Some(new_url);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            } else {
-                self.cached_stream_url = Some(new_url);
+            let mut new_urls = HashMap::new();
+
+            for (resolution, contents) in parsed_json["streams"].as_object().unwrap() {
+                let url = contents["url"].to_string().replace('\"', "");
+                new_urls.insert(resolution.to_string(), url);
+            }
+
+            if new_urls != self.stream_urls {
+                self.stream_urls = new_urls;
                 Ok(true)
+            } else {
+                Ok(false)
             }
         }
     }
 
     async fn find_and_save_stream(&mut self, db: &ProjectDb) -> anyhow::Result<bool> {
-        if self.find_stream()? {
-            println!("Updating stream url for {}", self.name);
-            db.update_runner(self).await?;
-            return Ok(true);
+        match self.find_stream() {
+            Ok(changed) => {
+                if changed {
+                    log::info!("Updating stream url for {}", self.name);
+                    db.update_runner(self).await?;
+                } else {
+                    log::info!("Stream url for {} is up to date", self.name);
+                }
+                Ok(changed)
+            }
+            Err(e) => {
+                log::warn!("Failed to find stream for {}: {}", self.name, e);
+                db.update_runner(self).await?;
+                Err(e)?
+            },
         }
-        Ok(false)
     }
 }

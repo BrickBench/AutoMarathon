@@ -34,9 +34,8 @@ where
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum EventResult {
-    SingleTime { time: f64 },
-    SplitTimes { split_times: Vec<f64> },
-    SingleScore { score: f64 },
+    SingleScore { score: String },
+    MultiScores { scores: HashMap<String, String> },
 }
 
 /// State of a runner in an event
@@ -60,6 +59,12 @@ pub struct Event {
 
     /// Category for this event
     pub category: Option<String>,
+
+    /// Game console for this event
+    pub console: Option<String>,
+
+    /// If the event is complete 
+    pub complete: Option<bool>,
 
     /// Time estimate for the event in seconds
     pub estimate: Option<i64>,
@@ -121,7 +126,13 @@ pub async fn run_event_actor(
                 log::info!("Creating event {}", event.name);
                 rto.reply(db.add_event(&mut event).await)
             }
-            EventRequest::Update(event, rto) => rto.reply(db.update_event(&event).await),
+            EventRequest::Update(event, rto) => {
+                let update = db.update_event(&event).await;
+                if let Err(e) = &update {
+                    log::error!("Error updating event: {:?}", e);
+                }
+                rto.reply(update)
+            }
             EventRequest::SetStartTime(id, time, rto) => {
                 rto.reply(db.update_event_start_time(id, time).await);
             }

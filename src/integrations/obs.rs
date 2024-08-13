@@ -6,15 +6,14 @@ use std::{
 
 use anyhow::anyhow;
 use obws::{
-    requests::{
+    common::MonitorType, requests::{
         inputs::{self, InputId, SetSettings, Volume},
         scene_items::{
             Bounds, CreateSceneItem, Position, SceneItemTransform, SetIndex, SetTransform,
         },
         scenes::SceneId,
         EventSubscription,
-    },
-    responses::scene_items::SceneItem,
+    }, responses::scene_items::SceneItem
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -84,6 +83,8 @@ pub struct ObsHostState {
     pub connected: bool,
     /// Whether the host is streaming
     pub streaming: bool,
+    /// The frame rate of the stream
+    pub stream_frame_rate: u32,
     /// The scenes present in the host by name
     pub scenes: HashMap<String, ObsScene>,
 }
@@ -135,8 +136,7 @@ pub async fn run_obs(
                     rto.reply(Err(e));
                 } else {
                     let obs = host_map.get_mut(&host).unwrap();
-                   // rto.reply(obs.streaming().start().await.map_err(|e| e.into()));
-                    rto.reply(Ok(()))
+                    rto.reply(obs.streaming().start().await.map_err(|e| e.into()));
                 }
             }
             ObsCommand::EndStream(host, rto) => {
@@ -144,8 +144,7 @@ pub async fn run_obs(
                     rto.reply(Err(e));
                 } else {
                     let obs = host_map.get_mut(&host).unwrap();
-                    //rto.reply(obs.streaming().stop().await.map_err(|e| e.into()));
-                    rto.reply(Ok(()))
+                    rto.reply(obs.streaming().stop().await.map_err(|e| e.into()));
                 }
             }
             ObsCommand::GetState(rto) => rto.reply(get_obs_state(&mut host_map, &settings).await),
@@ -169,6 +168,7 @@ async fn get_obs_state(
                 ObsHostState {
                     connected: false,
                     streaming: false,
+                    stream_frame_rate: 0,
                     scenes: HashMap::new(),
                 },
             );
@@ -184,10 +184,14 @@ async fn get_obs_client_info(obs: &obws::Client) -> anyhow::Result<ObsHostState>
     let mut state = ObsHostState {
         connected: true,
         streaming: false,
+        stream_frame_rate: 30,
         scenes: HashMap::new(),
     };
 
+    let settings = obs.config().video_settings().await?;
+
     state.connected = true;
+    state.stream_frame_rate = settings.fps_numerator / settings.fps_denominator;
     state.streaming = obs.streaming().status().await?.active;
 
     let scenes = obs.scenes().list().await?.scenes;
@@ -201,7 +205,8 @@ async fn get_obs_client_info(obs: &obws::Client) -> anyhow::Result<ObsHostState>
 
         let scene_items = obs.scene_items().list(SceneId::Name(&scene.name)).await?;
 
-        let regex = STREAM_ITEM_NAME_REGEX.get_or_init(|| Regex::new(r"stream_(\d+)_.*").unwrap());
+        let regex =
+            STREAM_ITEM_NAME_REGEX.get_or_init(|| Regex::new(r"streamer_(\d+)_.*").unwrap());
         for item in scene_items {
             if regex.is_match(&item.source_name) {
                 let caps = regex.captures(&item.source_name).unwrap();
@@ -212,17 +217,21 @@ async fn get_obs_client_info(obs: &obws::Client) -> anyhow::Result<ObsHostState>
                     .transform(SceneId::Name(&scene.name), item.id)
                     .await?;
 
-                out_scene.sources.entry(idx).or_default().push(VlcSourceBounds {
-                    name: item.source_name.clone(),
-                    x: transform.position_x,
-                    y: transform.position_y,
-                    width: transform.bounds_width,
-                    height: transform.bounds_height,
-                    crop_left: transform.crop_left,
-                    crop_right: transform.crop_right,
-                    crop_top: transform.crop_top,
-                    crop_bottom: transform.crop_bottom,
-                });
+                out_scene
+                    .sources
+                    .entry(idx)
+                    .or_default()
+                    .push(VlcSourceBounds {
+                        name: item.source_name.clone(),
+                        x: transform.position_x,
+                        y: transform.position_y,
+                        width: transform.bounds_width,
+                        height: transform.bounds_height,
+                        crop_left: transform.crop_left,
+                        crop_right: transform.crop_right,
+                        crop_top: transform.crop_top,
+                        crop_bottom: transform.crop_bottom,
+                    });
             }
         }
         state.scenes.insert(scene.name, out_scene);
@@ -295,9 +304,19 @@ pub async fn delete_scene_items_for_player(
 }
 
 /// Trigger the transition specified in the settings
-pub async fn do_transition(obs: &obws::Client, settings: &Settings) -> anyhow::Result<()> {
+pub async fn do_transition(
+    obs: &obws::Client,
+    settings: &Settings,
+    long: bool,
+) -> anyhow::Result<()> {
     log::debug!("Triggering Studio Mode transition");
-    match &settings.obs_transition {
+    let transition = if long {
+        &settings.obs_long_transition
+    } else {
+        &settings.obs_short_transition
+    };
+
+    match transition {
         Some(name) => {
             obs.transitions().set_current(name).await?;
             obs.transitions().trigger().await?;
@@ -331,6 +350,59 @@ fn get_layout<'a>(
         .find(|l| l.sources.len() == state.stream_runners.len())
 }
 
+fn calculate_best_url(
+    width: u32,
+    stream_fps: u32,
+    urls: &HashMap<String, String>,
+) -> Option<(String, u32)> {
+    if urls.is_empty() {
+        return None;
+    }
+
+    let desire_60fps = stream_fps >= 30;
+
+    let mut closest_title = "best";
+    let mut closest_url = urls["best"].clone();
+    let mut closest_width = 1080;
+    let mut closest_diff = u32::MAX;
+
+    for (res, url) in urls {
+        let elements: Vec<&str> = res.split('p').collect();
+        let res_width = elements[0].parse::<u32>();
+
+        if let Ok(stream_width) = res_width {
+            let stream_fps = if elements.len() > 1 {
+                if elements[1].contains("60") {
+                    60
+                } else {
+                    30
+                }
+            } else {
+                30
+            };
+
+            let stream_diff = (stream_width as i32 - width as i32).unsigned_abs();
+            if stream_width >= width && stream_diff <= closest_diff {
+                if stream_diff == closest_diff {
+                    if (desire_60fps && stream_fps == 60) || (!desire_60fps && stream_fps == 30) {
+                        closest_title = res;
+                        closest_url.clone_from(url);
+                    }
+                } else {
+                    closest_title = res;
+                    closest_url.clone_from(url);
+                    closest_width = stream_width;
+                    closest_diff = stream_width - width;
+                }
+            }
+        }
+    }
+
+    log::debug!("Selected stream URL {} for width {}", closest_title, width);
+
+    Some((closest_url, closest_width))
+}
+
 /// Apply project state to OBS
 pub async fn update_obs_state(
     state: &StreamState,
@@ -342,6 +414,8 @@ pub async fn update_obs_state(
     log::debug!("Updating OBS: {:?}", modifications);
 
     let mut vlc_inputs = obs.inputs().list(Some("vlc_source")).await?;
+    
+    vlc_inputs.retain(|v| v.id.name.starts_with("stream"));
 
     let obs_state = get_obs_client_info(obs).await?;
     let scenes = obs.scenes().list().await?;
@@ -383,40 +457,41 @@ pub async fn update_obs_state(
                 let stream_source_id_name = format!("streamer_{}", runner.name);
                 let stream_source_id = InputId::Name(&stream_source_id_name);
 
+                // Get the stream views for this runner.
+                let stream_views = layout
+                    .sources
+                    .get(&(*idx as usize))
+                    .cloned()
+                    .unwrap_or_default();
+
                 let mut just_created = false;
-                let good_url = runner.cached_stream_url.to_owned();
+                let mut good_url = None;
+                if !stream_views.is_empty() {
+                    let max_width = stream_views
+                        .iter()
+                        .map(|v| v.width as u32)
+                        .max()
+                        .unwrap_or(1920);
 
-                match &good_url {
-                    Some(url) => {
-                        if !vlc_inputs.iter().any(|i| i.id.name == stream_source_id) {
-                            // Source does not exist, create source
-                            log::debug!("Creating source for {}", runner.name);
-                            let vlc_setting = VLC {
-                                playlist: vec![PlaylistItem {
-                                    hidden: false,
-                                    selected: false,
-                                    value: url.to_owned(),
-                                }],
-                            };
+                    if let Some(stream) = runner.override_stream_url {
+                        if !stream.trim().is_empty() {
+                            good_url = Some((stream, 1080));
+                        }
+                    }
 
-                            let new_input = inputs::Create {
-                                scene: target_layout_id,
-                                input: &stream_source_id_name,
-                                kind: "vlc_source",
-                                settings: Some(vlc_setting),
-                                enabled: Some(false),
-                            };
+                    if good_url.is_none() {
+                        good_url = calculate_best_url(
+                            max_width,
+                            obs_state.stream_frame_rate,
+                            &runner.stream_urls,
+                        );
+                    }
 
-                            obs.inputs().create(new_input).await?;
-                            just_created = true;
-                        } else {
-                            // Source exists, check if stream is up to date
-                            let old_setting =
-                                obs.inputs().settings::<VLC>(stream_source_id).await?;
-                            if old_setting.settings.playlist.is_empty()
-                                || old_setting.settings.playlist[0].value != *url
-                            {
-                                log::debug!("Applying stream change to {}", runner.name);
+                    match &good_url {
+                        Some((url, _)) => {
+                            if !vlc_inputs.iter().any(|i| i.id.name == stream_source_id) {
+                                // Source does not exist, create source
+                                log::debug!("Creating source for {}", runner.name);
                                 let vlc_setting = VLC {
                                     playlist: vec![PlaylistItem {
                                         hidden: false,
@@ -424,38 +499,66 @@ pub async fn update_obs_state(
                                         value: url.to_owned(),
                                     }],
                                 };
-                                obs.inputs()
-                                    .set_settings(SetSettings {
-                                        input: stream_source_id,
-                                        settings: &vlc_setting,
-                                        overlay: Some(true),
-                                    })
-                                    .await?;
 
-                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                let new_input = inputs::Create {
+                                    scene: target_layout_id,
+                                    input: &stream_source_id_name,
+                                    kind: "vlc_source",
+                                    settings: Some(vlc_setting),
+                                    enabled: Some(false),
+                                };
+
+                                obs.inputs().create(new_input).await?;
+                                obs.inputs().set_audio_monitor_type(stream_source_id, MonitorType::None).await?;
+                                just_created = true;
                             } else {
-                                log::debug!("Stream for {} is up to date", runner.name);
+                                // Source exists, check if stream is up to date
+                                let old_setting =
+                                    obs.inputs().settings::<VLC>(stream_source_id).await?;
+                                if old_setting.settings.playlist.is_empty()
+                                    || old_setting.settings.playlist[0].value != *url
+                                {
+                                    log::debug!("Applying stream change to {}", runner.name);
+                                    let vlc_setting = VLC {
+                                        playlist: vec![PlaylistItem {
+                                            hidden: false,
+                                            selected: false,
+                                            value: url.to_owned(),
+                                        }],
+                                    };
+                                    obs.inputs()
+                                        .set_settings(SetSettings {
+                                            input: stream_source_id,
+                                            settings: &vlc_setting,
+                                            overlay: Some(true),
+                                        })
+                                        .await?;
+
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                } else {
+                                    log::debug!("Stream for {} is up to date", runner.name);
+                                }
+                            }
+
+                            if state
+                                .audible_runner
+                                .as_ref()
+                                .map(|r| *r == runner.id)
+                                .unwrap_or(*idx == 0)
+                            {
+                                obs.inputs().set_muted(stream_source_id, false).await?;
+                                obs.inputs()
+                                    .set_volume(
+                                        stream_source_id,
+                                        Volume::Db(-(runner.volume_percent as f32).abs()),
+                                    )
+                                    .await?;
+                            } else {
+                                obs.inputs().set_muted(stream_source_id, true).await?;
                             }
                         }
-
-                        if state
-                            .audible_runner
-                            .as_ref()
-                            .map(|r| *r == runner.id)
-                            .unwrap_or(*idx == 0)
-                        {
-                            obs.inputs().set_muted(stream_source_id, false).await?;
-                            obs.inputs()
-                                .set_volume(
-                                    stream_source_id,
-                                    Volume::Mul(0.01 * runner.volume_percent as f32),
-                                )
-                                .await?;
-                        } else {
-                            obs.inputs().set_muted(stream_source_id, true).await?;
-                        }
+                        None => log::warn!("No stream URL for {}, skipping...", runner.name),
                     }
-                    None => log::warn!("No stream URL for {}, skipping...", runner.name),
                 }
 
                 // Update this player's view
@@ -464,6 +567,7 @@ pub async fn update_obs_state(
                     || just_created
                 {
                     log::debug!("Deleting old items for {}", runner.name);
+
                     // Remove old scene_items
                     delete_scene_items_for_player(
                         obs,
@@ -494,8 +598,8 @@ pub async fn update_obs_state(
 
                     if good_url.is_some() {
                         log::debug!("Creating new stream views for {}", runner.name);
-                        // Get the user-defined list of stream views in the layout
-                        let stream_views = layout.sources.get(&(*idx as usize)).cloned().unwrap_or_default();
+
+                        let crop_scale: f64 = good_url.unwrap().1 as f64 / 1080.0;
 
                         // Create a VLC source scene item for each identified stream view
                         for view in stream_views {
@@ -510,11 +614,13 @@ pub async fn update_obs_state(
 
                             tokio::time::sleep(Duration::from_millis(200)).await;
 
+                            let location_idx = if view.name.contains("delta") { 15 } else { 0 };
+
                             obs.scene_items()
                                 .set_index(SetIndex {
                                     scene: target_layout_id,
                                     item_id: new_item,
-                                    index: 0,
+                                    index: location_idx,
                                 })
                                 .await?;
 
@@ -536,10 +642,10 @@ pub async fn update_obs_state(
                                         height: Some(view.height),
                                     }),
                                     crop: Some(obws::requests::scene_items::Crop {
-                                        left: Some(view.crop_left),
-                                        right: Some(view.crop_right),
-                                        top: Some(view.crop_top),
-                                        bottom: Some(view.crop_bottom),
+                                        left: Some((view.crop_left as f64 * crop_scale) as u32),
+                                        right: Some((view.crop_right as f64 * crop_scale) as u32),
+                                        top: Some((view.crop_top as f64 * crop_scale) as u32),
+                                        bottom: Some((view.crop_bottom as f64 * crop_scale) as u32),
                                     }),
                                 },
                             };
@@ -577,17 +683,19 @@ pub async fn update_obs_state(
             }
 
             tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let changing_layout = modifications.contains(&ModifiedStreamState::Layout)
+                && scenes.current_program_scene.unwrap().name != layout.name;
+
             if obs.ui().studio_mode_enabled().await? {
                 obs.scenes()
                     .set_current_preview_scene(target_layout_id)
                     .await?;
-                do_transition(obs, settings).await?;
+                do_transition(obs, settings, changing_layout).await?;
                 obs.scenes()
                     .set_current_preview_scene(target_layout_id)
                     .await?;
-            } else if modifications.contains(&ModifiedStreamState::Layout)
-                && scenes.current_program_scene.unwrap().name != layout.name
-            {
+            } else if changing_layout {
                 log::debug!("Activating new layout: {}", layout.name);
                 obs.scenes()
                     .set_current_program_scene(target_layout_id)

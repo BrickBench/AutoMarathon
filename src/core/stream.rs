@@ -114,17 +114,31 @@ pub async fn run_stream_manager(
                 let obs_host_data = send_message!(directory.obs_actor, ObsCommand, GetState);
 
                 if obs_host_data.is_err() {
+                    log::warn!(
+                        "Failed to get OBS host data, cannot create stream for event {}.",
+                        event
+                    );
                     rto.reply(Err(anyhow!(
                         "Failed to get OBS host data, cannot create stream for event {}.",
                         event
                     )));
                 } else if !obs_host_data.as_ref().unwrap().contains_key(&host) {
+                    log::warn!(
+                        "Host '{}' is not a valid OBS host, cannot create stream for event {}.",
+                        host,
+                        event
+                    );
                     rto.reply(Err(anyhow!(
                         "Host '{}' is not a valid OBS host, cannot create stream for event {}.",
                         host,
                         event
                     )));
                 } else if !obs_host_data.unwrap().get(&host).unwrap().connected {
+                    log::warn!(
+                        "Host '{}' is not connected, cannot create stream for event {}.",
+                        host,
+                        event
+                    );
                     rto.reply(Err(anyhow!(
                         "Host '{}' is not connected, cannot create stream for event {}.",
                         host,
@@ -177,16 +191,26 @@ pub async fn run_stream_manager(
             StreamRequest::Update(new_stream, rto) => match db.get_stream(new_stream.event).await {
                 Ok(stream) => {
                     let bad_runners = new_stream.trigger_refreshes(&stream, &directory).await;
-                    log::debug!("{:?}", bad_runners);
                     let diffs = new_stream.determine_modified_state(&stream);
                     db.save_stream(&new_stream).await?;
-                    rto.reply(send_message!(
+
+                    let worked = send_message!(
                         directory.obs_actor,
                         ObsCommand,
                         UpdateState,
                         new_stream.event,
                         diffs
-                    ));
+                    );
+
+                    if worked.is_err() {
+                        log::warn!(
+                            "Failed to update OBS state for event {}: {:?}",
+                            new_stream.event,
+                            worked
+                        );
+                    }
+
+                    rto.reply(worked);
                 }
                 Err(e) => {
                     rto.reply(Err(anyhow!(
@@ -240,10 +264,13 @@ impl StreamState {
 
     pub fn determine_modified_state(&self, old: &StreamState) -> Vec<ModifiedStreamState> {
         let mut modifications = Vec::<ModifiedStreamState>::new();
-        for (idx, runner) in self.stream_runners.iter().enumerate() {
-            if old.stream_runners.iter().position(|r| r == runner) != Some(idx) {
-                // Runner was added or moved
-                modifications.push(ModifiedStreamState::RunnerView(*runner.1));
+        for (pos, runner) in self.stream_runners.iter() {
+            if !old.stream_runners.contains_key(pos) {
+                // Runner was added
+                modifications.push(ModifiedStreamState::RunnerView(*runner));
+            } else if old.stream_runners.get(pos) != Some(runner) {
+                // Runner was moved
+                modifications.push(ModifiedStreamState::RunnerView(*runner));
             }
         }
 

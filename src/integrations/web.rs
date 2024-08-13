@@ -30,6 +30,7 @@ struct StateUpdate {
     runners: HashMap<i64, Runner>,
     active_runs: HashMap<i64, Run>,
     hosts: HashMap<String, ObsHostState>,
+    custom_fields: HashMap<String, Option<String>>,
 }
 
 /// A Json struct to store an event/runner ID
@@ -38,11 +39,17 @@ struct Id {
     id: i64,
 }
 
-/// A Json struct to store values for a new stream
+/// A Json struct to store values for a new custom field
 #[derive(Serialize, Deserialize, Debug)]
-struct NewStream {
-    event: i64,
-    host: String,
+struct NewField {
+    key: String,
+}
+
+/// A Json struct to store values for a new custom field
+#[derive(Serialize, Deserialize, Debug)]
+struct UpdateField {
+    key: String,
+    value: Option<String>,
 }
 
 /// A Json struct to set the streaming state of an OBS host
@@ -191,6 +198,30 @@ async fn update_runner(
     ))
 }
 
+async fn refresh_runner(runner: Id, directory: Directory) -> Result<impl warp::Reply, Infallible> {
+    let refreshed = send_message!(
+        directory.runner_actor,
+        RunnerRequest,
+        RefreshStream,
+        runner.id
+    );
+
+    match refreshed {
+        Ok(refreshed) => {
+            Ok(warp::reply::with_status(
+                serde_json::to_string::<bool>(&refreshed).unwrap(),
+                warp::http::StatusCode::OK,
+            ))
+        }
+        Err(e) => {
+            Ok(warp::reply::with_status(
+                e.to_string(),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
+    }
+}
+
 async fn delete_runner(
     runner_name: Id,
     directory: Directory,
@@ -204,16 +235,27 @@ async fn delete_runner(
 }
 
 async fn create_stream(
-    stream: NewStream,
+    stream: StreamState,
     directory: Directory,
 ) -> Result<impl warp::Reply, Infallible> {
-    to_http_none_or_error(send_message!(
+    let message = send_message!(
         directory.stream_actor,
         StreamRequest,
         Create,
         stream.event,
-        stream.host
-    ))
+        stream.obs_host.clone()
+    );
+
+    if let Err(e) = message {
+        to_http_none_or_error(Err(e))
+    } else {
+        to_http_none_or_error(send_message!(
+            directory.stream_actor,
+            StreamRequest,
+            Update,
+            stream
+        ))
+    }
 }
 
 async fn update_stream(
@@ -235,6 +277,30 @@ async fn delete_stream(event: Id, directory: Directory) -> Result<impl warp::Rep
         Delete,
         event.id
     ))
+}
+
+async fn create_custom_field(
+    field: NewField,
+    db: Arc<ProjectDb>,
+) -> Result<impl warp::Reply, Infallible> {
+    to_http_none_or_error(db.add_custom_field(&field.key, None).await)
+}
+
+async fn update_custom_field(
+    field: UpdateField,
+    db: Arc<ProjectDb>,
+) -> Result<impl warp::Reply, Infallible> {
+    to_http_none_or_error(
+        db.add_custom_field(&field.key, field.value.as_deref())
+            .await,
+    )
+}
+
+async fn delete_custom_field(
+    field: NewField,
+    db: Arc<ProjectDb>,
+) -> Result<impl warp::Reply, Infallible> {
+    to_http_none_or_error(db.clear_custom_field(&field.key).await)
 }
 
 async fn get_hosts(directory: Directory) -> Result<impl warp::Reply, Infallible> {
@@ -352,6 +418,7 @@ async fn assemble_state_update(
     }
 
     let hosts = send_message!(directory.obs_actor, ObsCommand, GetState)?;
+    let custom_fields = db.get_custom_fields().await?;
 
     Ok(StateUpdate {
         events,
@@ -359,6 +426,7 @@ async fn assemble_state_update(
         streams,
         active_runs: runs,
         hosts,
+        custom_fields,
     })
 }
 
@@ -423,6 +491,14 @@ pub async fn run_http_server(
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
         .and_then(update_runner);
+
+    let refresh_runner = warp::path("runner")
+        .and(warp::path("refresh"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_directory(directory.clone()))
+        .and_then(refresh_runner);
 
     let delete_runner = warp::path("runner")
         .and(warp::path::end())
@@ -494,6 +570,27 @@ pub async fn run_http_server(
         .and(with_directory(directory.clone()))
         .and_then(set_streaming_state);
 
+    let create_field = warp::path("custom-field")
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and_then(create_custom_field);
+
+    let update_field = warp::path("custom-field")
+        .and(warp::path::end())
+        .and(warp::put())
+        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and_then(update_custom_field);
+
+    let delete_field = warp::path("custom-field")
+        .and(warp::path::end())
+        .and(warp::delete())
+        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and_then(delete_custom_field);
+
     let dashboard = warp::path("static")
         .and(warp::get())
         .and(warp::fs::dir("web/static/timer.html"));
@@ -506,6 +603,7 @@ pub async fn run_http_server(
                 .or(socket)
                 .or(create_runner)
                 .or(update_runner)
+                .or(refresh_runner)
                 .or(delete_runner)
                 .or(create_event)
                 .or(update_event)
@@ -513,6 +611,9 @@ pub async fn run_http_server(
                 .or(create_stream)
                 .or(update_stream)
                 .or(delete_stream)
+                .or(create_field)
+                .or(update_field)
+                .or(delete_field)
                 .or(get_hosts)
                 .or(set_streaming_state)
                 .with(cors),
