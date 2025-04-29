@@ -1,4 +1,5 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use songbird::SerenityInit;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::anyhow;
 use poise::serenity_prelude as serenity;
@@ -11,22 +12,26 @@ use serenity::{
         voice::VoiceState,
     },
 };
+use songbird::{driver::DecodeMode, Config};
 use sqlx::types::time::OffsetDateTime;
 
 use crate::{
     core::{
         db::ProjectDb,
-        event::{Event, EventRequest, RunnerEventState},
-        runner::{Runner, RunnerRequest},
+        event::EventRequest,
+        runner::RunnerRequest,
         settings::Settings,
-        stream::{validate_streamed_event_id, StreamActor, StreamRequest},
+        stream::{validate_streamed_event_id, StreamRequest},
     },
     error::Error,
-    integrations::obs::ObsCommand,
+    integrations::{discord_voice::connect_to_voice, obs::HostCommand},
     send_message, Directory, Rto,
 };
 
+use super::obs::HostActor;
+
 struct Data {
+    name: String,
     db: Arc<ProjectDb>,
     settings: Arc<Settings>,
     directory: Directory,
@@ -79,9 +84,9 @@ async fn get_stream_id(name: Option<String>, db: &ProjectDb) -> anyhow::Result<i
 }
 
 async fn update_voice_list(
-    db: &ProjectDb,
+    bot_name: &str,
     context: &serenity::Context,
-    actor: &StreamActor,
+    actor: &HostActor,
     voice_state: &VoiceState,
     settings: &Settings,
 ) {
@@ -90,49 +95,33 @@ async fn update_voice_list(
             .obs_hosts
             .iter()
             .find(|h| {
-                h.1.discord_voice_channel
+                h.1.discord_voice_channel_id
                     .as_ref()
-                    .is_some_and(|name| name == channel.name())
+                    .is_some_and(|id| *id == u64::from(channel.id))
             })
             .map(|m| m.0.to_owned())
         {
-            if let Ok(stream) = db.get_event_by_obs_host(&host).await {
-                let users = channel.members(&context).await.unwrap();
-
-                let user_list: Vec<String> =
-                    users.iter().map(|u| u.display_name().to_string()).collect();
-
-                let mut stream_data = db.get_stream(stream).await.expect("Stream not found");
-                stream_data.active_commentators = user_list.join(";");
-
-                let resp = send_message!(actor, StreamRequest, Update, stream_data);
-
-                match resp {
-                    Ok(_) => {}
-                    Err(message) => {
-                        log::error!("Failed to set voice state: {}", message);
-                    }
-                }
-            }
+            let users = channel.members(context).unwrap();
+            let user_list: Vec<String> = users
+                .iter()
+                .map(|u| u.user.name.clone())
+                .filter(|u| u != bot_name)
+                .collect();
+            let _ = send_message!(actor, HostCommand, SetStreamCommentators, host, user_list);
         }
     }
 }
 
 async fn handle_voice_state_event(
     context: &serenity::Context,
-    old_state: &Option<VoiceState>,
+    _old_state: &Option<VoiceState>,
     new_state: &VoiceState,
     data: &Data,
 ) {
-    let db = &data.db;
     let settings = &data.settings;
-    let actor = &data.directory.stream_actor;
+    let actor = &data.directory.obs_actor;
 
-    if let Some(old_state) = old_state {
-        update_voice_list(db, context, actor, old_state, settings).await;
-    }
-
-    update_voice_list(db, context, actor, new_state, settings).await;
+    update_voice_list(&data.name, context, actor, new_state, settings).await;
 }
 
 async fn check_channel(context: &Context<'_>) -> anyhow::Result<bool> {
@@ -208,7 +197,7 @@ async fn autocomplete_runner_name<'a>(
         .await
         .unwrap()
         .iter()
-        .map(|p| p.name.clone())
+        .map(|p| p.participant_data.name.clone())
         .collect();
 
     futures::stream::iter(runners)
@@ -247,17 +236,19 @@ async fn toggle(
 ) -> Result<(), anyhow::Error> {
     let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
     let mut stream = context.data().db.get_stream(stream_id).await?;
-    let runner = context.data().db.find_runner(&runner).await?;
+    let runner = context.data().db.get_participant_by_name(&runner).await?;
 
     match stream.get_runner_slot(runner.id) {
         Some(pos) => {
             stream.stream_runners.remove(&pos);
         }
         None => {
-            stream.stream_runners.insert(stream.get_first_empty_slot(), runner.id);
+            stream
+                .stream_runners
+                .insert(stream.get_first_empty_slot(), runner.id);
         }
     }
-       
+
     send_message!(
         &context.data().directory.stream_actor,
         StreamRequest,
@@ -288,7 +279,7 @@ async fn refresh(
     event: Option<String>,
 ) -> Result<(), anyhow::Error> {
     let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
-    let runner = context.data().db.find_runner(&runner).await?;
+    let runner = context.data().db.get_participant_by_name(&runner).await?;
     send_message!(
         &context.data().directory.runner_actor,
         RunnerRequest,
@@ -327,8 +318,8 @@ async fn swap(
     let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
     let mut stream = context.data().db.get_stream(stream_id).await?;
 
-    let runner1 = context.data().db.find_runner(&runner1).await?;
-    let runner2 = context.data().db.find_runner(&runner2).await?;
+    let runner1 = context.data().db.get_participant_by_name(&runner1).await?;
+    let runner2 = context.data().db.get_participant_by_name(&runner2).await?;
 
     let pos_p1 = stream.get_runner_slot(runner1.id);
     let pos_p2 = stream.get_runner_slot(runner2.id);
@@ -401,7 +392,7 @@ async fn set(
             let mut res = vec![];
             let runners: Vec<String> = runners.split(',').map(|s| s.trim().to_owned()).collect();
             for runner in runners {
-                res.push(context.data().db.find_runner(&runner).await?.id);
+                res.push(context.data().db.get_participant_by_name(&runner).await?.id);
             }
 
             res
@@ -410,9 +401,14 @@ async fn set(
             vec![]
         }
     };
+
     let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
     let mut stream = context.data().db.get_stream(stream_id).await?;
-    stream.stream_runners = runner_ids.iter().enumerate().map(|(i, r)| ((i as i64), *r)).collect();
+    stream.stream_runners = runner_ids
+        .iter()
+        .enumerate()
+        .map(|(i, r)| ((i as i64), *r))
+        .collect();
 
     send_message!(
         &context.data().directory.stream_actor,
@@ -421,76 +417,6 @@ async fn set(
         stream
     )?;
 
-    send_success_reply(&context).await
-}
-
-/// Set a list of commentator names to ignore.
-///
-/// This command can be used to stop 'listener' users from appearing
-/// as commentators. The provided names should be the user's nicknames
-/// (those that appear in the voice channel).
-/// ```
-/// /ignore streamer_bot
-/// ```
-#[poise::command(prefix_command, slash_command)]
-async fn ignore(
-    context: Context<'_>,
-    #[description = "Names to ignore"] ignored: Option<String>,
-    #[description = "Event for this command"]
-    #[autocomplete = "autocomplete_streamed_event_name"]
-    event: Option<String>,
-) -> Result<(), anyhow::Error> {
-    let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
-    let mut stream = context.data().db.get_stream(stream_id).await?;
-    stream.ignored_commentators = ignored.unwrap_or_default();
-    send_message!(
-        &context.data().directory.stream_actor,
-        StreamRequest,
-        Update,
-        stream
-    )?;
-    send_success_reply(&context).await
-}
-
-/// Create a stream for an event.
-#[poise::command(prefix_command, slash_command)]
-async fn create_stream(
-    context: Context<'_>,
-    #[description = "Event to stream"]
-    #[autocomplete = "autocomplete_event_name"]
-    event: String,
-    #[description = "OBS host to use"]
-    #[autocomplete = "autocomplete_obs_name"]
-    host: String,
-) -> Result<(), anyhow::Error> {
-    let event = context.data().db.get_id_for_event(&event).await?;
-    send_message!(
-        &context.data().directory.stream_actor,
-        StreamRequest,
-        Create,
-        event,
-        host
-    )?;
-    send_success_reply(&context).await
-}
-
-/// Stop a stream related to an event.
-///
-/// This allows the OBS host this stream is associated with to be used again.
-#[poise::command(prefix_command, slash_command)]
-async fn delete_stream(
-    context: Context<'_>,
-    #[description = "Stream to delete"]
-    #[autocomplete = "autocomplete_streamed_event_name"]
-    event: String,
-) -> Result<(), anyhow::Error> {
-    let event = context.data().db.get_id_for_event(&event).await?;
-    send_message!(
-        &context.data().directory.stream_actor,
-        StreamRequest,
-        Delete,
-        event
-    )?;
     send_success_reply(&context).await
 }
 
@@ -611,7 +537,7 @@ async fn start_stream(
     let _ = context.defer().await;
     send_message!(
         &context.data().directory.obs_actor,
-        ObsCommand,
+        HostCommand,
         StartStream,
         host
     )?;
@@ -630,136 +556,9 @@ async fn stop_stream(
 
     send_message!(
         &context.data().directory.obs_actor,
-        ObsCommand,
+        HostCommand,
         EndStream,
         host
-    )?;
-
-    send_success_reply(&context).await
-}
-
-/// Create a new event.
-#[poise::command(prefix_command, slash_command)]
-async fn create_event(
-    context: Context<'_>,
-    #[description = "Name for this event"] event_name: String,
-    #[description = "Runners to add to this event"] runners: Option<String>,
-) -> Result<(), anyhow::Error> {
-    log::debug!("Creating event {}", event_name);
-    let mut new_event = Event {
-        id: -1,
-        name: event_name,
-        game: None,
-        category: None,
-        estimate: None,
-        console: None,
-        complete: None,
-        therun_race_id: None,
-        event_start_time: None,
-        timer_start_time: None,
-        timer_end_time: None,
-        is_relay: false,
-        is_marathon: false,
-        preferred_layouts: vec![],
-        tournament: None,
-        runner_state: HashMap::new(),
-    };
-
-    let db = &context.data().db;
-    let runners_names_list: Vec<_> = runners
-        .map(|r| r.split(',').map(|s| s.trim().to_owned()).collect())
-        .unwrap_or_default();
-
-    for name in runners_names_list {
-        let runner = db.find_runner(&name).await?.id;
-        new_event.runner_state.insert(runner, RunnerEventState {
-            runner,
-            result: None,
-        });
-    }
-
-    send_message!(
-        &context.data().directory.event_actor,
-        EventRequest,
-        Create,
-        new_event.clone()
-    )?;
-
-    send_success_reply(&context).await
-}
-
-/// Remove an event
-#[poise::command(prefix_command, slash_command)]
-async fn delete_event(
-    context: Context<'_>,
-    #[description = "Name for this event"]
-    #[autocomplete = "autocomplete_event_name"]
-    event_name: String,
-) -> Result<(), anyhow::Error> {
-    log::debug!("Deleting event {}", event_name);
-    let event = context.data().db.get_id_for_event(&event_name).await?;
-
-    send_message!(
-        context.data().directory.event_actor,
-        EventRequest,
-        Delete,
-        event
-    )?;
-
-    send_success_reply(&context).await
-}
-
-/// Create a new runner.
-#[poise::command(prefix_command, slash_command)]
-async fn create_runner(
-    context: Context<'_>,
-    #[description = "Name for this runner"] name: String,
-    #[description = "TheRun.gg username"] therun: Option<String>,
-    #[description = "Twitch username/stream link"] stream: Option<String>,
-    #[description = "Nicknames for this runner"] nicknames: Option<String>,
-) -> Result<(), anyhow::Error> {
-    log::debug!("Creating runner {}", name);
-    let nicknames: Vec<_> = nicknames
-        .map(|r| r.split(',').map(|s| s.trim().to_owned()).collect())
-        .unwrap_or_default();
-
-    let runner = Runner {
-        id: -1,
-        name,
-        stream,
-        therun,
-        override_stream_url: None,
-        stream_urls: HashMap::new(),
-        volume_percent: 15,
-        location: None,
-        photo: None,
-        nicks: nicknames,
-    };
-
-    send_message!(
-        &context.data().directory.runner_actor,
-        RunnerRequest,
-        Create,
-        runner.clone()
-    )?;
-
-    send_success_reply(&context).await
-}
-
-/// Delete a runner.
-#[poise::command(prefix_command, slash_command)]
-async fn delete_runner(
-    context: Context<'_>,
-    #[description = "Name for this runner"]
-    #[autocomplete = "autocomplete_runner_name"]
-    name: String,
-) -> Result<(), anyhow::Error> {
-    let runner = context.data().db.find_runner(&name).await?;
-    send_message!(
-        &context.data().directory.runner_actor,
-        RunnerRequest,
-        Delete,
-        runner.id
     )?;
 
     send_success_reply(&context).await
@@ -779,7 +578,7 @@ async fn set_audible_runner(
     let stream_id = get_stream_id(event.clone(), &context.data().db).await?;
     let mut stream = context.data().db.get_stream(stream_id).await?;
 
-    let runner = context.data().db.find_runner(&name).await?;
+    let runner = context.data().db.get_participant_by_name(&name).await?;
     stream.audible_runner = Some(runner.id);
 
     send_message!(
@@ -787,32 +586,6 @@ async fn set_audible_runner(
         StreamRequest,
         Update,
         stream
-    )?;
-    send_success_reply(&context).await
-}
-
-/// Set the volume for a runner.
-#[poise::command(prefix_command, slash_command)]
-async fn set_runner_volume(
-    context: Context<'_>,
-    #[description = "Name for this runner"]
-    #[autocomplete = "autocomplete_runner_name"]
-    name: String,
-    #[description = "Volume for this runner in percent"] volume: u32,
-) -> Result<(), anyhow::Error> {
-    let db = &context.data().db;
-
-    if volume > 100 {
-        return Err(anyhow!("Volume must be between 0 and 100"));
-    }
-
-    let mut runner = db.find_runner(&name).await?;
-    runner.volume_percent = volume;
-    send_message!(
-        &context.data().directory.runner_actor,
-        RunnerRequest,
-        Update,
-        runner.clone()
     )?;
     send_success_reply(&context).await
 }
@@ -834,7 +607,7 @@ pub async fn init_discord(
     let _owners = match http.get_current_application_info().await {
         Ok(info) => {
             let mut owners = HashSet::new();
-            owners.insert(info.owner.id);
+            owners.insert(info.owner.unwrap().id);
             owners
         }
         Err(why) => {
@@ -844,6 +617,8 @@ pub async fn init_discord(
             )))?
         }
     };
+
+    let songbird_config = Config::default().decode_mode(DecodeMode::Decode);
 
     let intents = serenity::GatewayIntents::non_privileged()
         | serenity::GatewayIntents::GUILD_MESSAGES
@@ -856,21 +631,13 @@ pub async fn init_discord(
         swap(),
         layout(),
         refresh(),
-        ignore(),
         start_stream(),
         stop_stream(),
-        create_stream(),
-        delete_stream(),
         set_start_time(),
         set_end_time(),
         start_timer(),
         stop_timer(),
-        create_event(),
-        delete_event(),
-        create_runner(),
-        delete_runner(),
         set_audible_runner(),
-        set_runner_volume(),
     ];
 
     let options = poise::FrameworkOptions::<Data, anyhow::Error> {
@@ -891,7 +658,7 @@ pub async fn init_discord(
         },
         event_handler: |ctx, event, _framework, data| {
             Box::pin(async move {
-                if let poise::event::Event::VoiceStateUpdate { old, new } = event {
+                if let serenity::FullEvent::VoiceStateUpdate { old, new } = event {
                     handle_voice_state_event(ctx, old, new, data).await;
                 }
 
@@ -901,24 +668,35 @@ pub async fn init_discord(
         ..Default::default()
     };
 
-    poise::Framework::<Data, anyhow::Error>::builder()
-        .token(settings.discord_token.clone().unwrap().trim())
-        .intents(intents)
+    let token = settings.discord_token.clone().unwrap();
+    let framework = poise::Framework::<Data, anyhow::Error>::builder()
         .options(options)
-        .setup(move |ctx, _ready, framework| {
+        .setup(move |ctx, ready, framework| {
             Box::pin(async move {
-                log::info!("Logged in as {}", _ready.user.name);
+                log::info!("Logged in as {}", ready.user.name);
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                for (host_name, host) in &settings.obs_hosts {
+                    if host.enable_voice.unwrap_or(false) {
+                        connect_to_voice(ctx, directory.clone(), settings.clone(), host_name)
+                            .await?;
+                    }
+                }
                 Ok(Data {
+                    name: ready.user.name.clone(),
                     db,
                     settings,
                     directory,
                 })
             })
         })
-        .run()
-        .await
-        .expect("Err running client");
+        .build();
+
+    let mut client = serenity::Client::builder(token, intents)
+        .framework(framework)
+        .register_songbird_from_config(songbird_config)
+        .await?;
+
+    client.start().await?;
 
     Ok(())
 }

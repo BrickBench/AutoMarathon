@@ -1,4 +1,4 @@
 pub mod discord;
 pub mod obs;
 pub mod therun;
-pub mod web;
+pub mod discord_voice;

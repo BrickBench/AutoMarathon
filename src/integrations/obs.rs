@@ -6,14 +6,16 @@ use std::{
 
 use anyhow::anyhow;
 use obws::{
-    common::MonitorType, requests::{
+    common::MonitorType,
+    requests::{
         inputs::{self, InputId, SetSettings, Volume},
         scene_items::{
             Bounds, CreateSceneItem, Position, SceneItemTransform, SetIndex, SetTransform,
         },
         scenes::SceneId,
         EventSubscription,
-    }, responses::scene_items::SceneItem
+    },
+    responses::scene_items::SceneItem,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -76,41 +78,72 @@ pub struct ObsScene {
     pub sources: HashMap<usize, Vec<VlcSourceBounds>>,
 }
 
+/// A user currently present in the commentary Discord channel.
+/// This may map to a `Person` based on their username
+#[derive(Serialize, Clone, Debug)]
+pub struct DiscordUser {
+    /// The Discord username of this user
+    pub username: String,
+    /// Whether this user is currently speaking and their peak amplitude.
+    /// If AutoMarathon voice transmission is disabled, this will be False.
+    pub speaking: bool,
+    pub peak_volume: f32,
+    /// If AutoMarathon voice transmission is enabled,
+    /// this sets this user's desired volume
+    pub desired_volume: f32,
+}
+
 /// The status of an OBS host
 #[derive(Serialize, Clone, Debug)]
 pub struct ObsHostState {
-    /// Whether the host is connected
+    /// Whether the host is connected.
     pub connected: bool,
-    /// Whether the host is streaming
+    /// Whether the host is streaming.
     pub streaming: bool,
-    /// The frame rate of the stream
+    /// The frame rate of the stream.
     pub stream_frame_rate: u32,
-    /// The scenes present in the host by name
+    /// The scenes present in the host by name.
     pub scenes: HashMap<String, ObsScene>,
+    /// The discord users present in this host's voice channel.
+    pub discord_users: HashMap<String, DiscordUser>,
 }
 
 /// Requests for ObsActor
-pub enum ObsCommand {
+pub enum HostCommand {
     UpdateState(i64, Vec<ModifiedStreamState>, Rto<()>),
     StartStream(String, Rto<()>),
+    SetStreamCommentators(String, Vec<String>, Rto<()>),
+    SetCommentatorVoiceState(String, String, bool, f32),
     EndStream(String, Rto<()>),
+    GetCommentatorState(String, Rto<HashMap<String, DiscordUser>>),
     GetState(Rto<HashMap<String, ObsHostState>>),
 }
 
-pub type ObsActor = ActorRef<ObsCommand>;
+pub type HostActor = ActorRef<HostCommand>;
 
 type HostMap = HashMap<String, obws::Client>;
 
 pub async fn run_obs(
     settings: Arc<Settings>,
     db: Arc<ProjectDb>,
-    mut rx: UnboundedReceiver<ObsCommand>,
+    mut rx: UnboundedReceiver<HostCommand>,
 ) -> Result<(), anyhow::Error> {
     let mut host_map: HostMap = HostMap::new();
+    let mut discord_users: HashMap<String, HashMap<String, DiscordUser>> = HashMap::new();
+
+    log::info!("Creating initial connection to OBS");
+    for host in settings.obs_hosts.keys() {
+        discord_users.insert(host.clone(), HashMap::new());
+        let _ = connect_client_for_host(host, &mut host_map, &settings)
+            .await
+            .inspect_err(|e| {
+                log::warn!("Failed to connect to OBS host {}: {:?}", host, e);
+            });
+    }
 
     loop {
         match rx.recv().await.unwrap() {
-            ObsCommand::UpdateState(event, modifications, rto) => {
+            HostCommand::UpdateState(event, modifications, rto) => {
                 match db.get_stream(event).await {
                     Ok(stream) => {
                         if let Err(e) =
@@ -131,7 +164,7 @@ pub async fn run_obs(
                     }
                 }
             }
-            ObsCommand::StartStream(host, rto) => {
+            HostCommand::StartStream(host, rto) => {
                 if let Err(e) = connect_client_for_host(&host, &mut host_map, &settings).await {
                     rto.reply(Err(e));
                 } else {
@@ -139,7 +172,50 @@ pub async fn run_obs(
                     rto.reply(obs.streaming().start().await.map_err(|e| e.into()));
                 }
             }
-            ObsCommand::EndStream(host, rto) => {
+            HostCommand::SetStreamCommentators(host, commentators, rto) => {
+                let host_users = discord_users.get_mut(&host).unwrap();
+                for commentator in commentators.iter() {
+                    if !host_users.contains_key(commentator) {
+                        let person = db.get_participant_by_discord_id(commentator).await;
+                        if let Ok(person) = person {
+                            host_users.insert(
+                                commentator.to_string(),
+                                DiscordUser {
+                                    username: person.name.clone(),
+                                    speaking: false,
+                                    peak_volume: 0.0,
+                                    desired_volume: 1.0,
+                                },
+                            );
+                        } else {
+                            host_users.insert(
+                                commentator.to_string(),
+                                DiscordUser {
+                                    username: commentator.clone(),
+                                    speaking: false,
+                                    peak_volume: 0.0,
+                                    desired_volume: 1.0,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                host_users.retain(|k, _| commentators.contains(k));
+
+                rto.reply(Ok(()));
+            }
+            HostCommand::SetCommentatorVoiceState(host, commentator, speaking, volume) => {
+                let host_users = discord_users.get_mut(&host).unwrap();
+                if let Some(user) = host_users.get_mut(&commentator) {
+                    user.speaking = speaking;
+                    user.peak_volume = volume;
+                }
+            }
+            HostCommand::GetCommentatorState(host, rto) => {
+                rto.reply(Ok(discord_users.get(&host).unwrap().clone()));
+            }
+            HostCommand::EndStream(host, rto) => {
                 if let Err(e) = connect_client_for_host(&host, &mut host_map, &settings).await {
                     rto.reply(Err(e));
                 } else {
@@ -147,13 +223,17 @@ pub async fn run_obs(
                     rto.reply(obs.streaming().stop().await.map_err(|e| e.into()));
                 }
             }
-            ObsCommand::GetState(rto) => rto.reply(get_obs_state(&mut host_map, &settings).await),
+            HostCommand::GetState(rto) => {
+                rto.reply(get_obs_state(&mut host_map, &discord_users, &settings).await)
+            }
         };
     }
 }
 
+/// Return the state of each OBS host by name.
 async fn get_obs_state(
     host_map: &mut HostMap,
+    commentary_map: &HashMap<String, HashMap<String, DiscordUser>>,
     settings: &Settings,
 ) -> anyhow::Result<HashMap<String, ObsHostState>> {
     let mut states = HashMap::new();
@@ -161,7 +241,9 @@ async fn get_obs_state(
         let connected = connect_client_for_host(host, host_map, settings).await;
         if connected.is_ok() {
             let obs = host_map.get_mut(host).unwrap();
-            states.insert(host.clone(), get_obs_client_info(obs).await?);
+            let mut info = get_obs_client_info(obs).await?;
+            info.discord_users = commentary_map.get(host).unwrap().clone();
+            states.insert(host.clone(), info);
         } else {
             states.insert(
                 host.clone(),
@@ -170,6 +252,7 @@ async fn get_obs_state(
                     streaming: false,
                     stream_frame_rate: 0,
                     scenes: HashMap::new(),
+                    discord_users: commentary_map.get(host).unwrap().clone(),
                 },
             );
         }
@@ -186,6 +269,7 @@ async fn get_obs_client_info(obs: &obws::Client) -> anyhow::Result<ObsHostState>
         streaming: false,
         stream_frame_rate: 30,
         scenes: HashMap::new(),
+        discord_users: HashMap::new(),
     };
 
     let settings = obs.config().video_settings().await?;
@@ -205,6 +289,7 @@ async fn get_obs_client_info(obs: &obws::Client) -> anyhow::Result<ObsHostState>
 
         let scene_items = obs.scene_items().list(SceneId::Name(&scene.name)).await?;
 
+        #[allow(clippy::regex_creation_in_loops)] // inited once
         let regex =
             STREAM_ITEM_NAME_REGEX.get_or_init(|| Regex::new(r"streamer_(\d+)_.*").unwrap());
         for item in scene_items {
@@ -326,7 +411,7 @@ pub async fn do_transition(
     Ok(())
 }
 
-/// Return the appropriate layout for the given project state
+/// Return the appropriate scene layout for the given project state
 fn get_layout<'a>(
     event: &Event,
     state: &StreamState,
@@ -350,6 +435,8 @@ fn get_layout<'a>(
         .find(|l| l.sources.len() == state.stream_runners.len())
 }
 
+/// Determine the correct streamlink URL for the given
+/// element width and desired FPS.
 fn calculate_best_url(
     width: u32,
     stream_fps: u32,
@@ -371,12 +458,8 @@ fn calculate_best_url(
         let res_width = elements[0].parse::<u32>();
 
         if let Ok(stream_width) = res_width {
-            let stream_fps = if elements.len() > 1 {
-                if elements[1].contains("60") {
-                    60
-                } else {
-                    30
-                }
+            let stream_fps = if elements.len() > 1 && elements[1].contains("60") {
+                60
             } else {
                 30
             };
@@ -414,7 +497,7 @@ pub async fn update_obs_state(
     log::debug!("Updating OBS: {:?}", modifications);
 
     let mut vlc_inputs = obs.inputs().list(Some("vlc_source")).await?;
-    
+
     vlc_inputs.retain(|v| v.id.name.starts_with("stream"));
 
     let obs_state = get_obs_client_info(obs).await?;
@@ -433,28 +516,10 @@ pub async fn update_obs_state(
             }
 
             let scene_items = obs.scene_items().list(target_layout_id).await?;
-
-            // Modify commentary text
-            if modifications.contains(&ModifiedStreamState::Commentary)
-                && scene_items.iter().any(|s| &s.source_name == "commentary")
-            {
-                log::debug!("Updating commentator list");
-                let comm_setting = SpecificFreetype {
-                    text: &state.get_commentators().join("\n"),
-                };
-                obs.inputs()
-                    .set_settings(SetSettings {
-                        input: InputId::Name("commentary"),
-                        settings: &comm_setting,
-                        overlay: Some(true),
-                    })
-                    .await?;
-            }
-
             for (idx, runner) in state.stream_runners.iter() {
                 let runner = db.get_runner(*runner).await?;
-                log::debug!("Updating player {}", runner.name);
-                let stream_source_id_name = format!("streamer_{}", runner.name);
+                log::debug!("Updating player {}", runner.participant_data.name);
+                let stream_source_id_name = format!("streamer_{}", runner.participant_data.name);
                 let stream_source_id = InputId::Name(&stream_source_id_name);
 
                 // Get the stream views for this runner.
@@ -491,7 +556,7 @@ pub async fn update_obs_state(
                         Some((url, _)) => {
                             if !vlc_inputs.iter().any(|i| i.id.name == stream_source_id) {
                                 // Source does not exist, create source
-                                log::debug!("Creating source for {}", runner.name);
+                                log::debug!("Creating source for {}", runner.participant_data.name);
                                 let vlc_setting = VLC {
                                     playlist: vec![PlaylistItem {
                                         hidden: false,
@@ -509,7 +574,9 @@ pub async fn update_obs_state(
                                 };
 
                                 obs.inputs().create(new_input).await?;
-                                obs.inputs().set_audio_monitor_type(stream_source_id, MonitorType::None).await?;
+                                obs.inputs()
+                                    .set_audio_monitor_type(stream_source_id, MonitorType::None)
+                                    .await?;
                                 just_created = true;
                             } else {
                                 // Source exists, check if stream is up to date
@@ -518,7 +585,10 @@ pub async fn update_obs_state(
                                 if old_setting.settings.playlist.is_empty()
                                     || old_setting.settings.playlist[0].value != *url
                                 {
-                                    log::debug!("Applying stream change to {}", runner.name);
+                                    log::debug!(
+                                        "Applying stream change to {}",
+                                        runner.participant_data.name
+                                    );
                                     let vlc_setting = VLC {
                                         playlist: vec![PlaylistItem {
                                             hidden: false,
@@ -536,14 +606,17 @@ pub async fn update_obs_state(
 
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                 } else {
-                                    log::debug!("Stream for {} is up to date", runner.name);
+                                    log::debug!(
+                                        "Stream for {} is up to date",
+                                        runner.participant_data.name
+                                    );
                                 }
                             }
 
                             if state
                                 .audible_runner
                                 .as_ref()
-                                .map(|r| *r == runner.id)
+                                .map(|r| *r == runner.participant)
                                 .unwrap_or(*idx == 0)
                             {
                                 obs.inputs().set_muted(stream_source_id, false).await?;
@@ -557,16 +630,21 @@ pub async fn update_obs_state(
                                 obs.inputs().set_muted(stream_source_id, true).await?;
                             }
                         }
-                        None => log::warn!("No stream URL for {}, skipping...", runner.name),
+                        None => {
+                            log::warn!(
+                                "No stream URL for {}, skipping...",
+                                runner.participant_data.name
+                            )
+                        }
                     }
                 }
 
                 // Update this player's view
-                if modifications.contains(&ModifiedStreamState::RunnerView(runner.id))
+                if modifications.contains(&ModifiedStreamState::RunnerView(runner.participant))
                     || modifications.contains(&ModifiedStreamState::Layout)
                     || just_created
                 {
-                    log::debug!("Deleting old items for {}", runner.name);
+                    log::debug!("Deleting old items for {}", runner.participant_data.name);
 
                     // Remove old scene_items
                     delete_scene_items_for_player(
@@ -579,10 +657,13 @@ pub async fn update_obs_state(
 
                     let name_field = &format!("name_{}", idx);
                     if scene_items.iter().any(|s| &s.source_name == name_field) {
-                        log::debug!("Updating name field for to {}", runner.name);
+                        log::debug!(
+                            "Updating name field for to {}",
+                            runner.participant_data.name
+                        );
                         // Update name field
                         let name_setting = SpecificFreetype {
-                            text: &runner.name.to_uppercase(),
+                            text: &runner.participant_data.name.to_uppercase(),
                         };
 
                         obs.inputs()
@@ -593,11 +674,14 @@ pub async fn update_obs_state(
                             })
                             .await?;
                     } else {
-                        log::debug!("{} has no nametag, skipping", runner.name);
+                        log::debug!("{} has no nametag, skipping", runner.participant_data.name);
                     }
 
                     if good_url.is_some() {
-                        log::debug!("Creating new stream views for {}", runner.name);
+                        log::debug!(
+                            "Creating new stream views for {}",
+                            runner.participant_data.name
+                        );
 
                         let crop_scale: f64 = good_url.unwrap().1 as f64 / 1080.0;
 
@@ -655,7 +739,7 @@ pub async fn update_obs_state(
                     } else {
                         log::warn!(
                             "Not creating stream views for {} due to missing stream URL",
-                            runner.name
+                            runner.participant_data.name
                         );
                     }
                 }

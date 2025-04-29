@@ -7,11 +7,12 @@ use sqlx::{
 
 use crate::{
     core::{event::Event, runner::Runner, stream::StreamState},
-    integrations::{therun::Run, web::WebCommand},
+    integrations::therun::Run,
+    web::dashboard::WebCommand,
     Directory,
 };
 
-use super::event::RunnerEventState;
+use super::{event::RunnerEventState, participant::Participant};
 
 pub struct ProjectDb {
     db: SqlitePool,
@@ -48,15 +49,27 @@ impl ProjectDb {
 
     pub async fn create_tables(&self) -> anyhow::Result<()> {
         query!(
-            "create table runners(
+            "create table participants(
                         id integer primary key not null,
                         name text unique not null collate nocase,
+                        location text,
+                        pronouns text,
+                        discord_id text,
+                        photo blob,
+                        host boolean not null
+                    );"
+        )
+        .execute(&self.db)
+        .await?;
+
+        query!(
+            "create table runners(
+                        participant integer primary key not null,
                         stream text, 
                         therun text,
                         override_stream_url text,
-                        location text,
-                        photo blob,
-                        volume_percent integer not null
+                        volume_percent integer not null,
+                        foreign key(participant) references participants(id) on delete cascade
                     );"
         )
         .execute(&self.db)
@@ -68,13 +81,12 @@ impl ProjectDb {
                 runner integer not null,
                 resolution text not null,
                 url text not null,
-                foreign key(runner) references runners(id) on delete cascade
+                foreign key(runner) references runners(participant) on delete cascade
                 );
             "
         )
         .execute(&self.db)
         .await?;
-                    
 
         query!(
             "create table runs(
@@ -87,7 +99,7 @@ impl ProjectDb {
                     pb real,
                     current_split_name text,
                     current_split_index integer,
-                    foreign key(runner) references runners(id) on delete cascade
+                    foreign key(runner) references runners(participant) on delete cascade
             );"
         )
         .execute(&self.db)
@@ -110,16 +122,6 @@ impl ProjectDb {
                         id integer primary key not null,
                         name text not null collate nocase,
                         format text not null
-            );"
-        )
-        .execute(&self.db)
-        .await?;
-
-        query!(
-            "create table nicknames(
-                        nickname text primary key not null collate nocase,
-                        runner integer not null, 
-                        foreign key(runner) references runners(id) on delete cascade
             );"
         )
         .execute(&self.db)
@@ -154,7 +156,18 @@ impl ProjectDb {
                     runner integer not null, 
                     result json,
                     foreign key(event) references events(id) on delete cascade,
-                    foreign key(runner) references runners(id) on delete cascade
+                    foreign key(runner) references runners(participant) on delete cascade
+                );"
+        )
+        .execute(&self.db)
+        .await?;
+
+        query!(
+            "create table commentators_in_event(
+                    event integer not null,
+                    commentator integer not null, 
+                    foreign key(event) references events(id) on delete cascade,
+                    foreign key(commentator) references participants(id) on delete cascade
                 );"
         )
         .execute(&self.db)
@@ -164,8 +177,6 @@ impl ProjectDb {
             "create table streams(
                     event integer primary key not null unique,
                     obs_host text not null,
-                    active_commentators text not null,
-                    ignored_commentators text not null,
                     requested_layout text,
                     audible_runner integer,
                     foreign key(event) references events(id) on delete cascade
@@ -180,7 +191,7 @@ impl ProjectDb {
                     runner integer not null,
                     stream_order integer not null,
                     foreign key(event) references streams(event) on delete cascade,
-                    foreign key(runner) references runners(id) on delete cascade
+                    foreign key(runner) references runners(participant) on delete cascade
                 );"
         )
         .execute(&self.db)
@@ -202,51 +213,132 @@ impl ProjectDb {
         self.directory.web_actor.send(WebCommand::SendStateUpdate);
     }
 
+    pub async fn add_participant(&self, participant: &mut Participant) -> anyhow::Result<()> {
+        log::debug!("Creating new participant {}", participant.name);
+        sqlx::query(
+            "insert into participants(name, location, pronouns, discord_id, photo, host)
+                    values(?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&participant.name)
+        .bind(&participant.location)
+        .bind(&participant.pronouns)
+        .bind(&participant.discord_id)
+        .bind(&participant.photo)
+        .bind(participant.host)
+        .execute(&self.db)
+        .await?;
+
+        let id: i64 = sqlx::query_scalar("select last_insert_rowid()")
+            .fetch_one(&self.db)
+            .await?;
+
+        participant.id = id;
+
+        self.trigger_update();
+        Ok(())
+    }
+
+    pub async fn get_participant(&self, id: i64) -> anyhow::Result<Participant> {
+        Ok(sqlx::query_as("select * from participants where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    pub async fn update_participant(&self, participant: &Participant) -> anyhow::Result<()> {
+        log::debug!("Updating participant {}", participant.name);
+        sqlx::query(
+            "update participants set
+                name = ?,
+                location = ?,
+                pronouns = ?,
+                discord_id = ?,
+                photo = ?,
+                host = ?
+                where id = ?",
+        )
+        .bind(&participant.name)
+        .bind(&participant.location)
+        .bind(&participant.pronouns)
+        .bind(&participant.discord_id)
+        .bind(&participant.photo)
+        .bind(participant.host)
+        .bind(participant.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_participants(&self) -> anyhow::Result<Vec<Participant>> {
+        Ok(sqlx::query_as("select * from participants")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    pub async fn get_participant_by_discord_id(
+        &self,
+        discord_id: &str,
+    ) -> anyhow::Result<Participant> {
+        Ok(
+            sqlx::query_as("select * from participants where discord_id = ?")
+                .bind(discord_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    pub async fn get_participant_by_name(&self, name: &str) -> anyhow::Result<Participant> {
+        Ok(sqlx::query_as("select * from participants where name = ?")
+            .bind(name)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    pub async fn delete_participant(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query("delete from participants where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        self.trigger_update();
+        Ok(())
+    }
+
     pub async fn get_runners(&self) -> anyhow::Result<Vec<Runner>> {
         let mut runners: Vec<Runner> = sqlx::query_as("select * from runners")
             .fetch_all(&self.db)
             .await?;
 
         for runner in runners.iter_mut() {
-            runner.nicks = sqlx::query_scalar("select nickname from nicknames where runner = ?")
-                .bind(runner.id)
-                .fetch_all(&self.db)
-                .await?;
+            let stream_urls: Vec<RunnerStreamUrl> =
+                sqlx::query_as("select resolution, url from runner_stream_urls where runner = ?")
+                    .bind(runner.participant)
+                    .fetch_all(&self.db)
+                    .await?;
 
-            let stream_urls: Vec<RunnerStreamUrl> = sqlx::query_as(
-                "select resolution, url from runner_stream_urls where runner = ?"
-            ).bind(runner.id).fetch_all(&self.db).await?;
-
-            runner.stream_urls = stream_urls.into_iter().map(|r| (r.resolution, r.url)).collect();
+            runner.stream_urls = stream_urls
+                .into_iter()
+                .map(|r| (r.resolution, r.url))
+                .collect();
         }
 
         Ok(runners)
     }
 
     pub async fn add_runner(&self, runner: &mut Runner) -> anyhow::Result<()> {
-        log::debug!("Creating new runner {}", runner.name);
+        log::debug!("Creating new runner {}", runner.participant);
         let mut tx = self.db.begin().await?;
-        sqlx::query("insert into runners(name, stream, therun, location, volume_percent) values(?, ?, ?, ?, ?)")
-            .bind(&runner.name)
-            .bind(&runner.stream)
-            .bind(&runner.therun)
-            .bind(&runner.location)
-            .bind(runner.volume_percent)
-            .execute(&mut *tx)
-            .await?;
-
-        let last_runner_id: i64 = sqlx::query_scalar("select last_insert_rowid()")
-            .fetch_one(&mut *tx)
-            .await?;
-        runner.id = last_runner_id;
-
-        if !runner.nicks.is_empty() {
-            let mut builder = sqlx::QueryBuilder::new("insert into nicknames(nickname, runner)");
-            builder.push_values(runner.nicks.iter(), |mut b, nick| {
-                b.push_bind(nick).push_bind(runner.id);
-            });
-            builder.build().execute(&mut *tx).await?;
-        }
+        sqlx::query(
+            "insert into runners(participant, stream, therun, override_stream_url, volume_percent)
+                    values(?, ?, ?, ?, ?)",
+        )
+        .bind(runner.participant)
+        .bind(&runner.stream)
+        .bind(&runner.therun)
+        .bind(&runner.override_stream_url)
+        .bind(runner.volume_percent)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         self.trigger_update();
@@ -254,53 +346,39 @@ impl ProjectDb {
     }
 
     pub async fn update_runner(&self, runner: &Runner) -> anyhow::Result<()> {
-        log::debug!("Updating runner {}", runner.name);
+        log::debug!("Updating runner {}", runner.participant);
 
         let mut tx = self.db.begin().await?;
 
         sqlx::query(
             "update runners set
-                    name = ?,
-                    stream = ?,
-                    therun = ?,
-                    override_stream_url = ?,
-                    location = ?,
-                    volume_percent = ?
-                    where id = ?",
+                stream = ?,
+                therun = ?,
+                override_stream_url = ?,
+                volume_percent = ?
+                where participant = ?
+  ",
         )
-        .bind(&runner.name)
         .bind(&runner.stream)
         .bind(&runner.therun)
         .bind(&runner.override_stream_url)
-        .bind(&runner.location)
         .bind(runner.volume_percent)
-        .bind(runner.id)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("delete from nicknames where runner = ?")
-            .bind(runner.id)
-            .execute(&mut *tx)
-            .await?;
-
-        if !runner.nicks.is_empty() {
-            let mut builder = sqlx::QueryBuilder::new("insert into nicknames(nickname, runner)");
-            builder.push_values(runner.nicks.iter(), |mut b, nick| {
-                b.push_bind(nick).push_bind(runner.id);
-            });
-            builder.build().execute(&mut *tx).await?;
-        }
-
         sqlx::query("delete from runner_stream_urls where runner = ?")
-            .bind(runner.id)
+            .bind(runner.participant)
             .execute(&mut *tx)
             .await?;
 
         if !runner.stream_urls.is_empty() {
-            let mut builder = sqlx::QueryBuilder::new("insert into runner_stream_urls(runner, resolution, url)");
+            let mut builder =
+                sqlx::QueryBuilder::new("insert into runner_stream_urls(runner, resolution, url)");
             let streams = runner.stream_urls.clone();
             builder.push_values(streams.iter(), |mut b, url_map| {
-                b.push_bind(runner.id).push_bind(url_map.0).push_bind(url_map.1);
+                b.push_bind(runner.participant)
+                    .push_bind(url_map.0)
+                    .push_bind(url_map.1);
             });
             builder.build().execute(&mut *tx).await?;
         }
@@ -314,69 +392,31 @@ impl ProjectDb {
     pub async fn get_runner(&self, id: i64) -> anyhow::Result<Runner> {
         let mut runner: Runner = sqlx::query_as(
             "select * from runners 
-                        where id = ?
+                        where participant = ?
                         limit 1",
-            /*"select * from runners r
-            left join nicknames n on r.name = n.runner
-            where r.name = '?' or n.nickname = '?'
-            limit 1",*/
         )
         .bind(id)
         .fetch_one(&self.db)
         .await?;
 
-        runner.nicks = sqlx::query_scalar("select nickname from nicknames where runner = ?")
-            .bind(runner.id)
-            .fetch_all(&self.db)
-            .await?;
+        runner.participant_data = self.get_participant(runner.participant).await?;
 
-        let stream_urls: Vec<RunnerStreamUrl> = sqlx::query_as(
-            "select resolution, url from runner_stream_urls where runner = ?"
-        ).bind(id).fetch_all(&self.db).await?;
+        let stream_urls: Vec<RunnerStreamUrl> =
+            sqlx::query_as("select resolution, url from runner_stream_urls where runner = ?")
+                .bind(id)
+                .fetch_all(&self.db)
+                .await?;
 
-        runner.stream_urls = stream_urls.into_iter().map(|r| (r.resolution, r.url)).collect();
-
-        Ok(runner)
-    }
-
-    pub async fn get_name_for_runner(&self, id: i64) -> anyhow::Result<String> {
-        Ok(sqlx::query_scalar("select name from runners where id = ?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await?)
-    }
-
-    pub async fn find_runner(&self, name: &str) -> anyhow::Result<Runner> {
-        log::debug!("Searching for runner {}", name);
-        let mut runner: Runner = 
-        /*sqlx::query_as(
-            "select * from runners r
-            left join nicknames n on r.name = n.runner
-            where r.name = '?' or n.nickname = '?'
-            limit 1",
-        )*/
-        sqlx::query_as("select * from runners where name = ?")
-        .bind(name)
-        .fetch_optional(&self.db)
-        .await?
-        .ok_or(anyhow!("Failed to find runner {}", name))?;
-
-        runner.nicks = sqlx::query_scalar("select nickname from nicknames where runner = ?")
-            .bind(runner.id)
-            .fetch_all(&self.db)
-            .await?;
-
-        let stream_urls: Vec<RunnerStreamUrl> = sqlx::query_as(
-            "select resolution, url from runner_stream_urls where runner = ?"
-        ).bind(runner.id).fetch_all(&self.db).await?;
-
-        runner.stream_urls = stream_urls.into_iter().map(|r| (r.resolution, r.url)).collect();
+        runner.stream_urls = stream_urls
+            .into_iter()
+            .map(|r| (r.resolution, r.url))
+            .collect();
 
         Ok(runner)
     }
 
     pub async fn delete_runner(&self, runner: i64) -> anyhow::Result<()> {
-        sqlx::query("delete from runners where id= ?")
+        sqlx::query("delete from runners where participant = ?")
             .bind(runner)
             .execute(&self.db)
             .await?;
@@ -460,6 +500,16 @@ impl ProjectDb {
         builder
     }
 
+    fn create_event_commentators_builder(&self, event: &Event) -> QueryBuilder<Sqlite> {
+        let mut builder =
+            sqlx::QueryBuilder::new("insert into commentators_in_event(event, commentator)");
+
+        builder.push_values(event.commentators.iter(), |mut b, result| {
+            b.push_bind(event.id).push_bind(*result);
+        });
+        builder
+    }
+
     pub async fn add_event(&self, event: &mut Event) -> anyhow::Result<()> {
         let mut tx = self.db.begin().await?;
         sqlx::query(
@@ -493,6 +543,11 @@ impl ProjectDb {
             builder.build().execute(&mut *tx).await?;
         }
 
+        if !event.commentators.is_empty() {
+            let mut builder = self.create_event_commentators_builder(event);
+            builder.build().execute(&mut *tx).await?;
+        }
+
         tx.commit().await?;
         self.trigger_update();
         Ok(())
@@ -523,10 +578,11 @@ impl ProjectDb {
             .fetch_one(&self.db)
             .await?;
 
-        let runner_state: Vec<RunnerEventState> = sqlx::query_as("select * from runners_in_event where event = ?")
-            .bind(event_id)
-            .fetch_all(&self.db)
-            .await?;
+        let runner_state: Vec<RunnerEventState> =
+            sqlx::query_as("select * from runners_in_event where event = ?")
+                .bind(event_id)
+                .fetch_all(&self.db)
+                .await?;
 
         event.runner_state = runner_state.into_iter().map(|r| (r.runner, r)).collect();
 
@@ -616,6 +672,10 @@ impl ProjectDb {
 
         let mut builder = self.create_event_runners_builder(event);
         builder.build().execute(&mut *tx).await?;
+
+        let mut builder = self.create_event_commentators_builder(event);
+        builder.build().execute(&mut *tx).await?;
+
         tx.commit().await?;
         self.trigger_update();
 
@@ -688,15 +748,13 @@ impl ProjectDb {
         let mut tx = self.db.begin().await?;
         sqlx::query(
             "insert or replace into streams(
-                        event, obs_host, active_commentators,
-                        ignored_commentators, requested_layout,
+                        event, obs_host, 
+                        requested_layout,
                         audible_runner
-                    ) values(?, ?, ?, ?, ?, ?)",
+                    ) values(?, ?, ?, ?)",
         )
         .bind(state.event)
         .bind(&state.obs_host)
-        .bind(&state.active_commentators)
-        .bind(&state.ignored_commentators)
         .bind(&state.requested_layout)
         .bind(state.audible_runner)
         .execute(&mut *tx)
@@ -776,10 +834,12 @@ impl ProjectDb {
     }
 
     pub async fn get_custom_field(&self, key: &str) -> anyhow::Result<Option<String>> {
-        Ok(sqlx::query_scalar("select value from custom_fields where fkey = ?")
-            .bind(key)
-            .fetch_optional(&self.db)
-            .await?)
+        Ok(
+            sqlx::query_scalar("select value from custom_fields where fkey = ?")
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await?,
+        )
     }
 
     pub async fn clear_custom_field(&self, key: &str) -> anyhow::Result<()> {

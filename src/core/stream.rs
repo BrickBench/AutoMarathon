@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     core::{db::ProjectDb, runner::RunnerRequest},
-    integrations::obs::ObsCommand,
+    integrations::obs::HostCommand,
     send_message, ActorRef, Directory, Rto,
 };
 
@@ -18,36 +18,12 @@ use crate::{
 pub struct StreamState {
     pub event: i64,
     pub obs_host: String,
-    /// Semicolon-separated list of commentators
-    pub active_commentators: String,
-    pub ignored_commentators: String,
     pub audible_runner: Option<i64>,
     pub requested_layout: Option<String>,
 
     #[sqlx(skip)]
-    /// Map of viwe IDs to runner IDs
+    /// Map of view IDs to runner IDs
     pub stream_runners: HashMap<i64, i64>,
-}
-
-impl StreamState {
-    /// Returns all active commentators
-    pub fn get_commentators(&self) -> Vec<String> {
-        let mut commentators = self
-            .active_commentators
-            .split(';')
-            .map(|s| s.to_string())
-            .collect::<Vec<String>>();
-
-        let ignored_vec = self
-            .ignored_commentators
-            .split(';')
-            .map(|s| s.to_string())
-            .collect::<Vec<String>>();
-
-        commentators.retain(|c| !&ignored_vec.contains(c));
-
-        commentators
-    }
 }
 
 /// Requests that can be sent to a StateActor
@@ -65,7 +41,6 @@ pub type StreamActor = ActorRef<StreamRequest>;
 pub enum ModifiedStreamState {
     RunnerView(i64),
     Layout,
-    Commentary,
 }
 
 /// Verify the ID of a streamed event.
@@ -111,17 +86,15 @@ pub async fn run_stream_manager(
             StreamRequest::Create(event, host, rto) => {
                 log::debug!("Creating stream for {} using {}", event, host);
 
-                let obs_host_data = send_message!(directory.obs_actor, ObsCommand, GetState);
+                let obs_host_data = send_message!(directory.obs_actor, HostCommand, GetState);
 
                 if obs_host_data.is_err() {
-                    log::warn!(
+                    let msg = format!(
                         "Failed to get OBS host data, cannot create stream for event {}.",
                         event
                     );
-                    rto.reply(Err(anyhow!(
-                        "Failed to get OBS host data, cannot create stream for event {}.",
-                        event
-                    )));
+                    log::warn!("{}", msg);
+                    rto.reply(Err(anyhow!(msg)));
                 } else if !obs_host_data.as_ref().unwrap().contains_key(&host) {
                     log::warn!(
                         "Host '{}' is not a valid OBS host, cannot create stream for event {}.",
@@ -172,8 +145,6 @@ pub async fn run_stream_manager(
                     let state = StreamState {
                         event,
                         obs_host: host,
-                        active_commentators: "".to_string(),
-                        ignored_commentators: "".to_string(),
                         requested_layout: None,
                         stream_runners: HashMap::new(),
                         audible_runner: None,
@@ -190,13 +161,13 @@ pub async fn run_stream_manager(
             }
             StreamRequest::Update(new_stream, rto) => match db.get_stream(new_stream.event).await {
                 Ok(stream) => {
-                    let bad_runners = new_stream.trigger_refreshes(&stream, &directory).await;
+                    let _bad_runners = new_stream.trigger_refreshes(&stream, &directory).await;
                     let diffs = new_stream.determine_modified_state(&stream);
                     db.save_stream(&new_stream).await?;
 
                     let worked = send_message!(
                         directory.obs_actor,
-                        ObsCommand,
+                        HostCommand,
                         UpdateState,
                         new_stream.event,
                         diffs
@@ -222,7 +193,7 @@ pub async fn run_stream_manager(
             },
             StreamRequest::Reload(stream, rto) => rto.reply(send_message!(
                 directory.obs_actor,
-                ObsCommand,
+                HostCommand,
                 UpdateState,
                 stream,
                 Vec::<ModifiedStreamState>::new()
@@ -237,6 +208,10 @@ pub async fn run_stream_manager(
 }
 
 impl StreamState {
+    /// Find the runners that changed between the previous and current stream states,
+    /// and trigger stream refreshes for those runners.
+    ///
+    /// Return the runners which failed to get streams.
     pub async fn trigger_refreshes(&self, old: &StreamState, directory: &Directory) -> Vec<i64> {
         let old_runners = HashSet::<i64>::from_iter(old.stream_runners.values().cloned());
         let new_runners = HashSet::<i64>::from_iter(self.stream_runners.values().cloned());
@@ -262,6 +237,7 @@ impl StreamState {
         bad_runners
     }
 
+    /// Determine which stream elements were modified between the previous and current states.
     pub fn determine_modified_state(&self, old: &StreamState) -> Vec<ModifiedStreamState> {
         let mut modifications = Vec::<ModifiedStreamState>::new();
         for (pos, runner) in self.stream_runners.iter() {
@@ -280,19 +256,17 @@ impl StreamState {
             modifications.push(ModifiedStreamState::Layout);
         }
 
-        if self.get_commentators() != old.get_commentators() {
-            modifications.push(ModifiedStreamState::Commentary);
-        }
-
         modifications
     }
 
+    /// Determine the stream slot for the given runner.
     pub fn get_runner_slot(&self, runner: i64) -> Option<i64> {
         self.stream_runners
             .iter()
             .find_map(|(k, v)| if *v == runner { Some(*k) } else { None })
     }
 
+    /// Find the slot not currently assigned to a runner.
     pub fn get_first_empty_slot(&self) -> i64 {
         let mut i = 1;
         while self.stream_runners.contains_key(&i) {

@@ -4,3 +4,4 @@ pub mod stream;
 pub mod db;
 pub mod tournament;
 pub mod settings;
+pub mod participant;

@@ -2,12 +2,14 @@ use core::{
     event::{run_event_actor, EventActor},
     runner::{run_runner_actor, RunnerActor},
 };
+use integrations::therun::{run_therun_actor, TheRunActor};
+use rustls::crypto::aws_lc_rs::default_provider;
 use std::{env::consts, fs::read_to_string, path::PathBuf, sync::Arc};
+use web::{dashboard::WebActor, run_http_server};
 
 use anyhow::anyhow;
 use clap::Parser;
 
-use integrations::web::{run_http_server, WebActor};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -20,12 +22,14 @@ use crate::{
     core::db::ProjectDb,
     core::settings::Settings,
     core::stream::{run_stream_manager, StreamActor},
-    integrations::obs::{run_obs, ObsActor},
+    integrations::obs::{run_obs, HostActor},
 };
 
 mod core;
 mod error;
 mod integrations;
+mod util;
+mod web;
 
 const AUTOMARATHON_VER: &str = "0.1";
 
@@ -81,10 +85,11 @@ macro_rules! send_nonblocking {
 #[derive(Clone)]
 pub struct Directory {
     pub stream_actor: StreamActor,
-    pub obs_actor: ObsActor,
+    pub obs_actor: HostActor,
     pub runner_actor: RunnerActor,
     pub event_actor: EventActor,
     pub web_actor: WebActor,
+    pub therun_actor: TheRunActor,
 }
 
 /// Actor reference
@@ -153,8 +158,10 @@ async fn main() -> anyhow::Result<()> {
         .filter(Some("h2"), log::LevelFilter::Warn)
         .filter(Some("rustls"), log::LevelFilter::Warn)
         .filter(Some("sqlx"), log::LevelFilter::Info)
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Info)
         .init();
+
+    default_provider().install_default().unwrap();
 
     log::info!(
         "Launching AutoMarathon {} on {}",
@@ -171,10 +178,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up messaging channels
     let (state_actor, state_rx) = StreamActor::new();
-    let (obs_actor, obs_rx) = ObsActor::new();
+    let (obs_actor, obs_rx) = HostActor::new();
     let (runner_actor, runner_rx) = RunnerActor::new();
     let (event_actor, event_rx) = EventActor::new();
     let (web_actor, web_rx) = WebActor::new();
+    let (therun_actor, therun_tx) = TheRunActor::new();
 
     let directory = Directory {
         stream_actor: state_actor.clone(),
@@ -182,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
         runner_actor: runner_actor.clone(),
         event_actor: event_actor.clone(),
         web_actor: web_actor.clone(),
+        therun_actor: therun_actor.clone(),
     };
 
     let db = Arc::new(
@@ -207,8 +216,14 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(run_obs(settings.clone(), db.clone(), obs_rx));
     tasks.spawn(run_stream_manager(db.clone(), state_rx, directory.clone()));
     tasks.spawn(run_event_actor(db.clone(), event_rx, directory.clone()));
-    tasks.spawn(run_http_server(db.clone(), directory.clone(), settings.clone(), web_rx));
-    tasks.spawn(run_runner_actor(db.clone(), runner_rx));
+    tasks.spawn(run_http_server(
+        db.clone(),
+        directory.clone(),
+        settings.clone(),
+        web_rx,
+    ));
+    tasks.spawn(run_runner_actor(directory.clone(), db.clone(), runner_rx));
+    tasks.spawn(run_therun_actor(db.clone(), therun_tx));
 
     // Spawn integrations
     if settings.discord_token.is_some() {

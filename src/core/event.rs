@@ -1,36 +1,17 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::anyhow;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use sqlx::{prelude::FromRow, types::time};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::{send_message, ActorRef, Directory, Rto};
+use crate::{
+    send_message,
+    util::{deserialize_datetime, serialize_datetime},
+    ActorRef, Directory, Rto,
+};
 
 use super::{db::ProjectDb, stream::StreamRequest};
-
-fn serialize_datetime<S>(x: &Option<time::OffsetDateTime>, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    if let Some(x) = x {
-        s.serialize_u64((x.unix_timestamp_nanos() / 1_000_000) as u64)
-    } else {
-        s.serialize_none()
-    }
-}
-
-fn deserialize_datetime<'de, D>(d: D) -> Result<Option<time::OffsetDateTime>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let x = Option::<u64>::deserialize(d)?;
-    let time = x.map(|x| time::OffsetDateTime::from_unix_timestamp_nanos(x as i128 * 1_000_000));
-    match time {
-        Some(Ok(x)) => Ok(Some(x)),
-        _ => Ok(None),
-    }
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum EventResult {
@@ -63,7 +44,7 @@ pub struct Event {
     /// Game console for this event
     pub console: Option<String>,
 
-    /// If the event is complete 
+    /// If the event is complete
     pub complete: Option<bool>,
 
     /// Time estimate for the event in seconds
@@ -98,6 +79,10 @@ pub struct Event {
 
     pub is_relay: bool,
     pub is_marathon: bool,
+
+    /// A list of associated commentators
+    #[sqlx(skip)]
+    pub commentators: Vec<i64>,
 
     #[sqlx(skip)]
     pub runner_state: HashMap<i64, RunnerEventState>,
