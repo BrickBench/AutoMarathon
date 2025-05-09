@@ -53,8 +53,10 @@ pub struct ParticipantVoiceState {
 /// Data for voice data in the last 20ms.
 #[derive(Serialize, Debug, Clone)]
 pub struct VoiceUpdate {
+    /// The host this voice channel is associated with
     pub host: String,
-    pub voice_users: HashMap<String, ParticipantVoiceState>,
+    /// Map of Discord ID to voice state
+    pub voice_users: HashMap<u64, ParticipantVoiceState>,
 }
 
 /// Struct denoting the current dashboard layout editor.

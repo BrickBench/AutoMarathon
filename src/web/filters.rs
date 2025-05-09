@@ -16,7 +16,7 @@ use crate::{
 
 use super::handlers::{
     create_stream, get_event, refresh_runner, set_streaming_state, to_http_none_or_error,
-    to_http_output, Id, NewField, UpdateField,
+    to_http_output, Id, NewField, SetDiscordUserVolume, UpdateField,
 };
 
 pub fn with_db(
@@ -255,6 +255,22 @@ pub fn api_filters(
             to_http_none_or_error(db.clear_custom_field(&field.key).await)
         });
 
+    let set_discord_volume = warp::path!("discord" / "volume")
+        .and(warp::put())
+        .and(warp::body::json())
+        .and(with_directory(directory.clone()))
+        .and_then(
+            async |volume_req: SetDiscordUserVolume, directory: Directory| {
+                to_http_none_or_error(send_message!(
+                    directory.obs_actor,
+                    HostCommand,
+                    SetCommentatorVolume,
+                    volume_req.user,
+                    volume_req.volume
+                ))
+            },
+        );
+
     let dashboard = warp::path!("static").and(warp::fs::dir("web/static/timer.html"));
 
     get_hosts
@@ -263,6 +279,7 @@ pub fn api_filters(
         .or(update_field)
         .or(delete_field)
         .or(dashboard)
+        .or(set_discord_volume)
         .or(participant_filters(db.clone()))
         .or(runner_filters(directory.clone()))
         .or(event_filters(db.clone(), directory.clone()))

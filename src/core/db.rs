@@ -68,7 +68,7 @@ impl ProjectDb {
                         stream text, 
                         therun text,
                         override_stream_url text,
-                        volume_percent integer not null,
+                        stream_volume_percent integer not null,
                         foreign key(participant) references participants(id) on delete cascade
                     );"
         )
@@ -206,6 +206,15 @@ impl ProjectDb {
         .execute(&self.db)
         .await?;
 
+        query!(
+            "create table discord_user_volumes(
+                    discord_id text primary key not null unique,
+                    volume_percent integer
+                );"
+        )
+        .execute(&self.db)
+        .await?;
+
         Ok(())
     }
 
@@ -329,14 +338,14 @@ impl ProjectDb {
         log::debug!("Creating new runner {}", runner.participant);
         let mut tx = self.db.begin().await?;
         sqlx::query(
-            "insert into runners(participant, stream, therun, override_stream_url, volume_percent)
+            "insert into runners(participant, stream, therun, override_stream_url, stream_volume_percent)
                     values(?, ?, ?, ?, ?)",
         )
         .bind(runner.participant)
         .bind(&runner.stream)
         .bind(&runner.therun)
         .bind(&runner.override_stream_url)
-        .bind(runner.volume_percent)
+        .bind(runner.stream_volume_percent)
         .execute(&mut *tx)
         .await?;
 
@@ -355,14 +364,15 @@ impl ProjectDb {
                 stream = ?,
                 therun = ?,
                 override_stream_url = ?,
-                volume_percent = ?
+                stream_volume_percent = ?
                 where participant = ?
   ",
         )
         .bind(&runner.stream)
         .bind(&runner.therun)
         .bind(&runner.override_stream_url)
-        .bind(runner.volume_percent)
+        .bind(runner.stream_volume_percent)
+        .bind(runner.participant)
         .execute(&mut *tx)
         .await?;
 
@@ -583,8 +593,14 @@ impl ProjectDb {
                 .bind(event_id)
                 .fetch_all(&self.db)
                 .await?;
-
         event.runner_state = runner_state.into_iter().map(|r| (r.runner, r)).collect();
+
+        let commentators: Vec<i64> =
+            sqlx::query_scalar("select commentator from commentators_in_event where event = ?")
+                .bind(event_id)
+                .fetch_all(&self.db)
+                .await?;
+        event.commentators = commentators;
 
         Ok(event)
     }
@@ -636,7 +652,7 @@ impl ProjectDb {
                     game = ?,
                     category = ?,
                     console = ?,
-                    complete= ?,
+                    complete = ?,
                     estimate = ?,
                     therun_race_id = ?,
                     event_start_time = ?,
@@ -670,11 +686,20 @@ impl ProjectDb {
             .execute(&mut *tx)
             .await?;
 
-        let mut builder = self.create_event_runners_builder(event);
-        builder.build().execute(&mut *tx).await?;
+        if !event.runner_state.is_empty() {
+            let mut builder = self.create_event_runners_builder(event);
+            builder.build().execute(&mut *tx).await?;
+        }
 
-        let mut builder = self.create_event_commentators_builder(event);
-        builder.build().execute(&mut *tx).await?;
+        sqlx::query("delete from commentators_in_event where event = ?")
+            .bind(event.id)
+            .execute(&mut *tx)
+            .await?;
+
+        if !event.commentators.is_empty() {
+            let mut builder = self.create_event_commentators_builder(event);
+            builder.build().execute(&mut *tx).await?;
+        }
 
         tx.commit().await?;
         self.trigger_update();
@@ -849,5 +874,30 @@ impl ProjectDb {
             .await?;
         self.trigger_update();
         Ok(())
+    }
+
+    pub async fn set_discord_user_volume(
+        &self,
+        discord_id: &str,
+        volume_percent: i32,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "insert or replace into discord_user_volumes(discord_id, volume_percent) values(?, ?)",
+        )
+        .bind(discord_id)
+        .bind(volume_percent)
+        .execute(&self.db)
+        .await?;
+        self.trigger_update();
+        Ok(())
+    }
+
+    pub async fn get_discord_user_volume(&self, discord_id: &str) -> anyhow::Result<Option<i32>> {
+        Ok(sqlx::query_scalar(
+            "select volume_percent from discord_user_volumes where discord_id = ?",
+        )
+        .bind(discord_id)
+        .fetch_optional(&self.db)
+        .await?)
     }
 }

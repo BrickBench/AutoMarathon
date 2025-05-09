@@ -40,6 +40,13 @@ pub struct SetStreamingState {
     pub streaming: bool,
 }
 
+/// A Json struct to set a Discord user's volume
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SetDiscordUserVolume {
+    pub user: u64,
+    pub volume: u32,
+}
+
 async fn get_event_by_args(
     args: HashMap<String, String>,
     db: &ProjectDb,

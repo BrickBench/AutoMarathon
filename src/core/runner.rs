@@ -58,6 +58,7 @@ pub async fn run_runner_actor(
                 let old_runner = db.get_runner(runner.participant).await;
                 match old_runner {
                     Ok(old_runner) => {
+                        log::info!("Updating runner {}", runner.participant);
                         // Check for changes in TheRun.gg username
                         if old_runner.get_therun_username() != runner.get_therun_username() {
                             send_nonblocking!(
@@ -154,11 +155,10 @@ pub struct Runner {
     /// fails to acquire it
     pub override_stream_url: Option<String>,
 
-    /// User volume in percent
-    pub volume_percent: u32,
+    /// Twitch stream volume in percent
+    pub stream_volume_percent: u32,
 
     #[sqlx(skip)]
-    #[serde(skip)]
     /// A map of streamlink resolutions (including `best`) to .m3u8 links.
     /// This is None if streamlink does not return values.
     pub stream_urls: HashMap<String, String>,

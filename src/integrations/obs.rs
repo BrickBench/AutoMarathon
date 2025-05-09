@@ -82,15 +82,15 @@ pub struct ObsScene {
 /// This may map to a `Person` based on their username
 #[derive(Serialize, Clone, Debug)]
 pub struct DiscordUser {
-    /// The Discord username of this user
+    /// The Discord username of this user.
     pub username: String,
-    /// Whether this user is currently speaking and their peak amplitude.
-    /// If AutoMarathon voice transmission is disabled, this will be False.
-    pub speaking: bool,
-    pub peak_volume: f32,
-    /// If AutoMarathon voice transmission is enabled,
-    /// this sets this user's desired volume
-    pub desired_volume: f32,
+    /// The Discord unique ID of this user.
+    pub id: u64,
+    /// The volume of this Discord user.
+    pub volume_percent: u32,
+    /// If this user is a participant in the event,
+    /// this is the participant ID
+    pub participant: Option<i64>,
 }
 
 /// The status of an OBS host
@@ -105,18 +105,18 @@ pub struct ObsHostState {
     /// The scenes present in the host by name.
     pub scenes: HashMap<String, ObsScene>,
     /// The discord users present in this host's voice channel.
-    pub discord_users: HashMap<String, DiscordUser>,
+    pub discord_users: HashMap<u64, DiscordUser>,
 }
 
 /// Requests for ObsActor
 pub enum HostCommand {
     UpdateState(i64, Vec<ModifiedStreamState>, Rto<()>),
-    StartStream(String, Rto<()>),
-    SetStreamCommentators(String, Vec<String>, Rto<()>),
-    SetCommentatorVoiceState(String, String, bool, f32),
-    EndStream(String, Rto<()>),
-    GetCommentatorState(String, Rto<HashMap<String, DiscordUser>>),
     GetState(Rto<HashMap<String, ObsHostState>>),
+    StartStream(String, Rto<()>),
+    EndStream(String, Rto<()>),
+    SetStreamCommentators(String, Vec<(u64, String)>, Rto<()>),
+    SetCommentatorVolume(u64, u32, Rto<()>),
+    GetCommentatorState(String, Rto<HashMap<u64, DiscordUser>>),
 }
 
 pub type HostActor = ActorRef<HostCommand>;
@@ -129,7 +129,7 @@ pub async fn run_obs(
     mut rx: UnboundedReceiver<HostCommand>,
 ) -> Result<(), anyhow::Error> {
     let mut host_map: HostMap = HostMap::new();
-    let mut discord_users: HashMap<String, HashMap<String, DiscordUser>> = HashMap::new();
+    let mut discord_users: HashMap<String, HashMap<u64, DiscordUser>> = HashMap::new();
 
     log::info!("Creating initial connection to OBS");
     for host in settings.obs_hosts.keys() {
@@ -174,46 +174,45 @@ pub async fn run_obs(
             }
             HostCommand::SetStreamCommentators(host, commentators, rto) => {
                 let host_users = discord_users.get_mut(&host).unwrap();
-                for commentator in commentators.iter() {
-                    if !host_users.contains_key(commentator) {
-                        let person = db.get_participant_by_discord_id(commentator).await;
-                        if let Ok(person) = person {
-                            host_users.insert(
-                                commentator.to_string(),
-                                DiscordUser {
-                                    username: person.name.clone(),
-                                    speaking: false,
-                                    peak_volume: 0.0,
-                                    desired_volume: 1.0,
-                                },
-                            );
-                        } else {
-                            host_users.insert(
-                                commentator.to_string(),
-                                DiscordUser {
-                                    username: commentator.clone(),
-                                    speaking: false,
-                                    peak_volume: 0.0,
-                                    desired_volume: 1.0,
-                                },
-                            );
-                        }
-                    }
-                }
+                host_users.clear();
 
-                host_users.retain(|k, _| commentators.contains(k));
+                for commentator in commentators.iter() {
+                    let maybe_participant =
+                        db.get_participant_by_discord_id(&commentator.1).await.ok();
+
+                    let volume = db
+                        .get_discord_user_volume(&commentator.0.to_string())
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or(100);
+
+                    host_users.insert(
+                        commentator.0,
+                        DiscordUser {
+                            username: commentator.1.clone(),
+                            id: commentator.0,
+                            volume_percent: volume as u32,
+                            participant: maybe_participant.map(|p| p.id),
+                        },
+                    );
+                }
 
                 rto.reply(Ok(()));
             }
-            HostCommand::SetCommentatorVoiceState(host, commentator, speaking, volume) => {
-                let host_users = discord_users.get_mut(&host).unwrap();
-                if let Some(user) = host_users.get_mut(&commentator) {
-                    user.speaking = speaking;
-                    user.peak_volume = volume;
-                }
-            }
             HostCommand::GetCommentatorState(host, rto) => {
                 rto.reply(Ok(discord_users.get(&host).unwrap().clone()));
+            }
+            HostCommand::SetCommentatorVolume(id, volume, rto) => {
+                db.set_discord_user_volume(&id.to_string(), volume as i32)
+                    .await?;
+                for host in settings.obs_hosts.keys() {
+                    if let Some(user) = discord_users.get_mut(host).unwrap().get_mut(&id) {
+                        user.volume_percent = volume;
+                    }
+                }
+
+                rto.reply(Ok(()))
             }
             HostCommand::EndStream(host, rto) => {
                 if let Err(e) = connect_client_for_host(&host, &mut host_map, &settings).await {
@@ -233,7 +232,7 @@ pub async fn run_obs(
 /// Return the state of each OBS host by name.
 async fn get_obs_state(
     host_map: &mut HostMap,
-    commentary_map: &HashMap<String, HashMap<String, DiscordUser>>,
+    commentary_map: &HashMap<String, HashMap<u64, DiscordUser>>,
     settings: &Settings,
 ) -> anyhow::Result<HashMap<String, ObsHostState>> {
     let mut states = HashMap::new();
@@ -241,8 +240,10 @@ async fn get_obs_state(
         let connected = connect_client_for_host(host, host_map, settings).await;
         if connected.is_ok() {
             let obs = host_map.get_mut(host).unwrap();
+
             let mut info = get_obs_client_info(obs).await?;
             info.discord_users = commentary_map.get(host).unwrap().clone();
+
             states.insert(host.clone(), info);
         } else {
             states.insert(
@@ -623,7 +624,7 @@ pub async fn update_obs_state(
                                 obs.inputs()
                                     .set_volume(
                                         stream_source_id,
-                                        Volume::Db(-(runner.volume_percent as f32).abs()),
+                                        Volume::Db(-(runner.stream_volume_percent as f32).abs()),
                                     )
                                     .await?;
                             } else {

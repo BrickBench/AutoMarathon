@@ -93,12 +93,7 @@ impl songbird::EventHandler for Receiver {
                 }
             }
             Ctx::VoiceTick(tick) => {
-                let participants = self.inner.db.get_participants().await.unwrap_or_default();
-
-                let speaking = tick.speaking.len();
-                let total_participants = speaking + tick.silent.len();
                 let current_update = self.inner.update_count.load(Ordering::SeqCst);
-                let last_tick_was_empty = self.inner.last_tick_was_empty.load(Ordering::SeqCst);
 
                 let mut planner = RealFftPlanner::<f32>::new();
                 let fft = planner.plan_fft_forward(BUF_SIZE);
@@ -107,103 +102,91 @@ impl songbird::EventHandler for Receiver {
 
                 let should_update_voice = current_update >= WEB_UPDATE_RATE;
 
-                if speaking == 0 && !last_tick_was_empty {
-                    self.inner.last_tick_was_empty.store(true, Ordering::SeqCst);
-                    self.inner
-                        .update_count
-                        .store(WEB_UPDATE_RATE, Ordering::SeqCst);
+                self.inner
+                    .last_tick_was_empty
+                    .store(false, Ordering::SeqCst);
+
+                for (ssrc, data) in &tick.speaking {
+                    if let Some(decoded_voice) = data.decoded_voice.as_ref() {
+                        if let Some(id) = self.inner.known_ssrcs.get(ssrc) {
+                            let volume = self
+                                .inner
+                                .db
+                                .get_discord_user_volume(&id.0.to_string())
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or(100) as f32
+                                / 100.0;
+
+                            let voice_len = decoded_voice.len();
+                            for i in 0..voice_len {
+                                float_voice[i] = decoded_voice[i] as f32 / i16::MAX as f32;
+                                buffer[i] += float_voice[i] * volume;
+                            }
+
+                            if should_update_voice {
+                                let fft = if self.inner.settings.transmit_voice_dft.unwrap_or(false)
+                                {
+                                    fft.process(&mut float_voice, &mut fft_result).unwrap();
+
+                                    let step_size = fft_result.len() / FFT_RESOLUTION;
+                                    let mut compressed_result = [0.0_f32; FFT_RESOLUTION];
+                                    (0..compressed_result.len()).for_each(|i| {
+                                        let mut sum = 0.0;
+                                        (i * step_size..(i + 1) * step_size).for_each(|j| {
+                                            sum += fft_result[j].norm_sqr();
+                                        });
+                                        compressed_result[i] = sum / step_size as f32;
+                                    });
+                                    compressed_result
+                                } else {
+                                    [0.0_f32; FFT_RESOLUTION]
+                                };
+
+                                voice_users.insert(
+                                    id.0,
+                                    ParticipantVoiceState {
+                                        active: true,
+                                        peak_db: *float_voice
+                                            .iter()
+                                            .max_by(|a, b| a.total_cmp(b))
+                                            .unwrap_or(&0.0),
+                                        voice_dft: fft,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+
+                for ssrc in &tick.silent {
+                    if let Some(id) = self.inner.known_ssrcs.get(ssrc) {
+                        voice_users.insert(
+                            id.0,
+                            ParticipantVoiceState {
+                                active: false,
+                                peak_db: 0.0,
+                                voice_dft: [0.0_f32; FFT_RESOLUTION],
+                            },
+                        );
+                    }
+                }
+
+                if should_update_voice {
                     self.inner
                         .directory
                         .web_actor
                         .send(WebCommand::SendVoiceUpdate(VoiceUpdate {
                             host: self.inner.host.clone(),
-                            voice_users: HashMap::new(),
+                            voice_users,
                         }));
-                } else if speaking != 0 {
-                    if last_tick_was_empty {
-                        log::trace!("Voice tick ({speaking}/{total_participants} live):");
-                    }
 
+                    self.inner.update_count.store(0, Ordering::SeqCst);
+                } else {
                     self.inner
-                        .last_tick_was_empty
-                        .store(false, Ordering::SeqCst);
-
-                    for (ssrc, data) in &tick.speaking {
-                        if let Some(decoded_voice) = data.decoded_voice.as_ref() {
-                            let voice_len = decoded_voice.len();
-                            for i in 0..voice_len {
-                                float_voice[i] = decoded_voice[i] as f32 / i16::MAX as f32;
-                                buffer[i] += float_voice[i];
-                            }
-
-                            if should_update_voice {
-                                if let Some(id) = self.inner.known_ssrcs.get(ssrc) {
-                                    let fft = if self
-                                        .inner
-                                        .settings
-                                        .transmit_voice_dft
-                                        .unwrap_or(false)
-                                    {
-                                        fft.process(&mut float_voice, &mut fft_result).unwrap();
-
-                                        let step_size = fft_result.len() / FFT_RESOLUTION;
-                                        let mut compressed_result = [0.0_f32; FFT_RESOLUTION];
-                                        (0..compressed_result.len()).for_each(|i| {
-                                            let mut sum = 0.0;
-                                            (i * step_size..(i + 1) * step_size).for_each(|j| {
-                                                sum += fft_result[j].norm_sqr();
-                                            });
-                                            compressed_result[i] = sum / step_size as f32;
-                                        });
-                                        compressed_result
-                                    } else {
-                                        [0.0_f32; FFT_RESOLUTION]
-                                    };
-
-                                    voice_users.insert(
-                                        id.0.to_string(),
-                                        ParticipantVoiceState {
-                                            active: true,
-                                            peak_db: *float_voice
-                                                .iter()
-                                                .max_by(|a, b| a.total_cmp(b))
-                                                .unwrap_or(&0.0),
-                                            voice_dft: fft,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    for ssrc in &tick.silent {
-                        if let Some(id) = self.inner.known_ssrcs.get(ssrc) {
-                            voice_users.insert(
-                                id.0.to_string(),
-                                ParticipantVoiceState {
-                                    active: false,
-                                    peak_db: 0.0,
-                                    voice_dft: [0.0_f32; FFT_RESOLUTION],
-                                },
-                            );
-                        }
-                    }
-
-                    if should_update_voice {
-                        self.inner
-                            .directory
-                            .web_actor
-                            .send(WebCommand::SendVoiceUpdate(VoiceUpdate {
-                                host: self.inner.host.clone(),
-                                voice_users,
-                            }));
-
-                        self.inner.update_count.store(0, Ordering::SeqCst);
-                    } else {
-                        self.inner
-                            .update_count
-                            .store(current_update + 1, Ordering::SeqCst);
-                    }
+                        .update_count
+                        .store(current_update + 1, Ordering::SeqCst);
                 }
                 self.inner.producer.lock().await.push_slice(&buffer);
             }

@@ -102,10 +102,10 @@ async fn update_voice_list(
             .map(|m| m.0.to_owned())
         {
             let users = channel.members(context).unwrap();
-            let user_list: Vec<String> = users
+            let user_list: Vec<(u64, String)> = users
                 .iter()
-                .map(|u| u.user.name.clone())
-                .filter(|u| u != bot_name)
+                .map(|u| (u.user.id.get(), u.user.name.clone()))
+                .filter(|u| u.1 != bot_name)
                 .collect();
             let _ = send_message!(actor, HostCommand, SetStreamCommentators, host, user_list);
         }
@@ -677,8 +677,14 @@ pub async fn init_discord(
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
                 for (host_name, host) in &settings.obs_hosts {
                     if host.enable_voice.unwrap_or(false) {
-                        connect_to_voice(ctx, directory.clone(), settings.clone(), host_name)
-                            .await?;
+                        connect_to_voice(
+                            ctx,
+                            directory.clone(),
+                            db.clone(),
+                            settings.clone(),
+                            host_name,
+                        )
+                        .await?;
                     }
                 }
                 Ok(Data {

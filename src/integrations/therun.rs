@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
@@ -195,3 +195,19 @@ async fn run_runner_websocket(
         }
     }
 }
+
+/*
+pub struct TheRunRaceStats {
+    pub leading_runner: i64,
+    
+    /// Deltas between each runner and the leading runner, at the last split shared
+    /// by those two runners. If a runner has not completed the first split, their delta
+    /// will not be present.
+    pub runner_deltas: HashMap<i64, f64>
+}
+
+pub fn compare_runners(runners: HashMap<i64, Run>) -> Option<TheRunRaceStats> {
+    // find which split and at what time each runner
+
+}
+*/
