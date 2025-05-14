@@ -227,13 +227,14 @@ pub async fn connect_to_voice(
         let mut handler = lock.lock().await;
 
         log::info!("Initializing audio device");
-        let host =  cpal::host_from_id(cpal::available_hosts()
-            .into_iter()
-            .find(|id| *id == cpal::HostId::Jack)
-            .expect(
-                "make sure --features jack is specified. only works on OSes where jack is available",
-            )).expect("jack host unavailable");
+        /* let host =  cpal::host_from_id(cpal::available_hosts()
+        .into_iter()
+        .find(|id| *id == cpal::HostId::Jack)
+        .expect(
+            "make sure --features jack is specified. only works on OSes where jack is available",
+        )).expect("jack host unavailable");*/
 
+        let host = cpal::default_host();
         let output_device = host
             .default_output_device()
             .expect("Failed to get default input device");

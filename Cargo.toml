@@ -23,7 +23,7 @@ obws = "0.12.0"
 reqwest = { version = "0.11", features = ["json"]}
 rustls = { version = "0.23.0", default-features = true }
 url = "2.4"
-warp = "0.3"
+warp = "0.3.7"
 env_logger = "0.10.0"
 log = "0.4.19"
 anyhow = "1.0.75"
@@ -31,3 +31,4 @@ thiserror = "1.0.50"
 regex = "1.10.5"
 sqlx = { version = "0.7.4", features = ["sqlite", "runtime-tokio", "macros", "json", "time"]}
 realfft = "3.4.0"
+vite-rs = "0.1.0"
