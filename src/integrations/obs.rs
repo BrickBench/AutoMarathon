@@ -105,6 +105,7 @@ pub struct ObsHostState {
     /// The scenes present in the host by name.
     pub scenes: HashMap<String, ObsScene>,
     /// The discord users present in this host's voice channel.
+    /// Maps from Discord UUID -> user
     pub discord_users: HashMap<u64, DiscordUser>,
 }
 
@@ -509,7 +510,7 @@ pub async fn update_obs_state(
         Some(layout) => {
             let target_layout_id = SceneId::Name(&layout.name);
 
-            if !scenes.scenes.iter().any(|s| s.name != layout.name) {
+            if scenes.scenes.iter().all(|s| s.name != layout.name) {
                 return Err(anyhow!(format!(
                     "OBS has no scene named {}, which the current layout requires.",
                     layout.name

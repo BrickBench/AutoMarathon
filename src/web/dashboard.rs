@@ -71,7 +71,7 @@ async fn run_voice_websocket(
     socket: warp::ws::WebSocket,
     mut voice_rx: broadcast::Receiver<VoiceUpdate>,
 ) {
-    log::info!("New voice websocket connection opened");
+    log::debug!("New voice websocket connection opened");
     let (mut tx, _) = socket.split();
     while let Ok(update) = voice_rx.recv().await {
         if let Ok(update) = serde_json::to_string(&update) {

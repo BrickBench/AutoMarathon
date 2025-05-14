@@ -276,6 +276,8 @@ impl ProjectDb {
         .execute(&self.db)
         .await?;
 
+        self.trigger_update();
+
         Ok(())
     }
 
@@ -466,7 +468,7 @@ impl ProjectDb {
 
         sqlx::query("delete from splits where run = ?")
             .bind(runner)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await?;
 
         let mut builder =

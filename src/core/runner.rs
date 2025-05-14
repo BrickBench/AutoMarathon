@@ -41,7 +41,9 @@ pub async fn run_runner_actor(
                 log::info!("Creating runner for person {}", runner.participant);
                 match db.add_runner(&mut runner).await {
                     Ok(_) => {
-                        if runner.get_therun_username().is_some() {
+                        if runner.get_therun_username().is_some()
+                            && runner.get_therun_username().unwrap() != ""
+                        {
                             send_nonblocking!(
                                 directory.therun_actor,
                                 TheRunCommand,
@@ -67,7 +69,9 @@ pub async fn run_runner_actor(
                                 RemoveRunner,
                                 old_runner.clone()
                             );
-                            if runner.get_therun_username().is_some() {
+                            if runner.get_therun_username().is_some()
+                                && runner.get_therun_username().unwrap() != ""
+                            {
                                 send_nonblocking!(
                                     directory.therun_actor,
                                     TheRunCommand,
@@ -205,8 +209,7 @@ impl Runner {
 
         let json = std::str::from_utf8(output.stdout.as_slice())?;
 
-        let parsed_json: Value =
-            serde_json::from_str(json).expect("Unable to parse streamlink output");
+        let parsed_json: Value = serde_json::from_str(json)?;
 
         if parsed_json.get("error").is_some() {
             Err(Error::FailedStreamAcq(

@@ -25,10 +25,10 @@ use crate::{
     },
     error::Error,
     integrations::{discord_voice::connect_to_voice, obs::HostCommand},
-    send_message, Directory, Rto,
+    send_message,
+    web::dashboard::WebCommand,
+    Directory, Rto,
 };
-
-use super::obs::HostActor;
 
 struct Data {
     name: String,
@@ -86,7 +86,7 @@ async fn get_stream_id(name: Option<String>, db: &ProjectDb) -> anyhow::Result<i
 async fn update_voice_list(
     bot_name: &str,
     context: &serenity::Context,
-    actor: &HostActor,
+    directory: &Directory,
     voice_state: &VoiceState,
     settings: &Settings,
 ) {
@@ -107,21 +107,33 @@ async fn update_voice_list(
                 .map(|u| (u.user.id.get(), u.user.name.clone()))
                 .filter(|u| u.1 != bot_name)
                 .collect();
-            let _ = send_message!(actor, HostCommand, SetStreamCommentators, host, user_list);
+
+            let _ = send_message!(
+                directory.obs_actor,
+                HostCommand,
+                SetStreamCommentators,
+                host,
+                user_list
+            );
+
+            directory.web_actor.send(WebCommand::SendStateUpdate);
         }
     }
 }
 
 async fn handle_voice_state_event(
     context: &serenity::Context,
-    _old_state: &Option<VoiceState>,
+    old_state: &Option<VoiceState>,
     new_state: &VoiceState,
     data: &Data,
 ) {
     let settings = &data.settings;
-    let actor = &data.directory.obs_actor;
 
-    update_voice_list(&data.name, context, actor, new_state, settings).await;
+    if let Some(old_state) = old_state {
+        update_voice_list(&data.name, context, &data.directory, old_state, settings).await;
+    }
+
+    update_voice_list(&data.name, context, &data.directory, new_state, settings).await;
 }
 
 async fn check_channel(context: &Context<'_>) -> anyhow::Result<bool> {

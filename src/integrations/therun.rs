@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
@@ -58,7 +58,7 @@ pub enum TheRunCommand {
 pub type TheRunActor = ActorRef<TheRunCommand>;
 
 /// A list of TheRun.gg users who are to be polled
-type LiveRunners = Arc<tokio::sync::Mutex<Vec<String>>>;
+type LiveRunners = Arc<tokio::sync::Mutex<Vec<i64>>>;
 
 /// Worker to manage TheRun.gg connections
 pub async fn run_therun_actor(
@@ -70,30 +70,31 @@ pub async fn run_therun_actor(
     while let Some(alert) = therun_rx.recv().await {
         match alert {
             TheRunCommand::AddRunner(runner, rto) => {
-                live_runners
-                    .lock()
-                    .await
-                    .push(runner.get_therun_username().expect("No username"));
+                if let Some(username) = runner.get_therun_username() {
+                    log::info!("Adding {} to TheRun.gg poller", username);
+                    live_runners.lock().await.push(runner.participant);
 
-                tokio::spawn(create_therun_websocket_monitor(
-                    db.clone(),
-                    runner.participant,
-                    runner.get_therun_username().expect("No username"),
-                    live_runners.clone(),
-                    death_tx.clone(),
-                ));
-
-                rto.reply(Ok(()));
+                    tokio::spawn(create_therun_websocket_monitor(
+                        db.clone(),
+                        runner.participant,
+                        username,
+                        live_runners.clone(),
+                        death_tx.clone(),
+                    ));
+                    rto.reply(Ok(()));
+                } else {
+                    rto.reply(Err(anyhow::anyhow!(
+                        "Runner added to therun, but no TheRun.gg username"
+                    )));
+                }
             }
             TheRunCommand::RemoveRunner(runner, rto) => {
                 live_runners
                     .lock()
                     .await
-                    .retain(|r| r != &runner.get_therun_username().expect("No username"));
+                    .retain(|r| r != &runner.participant);
 
-                death_tx
-                    .send(runner.get_therun_username().expect("No username"))
-                    .ok();
+                death_tx.send(runner.participant).ok();
 
                 rto.reply(Ok(()));
             }
@@ -109,7 +110,7 @@ async fn create_therun_websocket_monitor(
     runner: i64,
     therun: String,
     runners: LiveRunners,
-    death_monitor: broadcast::Sender<String>,
+    death_monitor: broadcast::Sender<i64>,
 ) -> Result<(), anyhow::Error> {
     loop {
         let res = tokio::spawn(run_runner_websocket(
@@ -120,15 +121,34 @@ async fn create_therun_websocket_monitor(
         ))
         .await;
 
-        if runners.lock().await.contains(&therun) {
+        if runners.lock().await.contains(&runner) {
             match res {
-                Ok(_) => log::warn!(
-                    "TheRun.gg WebSocket closed for {} ({}), reattempting in 30 seconds...",
-                    runner,
-                    therun
-                ),
+                Ok(Ok(restart)) => {
+                    if restart {
+                        log::warn!(
+                            "TheRun.gg WebSocket closed for {} ({}), reattempting in 30 seconds...",
+                            runner,
+                            therun
+                        )
+                    } else {
+                        log::info!(
+                            "TheRun.gg WebSocket closed for {} ({})",
+                            runner,
+                            therun
+                        );
+                        return Ok(());
+                    }
+                },
+                Ok(Err(error)) => {
+                    log::warn!(
+                        "TheRun.gg WebSocket had an error for {} ({}, {}), reattempting in 30 seconds...",
+                        runner,
+                        therun,
+                        error.to_string()
+                    );
+                }
                 Err(error) => log::warn!(
-                    "TheRun.gg WebSocket closed for {} ({}, {}), reattempting in 30 seconds...",
+                    "TheRun.gg WebSocket task for {} ({}) failed with {}, reattempting in 30 seconds...",
                     runner,
                     therun,
                     error.to_string()
@@ -146,12 +166,14 @@ async fn create_therun_websocket_monitor(
 ///
 /// This function will occasionally completely bypass the return or panic when failing,
 /// so it is restarted by ```create_player_websocket```.
+///
+/// Returns if it should restart.
 async fn run_runner_websocket(
     db: Arc<ProjectDb>,
     runner: i64,
     therun: String,
-    mut death_monitor: broadcast::Receiver<String>,
-) -> Result<(), anyhow::Error> {
+    mut death_monitor: broadcast::Receiver<i64>,
+) -> Result<bool, anyhow::Error> {
     let (mut stream, _) = tokio_tungstenite::connect_async(
         Url::parse(&format!("wss://ws.therun.gg/?username={}", therun)).unwrap(),
     )
@@ -163,9 +185,9 @@ async fn run_runner_websocket(
         tokio::select! {
             kill_name = death_monitor.recv() => {
                 if let Ok(kill_name) = kill_name {
-                    if kill_name == therun {
+                    if kill_name == runner{
                         log::debug!("Killing TheRun.gg websocket for {} ({})", runner, therun);
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
             }
@@ -189,7 +211,7 @@ async fn run_runner_websocket(
                         };
                     }
                     Some(Err(err)) => log::error!("{}", err.to_string().replace("\\\"", "\"")),
-                    None => return Ok(()),
+                    None => return Ok(true),
                 }
             }
         }
@@ -199,7 +221,7 @@ async fn run_runner_websocket(
 /*
 pub struct TheRunRaceStats {
     pub leading_runner: i64,
-    
+
     /// Deltas between each runner and the leading runner, at the last split shared
     /// by those two runners. If a runner has not completed the first split, their delta
     /// will not be present.

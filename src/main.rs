@@ -158,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(Some("h2"), log::LevelFilter::Warn)
         .filter(Some("rustls"), log::LevelFilter::Warn)
         .filter(Some("sqlx"), log::LevelFilter::Info)
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .init();
 
     default_provider().install_default().unwrap();

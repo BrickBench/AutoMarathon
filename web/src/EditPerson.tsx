@@ -103,9 +103,9 @@ export function EditPerson({ person, runner, events }: { person: Person | undefi
         </Col>
         <Col>
           <FormLabel htmlFor="runnereditdiscordid"><Discord /> Discord ID</FormLabel>
-          <FormControl type="number" id="runnereditdiscordid" onChange={e => setPersonEditState({
+          <FormControl type="text" id="runnereditdiscordid" onChange={e => setPersonEditState({
             ...personEditState,
-            discord_id: parseInt(e.target.value)
+            discord_id: e.target.value
           })} value={personEditState.discord_id || ''} />
         </Col>
       </Row>

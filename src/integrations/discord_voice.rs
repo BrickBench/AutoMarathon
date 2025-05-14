@@ -3,7 +3,10 @@ use async_ringbuf::{
     wrap::AsyncWrap,
     AsyncHeapRb, AsyncRb,
 };
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Device,
+};
 use realfft::RealFftPlanner;
 use ringbuf::storage::Heap;
 use songbird::model::id::UserId;
@@ -200,6 +203,20 @@ impl songbird::EventHandler for Receiver {
     }
 }
 
+async fn create_audio_device() -> anyhow::Result<Device> {
+    log::info!("Initializing audio device");
+    let host =  cpal::host_from_id(cpal::available_hosts()
+        .into_iter()
+        .find(|id| *id == cpal::HostId::Jack)
+        .expect(
+            "make sure --features jack is specified. only works on OSes where jack is available",
+        ))?;
+
+    // let host = cpal::default_host();
+    host.default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("No default output device found."))
+}
+
 pub async fn connect_to_voice(
     context: &serenity::Context,
     directory: Directory,
@@ -226,18 +243,7 @@ pub async fn connect_to_voice(
 
         let mut handler = lock.lock().await;
 
-        log::info!("Initializing audio device");
-        /* let host =  cpal::host_from_id(cpal::available_hosts()
-        .into_iter()
-        .find(|id| *id == cpal::HostId::Jack)
-        .expect(
-            "make sure --features jack is specified. only works on OSes where jack is available",
-        )).expect("jack host unavailable");*/
-
-        let host = cpal::default_host();
-        let output_device = host
-            .default_output_device()
-            .expect("Failed to get default input device");
+        let output_device = create_audio_device().await?;
 
         log::info!("Using output device: {}", output_device.name()?);
         let config = output_device.default_output_config()?;
@@ -256,6 +262,9 @@ pub async fn connect_to_voice(
                 *sample = ring_consumer.try_pop().unwrap_or(0.0);
             }
         };
+
+        log::info!("Using output device: {}", output_device.name()?);
+        let config = output_device.default_output_config()?;
 
         let output_stream = output_device.build_output_stream(
             &config.into(),
