@@ -13,14 +13,19 @@ import { Dashboard } from './dashboard/Dashboard';
 import { NotificationsToast, ToastNotificationsState, ToastNotifStateContext } from './AMNotification';
 import { EditEventData } from './dataeditor/EventData';
 
-function createWebSocket(path: string): WebSocket {
+function createWebSocket(path: string, isCreated: boolean): WebSocket | undefined {
+  if (isCreated) {
+    return undefined;
+  }
   var protocolPrefix = (window.location.protocol === 'https:') ? 'wss:' : 'ws:';
   return new WebSocket(new URL(path, protocolPrefix + '//' + location.hostname + ":28010"));
 }
 
 function AMApp() {
-  const [webSocket, setWebSocket] = useState<WebSocket>(createWebSocket("/ws"));
-  const [editorWebSocket, setEditorWebSocket] = useState<WebSocket>(createWebSocket("/ws/dashboard-editor"));
+  const [webSocketCreated, setWebSocketCreated] = useState<boolean>(false);
+  const [webSocket, setWebSocket] = useState<WebSocket | undefined>(createWebSocket("/ws", webSocketCreated));
+  const [editorWebSocketCreated, setEditorWebSocketCreated] = useState<boolean>(false);
+  const [editorWebSocket, setEditorWebSocket] = useState<WebSocket | undefined>(createWebSocket("/ws/dashboard-editor", editorWebSocketCreated));
 
   const [lockOwner, setLockOwner] = useState<LockState>();
 
@@ -42,58 +47,66 @@ function AMApp() {
     }
     if (authState.username == lockOwner.editor) {
       let lock: LockState = { editor: null, unix_time: 0 };
-      editorWebSocket.send(JSON.stringify(lock));
+      editorWebSocket?.send(JSON.stringify(lock));
     }
   }
 
   useEffect(() => {
-    console.log("Again????")
-    webSocket.onopen = (event) => {
-      console.log("Connected to Main AM Socket");
-    };
+    if(webSocket){
+      webSocket.onopen = (event) => {
+        console.log("Connected to Main AM Socket");
+        setWebSocketCreated(true);
+      };
 
-    webSocket.onmessage = (event) => {
-      var state: AMState = JSON.parse(event.data);
-      console.log(state);
-      diffAMState(state, people, setPeople, runners, setRunners, events, setEvents, hosts, setHosts, streams, setStreams);
-    };
+      webSocket.onmessage = (event) => {
+        var state: AMState = JSON.parse(event.data);
+        console.log(state);
+        diffAMState(state, people, setPeople, runners, setRunners, events, setEvents, hosts, setHosts, streams, setStreams);
+      };
 
-    webSocket.onclose = function(event) {
-    };
+      webSocket.onclose = function(event) {
+        setWebSocketCreated(false);
+      };
 
-    webSocket.onerror = function(err) {
-    };
+      webSocket.onerror = function(err) {
+        setWebSocketCreated(false);
+      };
+    }
 
     return () => {
     };
   }, [webSocket]);
 
   useEffect(() => {
-    console.log("Again???? E")
-    editorWebSocket.onopen = (event) => {
-      console.log("Connected to Editor Socket");
-    };
+    if(editorWebSocket){
+      editorWebSocket.onopen = (event) => {
+        console.log("Connected to Editor Socket");
+        setEditorWebSocketCreated(true);
+      };
 
-    editorWebSocket.onmessage = function(event) {
-      var state: LockState = JSON.parse(event.data);
-      console.log("Lock state", state);
-      setLockOwner(state);
-    };
+      editorWebSocket.onmessage = function(event) {
+        var state: LockState = JSON.parse(event.data);
+        console.log("Lock state", state);
+        setLockOwner(state);
+      };
 
-    editorWebSocket.onclose = function(event) {
-    };
+      editorWebSocket.onclose = function(event) {
+        setEditorWebSocketCreated(false);
+      };
 
-    editorWebSocket.onerror = function(err) {
-    };
+      editorWebSocket.onerror = function(err) {
+        setEditorWebSocketCreated(false);
+      };
+    }
 
     return () => {
     };
   }, [editorWebSocket]);
 
   let personSelected = people.get(webuistate.selectedPerson);
-  let selectedEvent = events.find((e) => e.id == webuistate.selectedEvent);
+  let selectedEvent = events.find((e) => e.id == webuistate.selectedEvent)!;
 
-  return webSocket && webSocket.readyState == WebSocket.OPEN ? <WebUIStateContext.Provider value={{ webuistate: webuistate, setWebUIState: setWebUIState }}>
+  return webSocket && editorWebSocket && webSocket.readyState == WebSocket.OPEN ? <WebUIStateContext.Provider value={{ webuistate: webuistate, setWebUIState: setWebUIState }}>
     <ToastNotifStateContext.Provider value={{ toastNotifState: notification, setToastNotifState: setNotification }}>
       <Container fluid={true}>
         <Row>

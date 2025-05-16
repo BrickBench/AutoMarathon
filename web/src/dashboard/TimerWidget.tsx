@@ -102,7 +102,6 @@ export function TimerWidget({event} : {event : Event | undefined}){
                     }); 
                   }
                 }}>Reset</Button>
-                <Button variant="outline-secondary">4</Button>
             </ButtonGroup>
             <InputGroup>
                 <FormControl value={editTimerString} onChange={(e)=>{
