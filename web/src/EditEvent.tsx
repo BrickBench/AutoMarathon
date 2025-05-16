@@ -143,6 +143,7 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
     }, [event]);
   
     let runner_options =  [...runners.entries()].map(([key, value]) => ({value: key.toString(), label: people.get(value.participant)!.name}));
+    let commentatorOptions =  [...people.entries()].map(([key, value]) => ({value: key, label: value.name}));
   
     return (eventState && <>
     <Form onSubmit={(event) => {
@@ -232,6 +233,23 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
             preferred_layouts: temp_layouts
           });
         }}></Creatable>
+      </Row>
+      <Row className="mb-3">
+        <Form.Label>Manual Commentators</Form.Label>
+        <Select styles={customStyles}  value={Array.from(eventState.commentators, (personID) => ({value: personID, label: people.get(personID)!.name}))} 
+        onChange={selectedOptions => {
+          let commentators = []
+  
+          for(const entry of selectedOptions){
+              commentators.push(entry.value);
+          }
+  
+          setEventState({
+            ...eventState,
+            commentators: commentators
+          });
+        }}
+        options={commentatorOptions} id="eventeditcommentators" isMulti={true}></Select>
       </Row>
       <div className='d-flex'>
         <div className="p-2">

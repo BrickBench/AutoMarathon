@@ -6,6 +6,8 @@ import { StreamPanel } from "./StreamPanel";
 import { StreamEntry, StreamHost, Event, Person, Runner } from "../websocket";
 import { getSelectedLayout, getStreamForHost, updateStreamRequest } from "./LayoutUtilities";
 import { ToastNotifStateContext } from "../AMNotification";
+import { TimerWidget } from "../dashboard/TimerWidget";
+import { doPost } from "../Api";
 
 export function HostPanel({ host, events, people, streams, runners }: {
   host: StreamHost, events: Event[], people: Map<number, Person>, streams: StreamEntry[],
@@ -41,6 +43,7 @@ export function HostPanel({ host, events, people, streams, runners }: {
           </Row>
           <LayoutSelector host={host}></LayoutSelector>
           <TransitionSelector></TransitionSelector>
+          <Row>
           {streamState ?
             <ButtonToolbar className="mt-4" role="toolbar" aria-label="Toolbar with button groups">
               <ButtonGroup>
@@ -96,10 +99,41 @@ export function HostPanel({ host, events, people, streams, runners }: {
               </ButtonGroup>
             </ButtonToolbar>
             : <></>}
+            </Row>
+            <Row className="pt-6">
+              <div>
+                <Button variant={host.streaming ? "danger" : "success"} onClick={()=>{
+                  if(host.streaming){
+                    let confirm = prompt("Are you sure you want to end the stream? If so, type \"End\" into the box.");
+                    if(confirm?.toLowerCase().replace("\"","").replace("'","") == "end"){
+                      doPost('host', 'PUT', {
+                        host: webuistate.selectedHost,
+                        streaming: false
+                      });
+                      setToastNotifState({ notification: "Ending stream. Wait to confirm the stream has ended.", toggle: true, success: true });
+                    }
+                  }else{
+                    let confirm = prompt("Are you sure you want to go live? Review the stream starting procedure for your event before proceeding. If so, type \"Live\" into the box.");
+                    if(confirm?.toLowerCase().replace("\"","").replace("'","") =="live"){
+                      doPost('host', 'PUT', {
+                        host: webuistate.selectedHost,
+                        streaming: true
+                      });
+                      setToastNotifState({ notification: "Starting stream. Wait to confirm the stream has started.", toggle: true, success: true });
+                    }
+                  }
+                }}>
+                  {host.streaming ? "End Stream" : "Go Live"}
+                </Button>
+              </div>
+            </Row>
         </Col>
       </Row>
       <Row className="border-top pt-3">
-        <Col lg={6}>
+        <Col lg={3}>
+          <TimerWidget event={streamEvent}></TimerWidget>
+        </Col>
+        <Col lg={3}>
         </Col>
         <Col lg={6}>
         </Col>

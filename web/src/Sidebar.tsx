@@ -112,6 +112,8 @@ export function Sidebar({ people, events, streams, hosts }: { people: Map<number
                 host: false
               });
               setCreateField("");
+            }else{
+              alert("Please enter a name for the person that will be created.");
             }
           }}>Person</DropdownItem>
           <DropdownItem onClick={() => {
@@ -136,6 +138,8 @@ export function Sidebar({ people, events, streams, hosts }: { people: Map<number
                 commentators: []
               });
               setCreateField("");
+            }else{
+              alert("Please enter a name for the event that will be created.");
             }
           }}>Event</DropdownItem>
         </DropdownButton>

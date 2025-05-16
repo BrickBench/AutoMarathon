@@ -11,6 +11,7 @@ import { HostPanelLock } from './HostPanelLock';
 import { HostPanel } from './hostpanel/HostPanel';
 import { Dashboard } from './dashboard/Dashboard';
 import { NotificationsToast, ToastNotificationsState, ToastNotifStateContext } from './AMNotification';
+import { EditEventData } from './dataeditor/EventData';
 
 function createWebSocket(path: string): WebSocket {
   var protocolPrefix = (window.location.protocol === 'https:') ? 'wss:' : 'ws:';
@@ -113,6 +114,9 @@ function AMApp() {
                 </Row>
                 {webuistate.eventSubmenu == EventTab.Setup &&
                   <EditEvent event={selectedEvent} people={people} runners={runners} />
+                }
+                {webuistate.eventSubmenu == EventTab.Data &&
+                  <EditEventData event={selectedEvent} people={people}/>
                 }
                 {webuistate.eventSubmenu == EventTab.Stream ?
                   (lockOwner && lockOwner.editor == authState.username ?
