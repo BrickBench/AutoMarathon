@@ -106,7 +106,7 @@ export function HostPanel({ host, events, people, streams, runners }: {
                   if(host.streaming){
                     let confirm = prompt("Are you sure you want to end the stream? If so, type \"End\" into the box.");
                     if(confirm?.toLowerCase().replace("\"","").replace("'","") == "end"){
-                      doPost('host', 'PUT', {
+                      doPost('hosts', 'PUT', {
                         host: webuistate.selectedHost,
                         streaming: false
                       });
@@ -115,7 +115,7 @@ export function HostPanel({ host, events, people, streams, runners }: {
                   }else{
                     let confirm = prompt("Are you sure you want to go live? Review the stream starting procedure for your event before proceeding. If so, type \"Live\" into the box.");
                     if(confirm?.toLowerCase().replace("\"","").replace("'","") =="live"){
-                      doPost('host', 'PUT', {
+                      doPost('hosts', 'PUT', {
                         host: webuistate.selectedHost,
                         streaming: true
                       });
