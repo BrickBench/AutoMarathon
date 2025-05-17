@@ -167,7 +167,7 @@ export function EditPerson({ person, runner, events }: { person: Person | undefi
             <FormLabel htmlFor="runnervolume" className="form-label">Volume</FormLabel>
             <FormControl type="text" className="form-control" id="runnereditvolume" onChange={e => setRunnerEditState({
               ...runnerEditState,
-              therun: e.target.value
+              stream_volume_percent: parseInt(e.target.value)
             })} value={runnerEditState.stream_volume_percent || ''} />
           </Col>
           <Col lg={4}>

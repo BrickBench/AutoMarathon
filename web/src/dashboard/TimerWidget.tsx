@@ -108,8 +108,30 @@ export function TimerWidget({event} : {event : Event | undefined}){
                   setEditTimerString(e.currentTarget.value);
                 }}/>
                 <Button disabled={!event} onClick={()=>{
+                  let regex =  /^\d+\:\d+\:\d+\.\d+$/;
                   let time = editTimerString;
-                  alert("Invalid time format. Please input the new time in the format HH:MM:SS.xxx.")
+                  if(!time.match(regex)){
+                    alert("Invalid time format. Please input the new time in the format HH:MM:SS.xxx.")
+                  }else{
+                    let tokens = time.split(":");
+                    let hours = parseInt(tokens[0]);
+                    let minutes = parseInt(tokens[1]);
+                    let secmillis = tokens[2].split(".");
+                    let seconds = parseInt(secmillis[0]);
+                    let millis = parseInt(secmillis[1]);
+
+                    let setstarttime;
+                    let setendtime;
+
+                    let millisdiff = ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis;
+
+                    setendtime = Date.now();
+                    setstarttime = Date.now() - millisdiff;
+
+                    doPost('event','PUT', {...event, timer_start_time: setstarttime,
+                      timer_end_time: setendtime
+                    }); 
+                  }
                 }}>Set Time</Button>
             </InputGroup>
             
