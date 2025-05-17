@@ -25,13 +25,15 @@ pub async fn run_runner_actor(
 ) -> anyhow::Result<()> {
     // Add all existing runners to TheRun.gg poller.
     for runner in db.get_runners().await? {
-        if runner.get_therun_username().is_some() {
-            send_nonblocking!(
-                directory.therun_actor,
-                TheRunCommand,
-                AddRunner,
-                runner.clone()
-            );
+        if let Some(therun_username) = runner.get_therun_username() {
+            if !therun_username.is_empty() {
+                send_nonblocking!(
+                    directory.therun_actor,
+                    TheRunCommand,
+                    AddRunner,
+                    runner.clone()
+                );
+            }
         }
     }
 
@@ -195,7 +197,6 @@ impl Runner {
     /// Returns if the link changed.
     pub fn find_stream(&mut self) -> anyhow::Result<bool> {
         let output = process::Command::new("streamlink")
-            .arg("-Q")
             .arg("-j")
             .arg(self.get_stream())
             .output()

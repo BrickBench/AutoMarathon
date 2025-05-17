@@ -43,7 +43,7 @@ pub struct SetStreamingState {
 /// A Json struct to set a Discord user's volume
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SetDiscordUserVolume {
-    pub user: u64,
+    pub user: String,
     pub volume: u32,
 }
 

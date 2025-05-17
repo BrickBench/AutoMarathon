@@ -54,13 +54,11 @@ function AMApp() {
   useEffect(() => {
     if(webSocket){
       webSocket.onopen = (event) => {
-        console.log("Connected to Main AM Socket");
         setWebSocketCreated(true);
       };
 
       webSocket.onmessage = (event) => {
         var state: AMState = JSON.parse(event.data);
-        console.log(state);
         diffAMState(state, people, setPeople, runners, setRunners, events, setEvents, hosts, setHosts, streams, setStreams);
       };
 
@@ -80,13 +78,11 @@ function AMApp() {
   useEffect(() => {
     if(editorWebSocket){
       editorWebSocket.onopen = (event) => {
-        console.log("Connected to Editor Socket");
         setEditorWebSocketCreated(true);
       };
 
       editorWebSocket.onmessage = function(event) {
         var state: LockState = JSON.parse(event.data);
-        console.log("Lock state", state);
         setLockOwner(state);
       };
 

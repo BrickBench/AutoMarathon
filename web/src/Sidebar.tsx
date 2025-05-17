@@ -13,6 +13,10 @@ function EventList({ searchField, events, people, streams, hosts }: {
     return !searchField || searchField.length == 0 || event.name.toLowerCase().includes(searchField.toLowerCase());
   });
 
+  filteredEvents.sort((a, b) => {
+    return (a.event_start_time ? a.event_start_time : 0) - (b.event_start_time ? b.event_start_time : 0)
+  })
+
   return <ListGroup className='overflow-auto'>
     {filteredEvents.map(event => <EventItem key={event.id} event={event} people={people} streams={streams} hosts={hosts}></EventItem>)}
   </ListGroup>
@@ -112,7 +116,7 @@ export function Sidebar({ people, events, streams, hosts }: { people: Map<number
                 host: false
               });
               setCreateField("");
-            }else{
+            } else {
               alert("Please enter a name for the person that will be created.");
             }
           }}>Person</DropdownItem>
@@ -138,7 +142,7 @@ export function Sidebar({ people, events, streams, hosts }: { people: Map<number
                 commentators: []
               });
               setCreateField("");
-            }else{
+            } else {
               alert("Please enter a name for the event that will be created.");
             }
           }}>Event</DropdownItem>

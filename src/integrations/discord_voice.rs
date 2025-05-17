@@ -284,18 +284,21 @@ pub async fn connect_to_voice(
         std::mem::forget(output_stream);
     }
 
-    if let Ok(call) = manager.join(guild_id, channel_id).await {
-        let call = call.lock().await;
-        log::info!(
-            "Joined voice channel at {:?}, {:?}",
-            call.config().decode_sample_rate,
-            call.config().decode_channels
-        );
-    } else {
-        // Although we failed to join, we need to clear out existing event handlers on the call.
-        _ = manager.remove(guild_id).await;
+    match manager.join(guild_id, channel_id).await {
+        Ok(call) => {
+            let call = call.lock().await;
+            log::info!(
+                "Joined voice channel at {:?}, {:?}",
+                call.config().decode_sample_rate,
+                call.config().decode_channels
+            );
+        }
+        Err(err) => {
+            // Although we failed to join, we need to clear out existing event handlers on the call.
+            _ = manager.remove(guild_id).await;
 
-        log::error!("Failed to join voice channel");
+            log::error!("Failed to join voice channel: {:?}", err.to_string());
+        }
     }
 
     Ok(())

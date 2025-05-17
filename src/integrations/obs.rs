@@ -116,7 +116,7 @@ pub enum HostCommand {
     StartStream(String, Rto<()>),
     EndStream(String, Rto<()>),
     SetStreamCommentators(String, Vec<(u64, String)>, Rto<()>),
-    SetCommentatorVolume(u64, u32, Rto<()>),
+    SetCommentatorVolume(String, u32, Rto<()>),
     GetCommentatorState(String, Rto<HashMap<u64, DiscordUser>>),
 }
 
@@ -204,12 +204,13 @@ pub async fn run_obs(
             HostCommand::GetCommentatorState(host, rto) => {
                 rto.reply(Ok(discord_users.get(&host).unwrap().clone()));
             }
-            HostCommand::SetCommentatorVolume(id, volume, rto) => {
-                db.set_discord_user_volume(&id.to_string(), volume as i32)
-                    .await?;
+            HostCommand::SetCommentatorVolume(name, volume, rto) => {
                 for host in settings.obs_hosts.keys() {
-                    if let Some(user) = discord_users.get_mut(host).unwrap().get_mut(&id) {
+                    let users = discord_users.get_mut(host).unwrap();
+                    if let Some(user) = users.values_mut().find(|u| u.username == name) {
                         user.volume_percent = volume;
+                        db.set_discord_user_volume(&user.id.to_string(), volume as i32)
+                            .await?;
                     }
                 }
 
@@ -396,12 +397,13 @@ pub async fn do_transition(
     settings: &Settings,
     long: bool,
 ) -> anyhow::Result<()> {
-    log::debug!("Triggering Studio Mode transition");
     let transition = if long {
         &settings.obs_long_transition
     } else {
         &settings.obs_short_transition
     };
+
+    log::debug!("Triggering Studio Mode transition: {:?}", transition);
 
     match transition {
         Some(name) => {
@@ -700,7 +702,7 @@ pub async fn update_obs_state(
 
                             tokio::time::sleep(Duration::from_millis(200)).await;
 
-                            let location_idx = if view.name.contains("delta") { 15 } else { 0 };
+                            let location_idx = 0;
 
                             obs.scene_items()
                                 .set_index(SetIndex {
