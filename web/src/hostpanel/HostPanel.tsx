@@ -8,6 +8,7 @@ import { getSelectedLayout, getStreamForHost, updateStreamRequest } from "./Layo
 import { ToastNotifStateContext } from "../AMNotification";
 import { TimerWidget } from "../dashboard/TimerWidget";
 import { doPost } from "../Api";
+import { CommentatorWidget } from "./CommentatorWidget";
 
 export function HostPanel({ host, events, people, streams, runners }: {
   host: StreamHost, events: Event[], people: Map<number, Person>, streams: StreamEntry[],
@@ -134,6 +135,7 @@ export function HostPanel({ host, events, people, streams, runners }: {
           <TimerWidget event={streamEvent}></TimerWidget>
         </Col>
         <Col lg={3}>
+          <CommentatorWidget host={host}></CommentatorWidget>
         </Col>
         <Col lg={6}>
         </Col>

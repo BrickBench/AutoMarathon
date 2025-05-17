@@ -34,7 +34,11 @@ export function LoginPage({beginSession}:{beginSession : (state: AuthState) => v
                 <Col md={12} className="d-flex justify-content-center">
                     <Form onSubmit={(event) => {
                         event.preventDefault();
-                        loginUser(username || "", password || "",beginSession);             
+                        if(!username || username.length == 0){
+                          alert("Enter a non-blank username.");
+                        }else{
+                          loginUser(username || "", password || "",beginSession);     
+                        }        
                     }}>
                         <Form.Text><h3>Login to Automarathon</h3></Form.Text>
                         <FormLabel htmlFor="username">Username</FormLabel>

@@ -84,7 +84,7 @@ export interface StreamHost {
         [key: string]: StreamScene;
     };
     discord_users: {
-        [key: string]: VoiceCallStatus;
+        [key: string]: DiscordUser;
     };
 }
 
@@ -93,6 +93,13 @@ export interface VoiceCallStatus {
     speaking: boolean;
     peak_volume: number;
     desired_volume: number;
+}
+
+export interface DiscordUser {
+    username: string;
+    id: number;
+    volume_percent: number;
+    participant?: number;
 }
 
 export interface StreamScene {
