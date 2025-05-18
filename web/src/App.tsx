@@ -1,6 +1,6 @@
 import { useState, useEffect, createContext, useContext, useRef } from 'react'
 import { Container, Row, Col, Button, Accordion, ListGroup } from 'react-bootstrap';
-import { AMState, Person, Runner, Event, StreamHost, WebUIState, diffAMState, LockState, AuthState, StreamEntry, EventTab } from './websocket';
+import { AMState, Person, Runner, Event, StreamHost, WebUIState, diffAMState, LockState, AuthState, StreamEntry, EventTab, CustomFields } from './websocket';
 import { Sidebar } from './Sidebar'
 import { AuthStateContext, WebUIStateContext } from './Context';
 import { EditPerson } from './EditPerson';
@@ -34,6 +34,7 @@ function AMApp() {
   const [events, setEvents] = useState<Event[]>([]);
   const [streams, setStreams] = useState<StreamEntry[]>([]);
   const [hosts, setHosts] = useState<Map<string, StreamHost>>(new Map());
+  const [customFields, setCustomFields] = useState<CustomFields>({});
 
   const [webuistate, setWebUIState] = useState<WebUIState>(new WebUIState());
 
@@ -59,7 +60,10 @@ function AMApp() {
 
       webSocket.onmessage = (event) => {
         var state: AMState = JSON.parse(event.data);
-        diffAMState(state, people, setPeople, runners, setRunners, events, setEvents, hosts, setHosts, streams, setStreams);
+        console.log(state);
+        diffAMState(state, people, setPeople, runners, setRunners, events, setEvents, hosts, setHosts, streams, setStreams,
+          customFields, setCustomFields
+        );
       };
 
       webSocket.onclose = function(event) {
@@ -129,7 +133,7 @@ function AMApp() {
                 }
                 {webuistate.eventSubmenu == EventTab.Stream ?
                   (lockOwner && lockOwner.editor == authState.username ?
-                    <HostPanel host={hosts.get(webuistate.selectedHost)!} events={events} people={people} streams={streams} runners={runners}></HostPanel> :
+                    <HostPanel host={hosts.get(webuistate.selectedHost)!} events={events} people={people} streams={streams} runners={runners} customFields={customFields}></HostPanel> :
                     <HostPanelLock authState={authState} lockState={lockOwner} lockSocket={editorWebSocket}></HostPanelLock>) :
                   <></>
                 }

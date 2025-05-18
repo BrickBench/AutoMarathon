@@ -13,9 +13,21 @@ function EventList({ searchField, events, people, streams, hosts }: {
     return !searchField || searchField.length == 0 || event.name.toLowerCase().includes(searchField.toLowerCase());
   });
 
-  filteredEvents.sort((a, b) => {
-    return (a.event_start_time ? a.event_start_time : 0) - (b.event_start_time ? b.event_start_time : 0)
-  })
+  filteredEvents.sort((event1,event2) => {
+    if(event1.complete && !event2.complete){
+        return 1;
+    }
+    if(event2.complete && !event1.complete){
+      return -1;
+    }
+    if(!event1.event_start_time){
+        return 1;
+    }
+    if(!event2.event_start_time){
+        return -1;
+    }
+    return event1.event_start_time > event2.event_start_time ? 1 : -1;
+  });
 
   return <ListGroup className='overflow-auto'>
     {filteredEvents.map(event => <EventItem key={event.id} event={event} people={people} streams={streams} hosts={hosts}></EventItem>)}

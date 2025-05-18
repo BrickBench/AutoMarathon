@@ -10,9 +10,11 @@ export interface AMState {
     hosts: {
         [key: string]: StreamHost;
     }
-    custom_fields: {
-        [key: string]: string;
-    }
+    custom_fields: CustomFields;
+}
+
+export type CustomFields = {
+    [key: string]: string;
 }
 
 export type RunnerStateEntry = {
@@ -150,7 +152,8 @@ export function diffAMState(newData: AMState, people: Map<number, Person>, setPe
     runners: Map<number, Runner>, setRunners: (state: Map<number, Runner>) => void,
     events, setEvents,
     hosts, setHosts: (state: Map<string, StreamHost>) => void,
-    streams: StreamEntry[], setStreams: (stream: StreamEntry[]) => void) {
+    streams: StreamEntry[], setStreams: (stream: StreamEntry[]) => void,
+    customFields: CustomFields, setCustomFields: (customFields : CustomFields) => void) {
 
     var newPeopleMap = new Map<number, Person>(Object.entries(newData.people).map(([key, value]) => [parseInt(key), value]));
     setPeople(newPeopleMap);
@@ -166,6 +169,9 @@ export function diffAMState(newData: AMState, people: Map<number, Person>, setPe
 
     var newstream = newData.streams;
     setStreams(newstream);
+
+    var newCustomField = newData.custom_fields;
+    setCustomFields(newCustomField);
 
     //var peopleChanges = mapsAreEqual(newPeopleMap, people);
 }
