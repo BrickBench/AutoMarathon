@@ -7,89 +7,6 @@ import { customStyles } from './Globals';
 import { WebUIStateContext } from './Context';
 import { doPost } from './Api'
 
-function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,runner,event,setEventTemp}: {typename:any,customTemp: any,key2:any,setCustomTemp:any,horizontal:boolean,event:any,runner:any,setEventTemp:any}){
-    const [inputState,setInputState]  = useState(customTemp[key2]);
-    useEffect(() => {
-        setInputState(customTemp[key2]);
-    }, [customTemp]);
-    return horizontal ? <div className="input-group">
-      <label className="input-group-text">{key2}</label>
-      <input type="text" name={key2} className="form-control" onChange={({ target }) => {
-          setInputState(target.value);
-          let temp = customTemp;
-          temp[key2] = target.value;
-          let out = {};
-          out[typename] = temp;
-          setCustomTemp(out);
-          let tempevent = {...event};
-          tempevent.runner_state[runner].result = out;
-          setEventTemp(tempevent);
-        }} value={inputState || ''}/>
-    </div> : 
-    <div className="col-2">
-    <label>{key2}</label>
-    <input type="text" name={key2} className="form-control" onChange={({ target }) => {
-        setInputState(target.value);
-        let temp = customTemp;
-        temp[key2] = target.value;
-        let out = {};
-        out[typename] = temp;
-        setCustomTemp(out);
-        let tempevent = {...event};
-          tempevent.runner_state[runner].result = out;
-          setEventTemp(tempevent);
-      }} value={inputState || ''}/>
-  </div>;
-  }
-  
-  function EventRunnerData({runner,event,setEventState,data}:{runner:any,event:any,setEventState:any,data:any}){
-  const {webuistate, setWebUIState } = useContext(WebUIStateContext);
-  const { amstate, setAMState } = useContext(AMStateContext);
-  const [eventRunnerState,setEventRunnerStateTemp] = useState(data ? data : 
-    {"SingleScore":{score: ""}});
-  useEffect(() => {
-    setEventRunnerStateTemp(data ? data : 
-      {"SingleScore":{score: ""}});
-  }, [webuistate,data])
-  
-  return (
-    <div className="row pt-2">
-        <div className="col-2">
-            {amstate.runners[runner].name}
-        </div>
-        <div className="col-10">
-          {eventRunnerState["SingleScore"] &&
-            <div className="row">
-            {Object.entries(eventRunnerState['SingleScore'])
-            .map(([key,val])=>{return <EventDataFieldInput typename={"SingleScore"} runner={runner} horizontal={true} customTemp={eventRunnerState['SingleScore']} event={event} setEventTemp={setEventState} key2={key} setCustomTemp={setEventRunnerStateTemp}></EventDataFieldInput>})}
-            </div>
-          }
-        </div>
-    </div>
-  );
-  }
-  
-  function EditEventData({event}: {event: any}){
-    const [eventState, setEventState] = useState({...event});
-    const { amstate, setAMState } = useContext(AMStateContext);
-    useEffect(() => {
-      setEventState(event)
-    }, [event]);
-    return (<div className="container">
-      <div className="row pt-2">
-        <div className="col">
-          <h2>Edit Event Data</h2>
-        </div>
-        <div className="col align-items-center me-auto">
-          <button className="btn btn-primary" onClick={() => {
-                doPost('http://'+apiurl+'/event','PUT', eventState);
-            }}>Save Changes</button>
-        </div>
-      </div>
-      {Object.entries(eventState.runner_state).map(([key,val])=><EventRunnerData runner={key} event={eventState} setEventState={setEventState} data={val.result}></EventRunnerData>)}
-      </div>);
-  }
-
   function HMSInput({time, onChangeCallback} : {time: number | undefined, onChangeCallback : (time:number) => void}){
 
     function getHMS(totalSeconds:number){
@@ -182,7 +99,7 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
       </Row>
       <div className="mb-3">
         <Form.Label htmlFor="eventeditrunners">Runners</Form.Label>
-        <Select styles={customStyles}  value={Array.from(Object.entries(eventState.runner_state), ([key, value]) => ({value: key, label: people.get(value.runner)!.name}))} 
+        <Select styles={customStyles} inputId="eventeditrunners" value={Array.from(Object.entries(eventState.runner_state), ([key, value]) => ({value: key, label: people.get(value.runner)!.name}))} 
         onChange={selectedOptions => {
           let temp_runners = {}
   
@@ -199,7 +116,7 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
             runner_state: temp_runners
           });
         }}
-        options={runner_options} id="eventeditrunners" isMulti={true}></Select>
+        options={runner_options} isMulti={true}></Select>
       </div>
       <Row className="mb-3">
         <Col>
@@ -221,8 +138,8 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
         </Col>
       </Row>
       <Row className="mb-3">
-        <Form.Label>Preferred Layouts</Form.Label>
-        <Creatable isMulti={true} value={eventState.preferred_layouts.map((value:string) => ({value: value, label: value}))} 
+        <Form.Label htmlFor='eventeditlayouts'>Preferred Layouts</Form.Label>
+        <Creatable isMulti={true} inputId="eventeditlayouts" value={eventState.preferred_layouts.map((value:string) => ({value: value, label: value}))} 
         onChange={selectedOptions => {
           let temp_layouts = []
           for(const entry of selectedOptions){
@@ -235,8 +152,8 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
         }}></Creatable>
       </Row>
       <Row className="mb-3">
-        <Form.Label>Manual Commentators</Form.Label>
-        <Select styles={customStyles}  value={Array.from(eventState.commentators, (personID) => ({value: personID, label: people.get(personID)!.name}))} 
+        <Form.Label htmlFor="eventeditcommentators">Manual Commentators</Form.Label>
+        <Select styles={customStyles} inputId="eventeditcommentators" value={Array.from(eventState.commentators, (personID) => ({value: personID, label: people.get(personID)!.name}))} 
         onChange={selectedOptions => {
           let commentators = []
   
@@ -249,7 +166,7 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
             commentators: commentators
           });
         }}
-        options={commentatorOptions} id="eventeditcommentators" isMulti={true}></Select>
+        options={commentatorOptions} isMulti={true}></Select>
       </Row>
       <div className='d-flex'>
         <div className="p-2">

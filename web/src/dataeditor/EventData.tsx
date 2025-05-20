@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { doPost } from "../Api";
 import { Event, Person } from "../websocket";
-import { Button, Col, Container, InputGroup, Row } from "react-bootstrap";
+import { Button, Col, Container, FormControl, FormLabel, InputGroup, Row } from "react-bootstrap";
+import InputGroupText from "react-bootstrap/esm/InputGroupText";
 
 function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,runner,event,setEventTemp}: {typename:any,customTemp: any,key2:any,setCustomTemp:any,horizontal:boolean,event:any,runner:any,setEventTemp:any}){
   const [inputState,setInputState]  = useState(customTemp[key2]);
@@ -10,8 +11,8 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
   }, [customTemp]);
   return horizontal ? 
   <InputGroup>
-    <label className="input-group-text">{key2}</label>
-    <input type="text" name={key2} className="form-control" onChange={({ target }) => {
+    <InputGroupText>{key2}</InputGroupText>
+    <FormControl type="text" name={key2} onChange={({ target }) => {
         setInputState(target.value);
         let temp = customTemp;
         temp[key2] = target.value;
@@ -23,20 +24,20 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
         setEventTemp(tempevent);
       }} value={inputState || ''}/>
   </InputGroup> : 
-  <div className="col-2">
-    <label>{key2}</label>
-  <input type="text" name={key2} className="form-control" onChange={({ target }) => {
-      setInputState(target.value);
-      let temp = customTemp;
-      temp[key2] = target.value;
-      let out = {};
-      out[typename] = temp;
-      setCustomTemp(out);
-      let tempevent = {...event};
-        tempevent.runner_state[runner].result = out;
-        setEventTemp(tempevent);
-    }} value={inputState || ''}/>
-</div>;
+  <Col lg={2}>
+    <FormLabel>{key2}</FormLabel>
+    <FormControl type="text" name={key2} onChange={({ target }) => {
+        setInputState(target.value);
+        let temp = customTemp;
+        temp[key2] = target.value;
+        let out = {};
+        out[typename] = temp;
+        setCustomTemp(out);
+        let tempevent = {...event};
+            tempevent.runner_state[runner].result = out;
+            setEventTemp(tempevent);
+        }} value={inputState || ''}/>
+</Col>;
 }
 
 function EventRunnerData({runnerID, event, setEventState, data, people}:{runnerID: number, event:Event, setEventState:any,data:any, people: Map<number, Person>}){
@@ -47,7 +48,7 @@ function EventRunnerData({runnerID, event, setEventState, data, people}:{runnerI
     }, [data])
 
     return (
-    <div className="row pt-2">
+    <Row className="pt-2">
         <Col lg={2}>
             {people.get(runnerID)!.name}
         </Col>
@@ -55,11 +56,11 @@ function EventRunnerData({runnerID, event, setEventState, data, people}:{runnerI
             {eventRunnerState["SingleScore"] &&
             <Row>
                 {Object.entries(eventRunnerState['SingleScore'])
-                .map(([key,val])=>{return <EventDataFieldInput typename={"SingleScore"} runner={runnerID} horizontal={true} customTemp={eventRunnerState['SingleScore']} event={event} setEventTemp={setEventState} key2={key} setCustomTemp={setEventRunnerStateTemp}></EventDataFieldInput>})}
+                .map(([key,val])=>{return <EventDataFieldInput key={key} typename={"SingleScore"} runner={runnerID} horizontal={true} customTemp={eventRunnerState['SingleScore']} event={event} setEventTemp={setEventState} key2={key} setCustomTemp={setEventRunnerStateTemp}></EventDataFieldInput>})}
             </Row>
             }
         </Col>
-    </div>
+    </Row>
     );
 }
 
@@ -80,7 +81,7 @@ export function EditEventData({event, people}: {event: Event, people: Map<number
             </Col>
         </Row>
         {Object.entries(eventState.runner_state).map(([key,val])=>
-            <EventRunnerData runnerID={parseInt(key)} event={eventState} setEventState={setEventState} data={val.result} people={people}></EventRunnerData>)
+            <EventRunnerData key={key} runnerID={parseInt(key)} event={eventState} setEventState={setEventState} data={val.result} people={people}></EventRunnerData>)
         }
     </Container>;
 }
