@@ -1,9 +1,10 @@
 import { Event, Person, Runner } from './websocket';
 import { useState, useContext, useEffect } from 'react'
-import { Form, Button, Row, Col, FormControl, FormLabel } from 'react-bootstrap';
-import { ArrowClockwise, Discord, Twitch, Twitter, Youtube } from 'react-bootstrap-icons';
+import { Form, Button, Row, Col, FormControl, FormLabel, InputGroup } from 'react-bootstrap';
+import { ArrowClockwise, Dash, DashLg, Discord, Twitch, Twitter, Youtube } from 'react-bootstrap-icons';
 import { WebUIStateContext } from './Context';
 import { doPost } from './Api'
+import InputGroupText from 'react-bootstrap/esm/InputGroupText';
 
 function runnerInEvent(runnerID: number, events: Event[]) {
   for (let event of events) {
@@ -163,14 +164,28 @@ export function EditPerson({ person, runner, events }: { person: Person | undefi
           </Col>
         </Row>
         <Row className="pt-3">
-          <Col lg={8}>
+          <Col lg={6}>
             <FormLabel htmlFor="runnervolume" className="form-label">Volume</FormLabel>
-            <FormControl type="text" className="form-control" id="runnereditvolume" onChange={e => setRunnerEditState({
-              ...runnerEditState,
-              stream_volume_percent: parseInt(e.target.value)
-            })} value={runnerEditState.stream_volume_percent || ''} />
+            <Row>
+              <Col lg={9}>
+                <Form.Range min={-100} max={0} value={-runnerEditState.stream_volume_percent || 0} onChange={e => setRunnerEditState({
+                ...runnerEditState,
+                stream_volume_percent: Math.max(-parseInt(e.target.value),0)
+              })}/>
+              </Col>
+              <Col lg={3}>
+                <InputGroup>
+                  <InputGroupText><DashLg></DashLg></InputGroupText>
+                  <FormControl type="text" className="form-control" id="runnereditvolume" onChange={e => setRunnerEditState({
+                  ...runnerEditState,
+                  stream_volume_percent: Math.max(Math.min(parseInt(e.target.value),100),0)
+                })} value={runnerEditState.stream_volume_percent || 0} />
+                  <InputGroupText>dB</InputGroupText>
+                </InputGroup>
+              </Col>
+            </Row>
           </Col>
-          <Col lg={4}>
+          <Col lg={6}>
             <FormLabel htmlFor="runneredittherun" className="form-label">therun.gg Username</FormLabel>
             <FormControl type="text" className="form-control" id="runneredittherun" onChange={e => setRunnerEditState({
               ...runnerEditState,

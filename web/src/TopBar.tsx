@@ -51,7 +51,7 @@ export function PanelSelector({selectedEvent, releaseLock} : {selectedEvent: Eve
 export function HostSelector({hosts, releaseLock} : {hosts : Map<string, StreamHost>, releaseLock : ()=>void}){
     const { webuistate, setWebUIState } = useContext(WebUIStateContext);
 
-    let hostOptions = [...hosts.entries()].filter(([_, host])=>{return host.connected}).map(([key]) => ({value: key, label: key}));
+    let hostOptions = [...hosts.entries()].filter(([_, host])=>{return true || host.connected}).map(([key]) => ({value: key, label: key}));
   
     return (
       <Navbar>
