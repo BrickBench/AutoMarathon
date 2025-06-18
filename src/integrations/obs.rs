@@ -643,7 +643,7 @@ pub async fn update_obs_state(
                     }
                 }
 
-                // Update this player's view
+                // Update this player's views
                 if modifications.contains(&ModifiedStreamState::RunnerView(runner.participant))
                     || modifications.contains(&ModifiedStreamState::Layout)
                     || just_created

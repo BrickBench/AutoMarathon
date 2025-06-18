@@ -8,7 +8,7 @@ use sqlx::{
 use crate::{
     core::{event::Event, runner::Runner, stream::StreamState},
     integrations::therun::Run,
-    web::dashboard::WebCommand,
+    web::streams::WebCommand,
     Directory,
 };
 
@@ -111,6 +111,7 @@ impl ProjectDb {
                 name text not null,
                 pb_split_time real,
                 split_time real,
+                best_possible real,
                 foreign key(run) references runs(runner) on delete cascade
             );"
         )
@@ -219,7 +220,7 @@ impl ProjectDb {
     }
 
     fn trigger_update(&self) {
-        self.directory.web_actor.send(WebCommand::SendStateUpdate);
+        self.directory.web_actor.send(WebCommand::TriggerStateUpdate);
     }
 
     pub async fn add_participant(&self, participant: &mut Participant) -> anyhow::Result<()> {
@@ -472,17 +473,17 @@ impl ProjectDb {
             .await?;
 
         let mut builder =
-            sqlx::QueryBuilder::new("insert into splits(run, name, pb_split_time, split_time)");
+            sqlx::QueryBuilder::new("insert into splits(run, name, pb_split_time, split_time, best_possible)");
         builder.push_values(run.splits.iter(), |mut b, split| {
             b.push_bind(runner)
                 .push_bind(&split.name)
                 .push_bind(split.pb_split_time)
-                .push_bind(split.split_time);
+                .push_bind(split.split_time)
+                .push_bind(split.best_possible);
         });
 
         builder.build().execute(&mut *tx).await?;
         tx.commit().await?;
-        self.trigger_update();
 
         Ok(())
     }

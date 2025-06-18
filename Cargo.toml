@@ -16,7 +16,7 @@ ringbuf = "0.4.8"
 async-ringbuf = "0.3.4"
 clap = { version = "4.0.15", features = ["derive"] }
 tokio = { version = "1.21.2", features = ["full"] }
-tokio-tungstenite = { version = "*", features = ["rustls"]}
+tokio-tungstenite = { version = "0.26.2", features = ["rustls"]}
 tokio-stream = { version = "0.1.17", features = ["sync"]}
 futures = "0.3.24"
 obws = "0.12.0"
@@ -32,3 +32,5 @@ regex = "1.10.5"
 sqlx = { version = "0.7.4", features = ["sqlite", "runtime-tokio", "macros", "json", "time"]}
 realfft = "3.4.0"
 vite-rs = "0.1.0"
+statrs = { version = "0.18.0", features = ["rand"] }
+rand = "0.8.5"

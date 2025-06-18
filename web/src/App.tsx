@@ -17,8 +17,11 @@ function createWebSocket(path: string, isCreated: boolean): WebSocket | undefine
   if (isCreated) {
     return undefined;
   }
-  var protocolPrefix = (window.location.protocol === 'https:') ? 'wss:' : 'ws:';
-  return new WebSocket(new URL(path, protocolPrefix + '//' + location.hostname + ":28010"));
+  if (window.location.protocol === 'https:') {
+    return new WebSocket(new URL(path, 'wss://' + location.hostname));
+  } else {
+    return new WebSocket(new URL(path, 'ws://' + location.hostname + ":28010"));
+  }
 }
 
 function AMApp() {

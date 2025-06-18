@@ -5,7 +5,7 @@ use async_ringbuf::{
 };
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device,
+    Device, SampleRate,
 };
 use realfft::RealFftPlanner;
 use ringbuf::storage::Heap;
@@ -26,14 +26,14 @@ use songbird::{model::payload::Speaking, CoreEvent, Event, EventContext};
 
 use crate::{
     core::{db::ProjectDb, settings::Settings},
-    web::dashboard::{ParticipantVoiceState, VoiceUpdate, WebCommand},
+    web::streams::{ParticipantVoiceState, VoiceState, WebCommand},
     Directory,
 };
 
-// 48 kHz, 2 channels, 20ms
-const BUF_SIZE: usize = 1920;
+const SAMPLE_RATE: u32 = 48_000;
+const BUF_SIZE: usize = (SAMPLE_RATE as usize * 2) / 50; // 2 channels, 20ms buffer
 const FFT_RESOLUTION: usize = 16;
-const LATENCY: Duration = Duration::from_millis(100);
+const LATENCY: Duration = Duration::from_millis(1000);
 const WEB_UPDATE_RATE: usize = 10;
 
 type AudioProducer = AsyncWrap<Arc<AsyncRb<Heap<f32>>>, true, false>;
@@ -180,7 +180,7 @@ impl songbird::EventHandler for Receiver {
                     self.inner
                         .directory
                         .web_actor
-                        .send(WebCommand::SendVoiceUpdate(VoiceUpdate {
+                        .send(WebCommand::SendVoiceState(VoiceState {
                             host: self.inner.host.clone(),
                             voice_users,
                         }));
@@ -203,18 +203,32 @@ impl songbird::EventHandler for Receiver {
     }
 }
 
+const USE_JACK: bool = false;
 async fn create_audio_device() -> anyhow::Result<Device> {
     log::info!("Initializing audio device");
-    let host =  cpal::host_from_id(cpal::available_hosts()
+
+    if USE_JACK {
+        log::info!("Using JACK audio host");
+        let host =  cpal::host_from_id(cpal::available_hosts()
         .into_iter()
         .find(|id| *id == cpal::HostId::Jack)
         .expect(
             "make sure --features jack is specified. only works on OSes where jack is available",
         ))?;
 
-    // let host = cpal::default_host();
-    host.default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("No default output device found."))
+        host.output_devices()?.for_each(|device| {
+            println!("Output device: {:?} ", device.name());
+        });
+
+        host.default_output_device()
+            .ok_or(anyhow::anyhow!("No default output device found."))
+    } else {
+        let host = cpal::default_host();
+        host.output_devices()?
+            .find(|d| d.name().unwrap_or_default().contains("pipewire"))
+            .or_else(|| host.default_output_device())
+            .ok_or(anyhow::anyhow!("No default output device found."))
+    }
 }
 
 pub async fn connect_to_voice(
@@ -237,7 +251,6 @@ pub async fn connect_to_voice(
         .await
         .expect("Failed to init songbird")
         .clone();
-
     {
         let lock = manager.get_or_insert(guild_id);
 
@@ -246,12 +259,30 @@ pub async fn connect_to_voice(
         let output_device = create_audio_device().await?;
 
         log::info!("Using output device: {}", output_device.name()?);
-        let config = output_device.default_output_config()?;
+        let good_config_range = output_device
+            .supported_output_configs()?
+            .find(|config| {
+                config.channels() == 2
+                    && config.min_sample_rate().0 <= SAMPLE_RATE
+                    && config.max_sample_rate().0 >= SAMPLE_RATE
+            })
+            .ok_or(anyhow::anyhow!(
+                "No suitable output config found for sample rate {} and 2 channels",
+                SAMPLE_RATE
+            ))?;
+
+        let config = good_config_range.with_sample_rate(SampleRate(SAMPLE_RATE));
+
+        log::info!(
+            "Output device config: {:?} channels, {}Hz sample rate",
+            config.channels(),
+            config.sample_rate().0
+        );
 
         let latency_frames = config.sample_rate().0 as f64 * LATENCY.as_secs_f64();
         let latency_samples = latency_frames as usize * config.channels() as usize;
-        let ringbuf = AsyncHeapRb::<f32>::new(latency_samples * 2);
 
+        let ringbuf = AsyncHeapRb::<f32>::new(latency_samples * 2);
         let (mut ring_producer, mut ring_consumer) = ringbuf.split();
         for _ in 0..latency_samples {
             ring_producer.try_push(0.0).unwrap();
@@ -262,9 +293,6 @@ pub async fn connect_to_voice(
                 *sample = ring_consumer.try_pop().unwrap_or(0.0);
             }
         };
-
-        log::info!("Using output device: {}", output_device.name()?);
-        let config = output_device.default_output_config()?;
 
         let output_stream = output_device.build_output_stream(
             &config.into(),

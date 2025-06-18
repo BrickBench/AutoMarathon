@@ -1,18 +1,6 @@
-use songbird::SerenityInit;
-use std::{collections::HashSet, sync::Arc};
-
 use anyhow::anyhow;
-use poise::serenity_prelude as serenity;
 
 use futures::{Stream, StreamExt};
-use serenity::{
-    http::Http,
-    model::{
-        prelude::{ChannelId, GuildChannel},
-        voice::VoiceState,
-    },
-};
-use songbird::{driver::DecodeMode, Config};
 use sqlx::types::time::OffsetDateTime;
 
 use crate::{
@@ -20,49 +8,16 @@ use crate::{
         db::ProjectDb,
         event::EventRequest,
         runner::RunnerRequest,
-        settings::Settings,
         stream::{validate_streamed_event_id, StreamRequest},
     },
     error::Error,
-    integrations::{discord_voice::connect_to_voice, obs::HostCommand},
-    send_message,
-    web::dashboard::WebCommand,
-    Directory, Rto,
+    integrations::obs::HostCommand,
+    send_message, Rto,
 };
 
-struct Data {
-    name: String,
-    db: Arc<ProjectDb>,
-    settings: Arc<Settings>,
-    directory: Directory,
-}
+use super::{to_guild_channel, Data};
 
 type Context<'a> = poise::Context<'a, Data, anyhow::Error>;
-
-/// Returns the GuildChannel for the provided voice
-async fn get_voice_guild_channel(
-    state: &VoiceState,
-    context: &serenity::Context,
-) -> Option<GuildChannel> {
-    let channel_id = state.channel_id?;
-
-    to_guild_channel(channel_id, context).await
-}
-
-/// Convert a ChannelID to a GuildChannel
-async fn to_guild_channel(
-    channel_id: ChannelId,
-    context: &serenity::Context,
-) -> Option<GuildChannel> {
-    match channel_id.to_channel(&context).await {
-        Ok(channel) => channel.guild(),
-        Err(why) => {
-            log::error!("Err w/ channel {}", why);
-
-            None
-        }
-    }
-}
 
 /// Return the event ID corresponding to the given name, or None if None
 async fn get_event_id(name: Option<String>, db: &ProjectDb) -> anyhow::Result<Option<i64>> {
@@ -81,59 +36,6 @@ async fn get_stream_id(name: Option<String>, db: &ProjectDb) -> anyhow::Result<i
         },
         Err(e) => Err(e),
     }
-}
-
-async fn update_voice_list(
-    bot_name: &str,
-    context: &serenity::Context,
-    directory: &Directory,
-    voice_state: &VoiceState,
-    settings: &Settings,
-) {
-    if let Some(channel) = get_voice_guild_channel(voice_state, context).await {
-        if let Some(host) = settings
-            .obs_hosts
-            .iter()
-            .find(|h| {
-                h.1.discord_voice_channel_id
-                    .as_ref()
-                    .is_some_and(|id| *id == u64::from(channel.id))
-            })
-            .map(|m| m.0.to_owned())
-        {
-            let users = channel.members(context).unwrap();
-            let user_list: Vec<(u64, String)> = users
-                .iter()
-                .map(|u| (u.user.id.get(), u.user.name.clone()))
-                .filter(|u| u.1 != bot_name)
-                .collect();
-
-            let _ = send_message!(
-                directory.obs_actor,
-                HostCommand,
-                SetStreamCommentators,
-                host,
-                user_list
-            );
-
-            directory.web_actor.send(WebCommand::SendStateUpdate);
-        }
-    }
-}
-
-async fn handle_voice_state_event(
-    context: &serenity::Context,
-    old_state: &Option<VoiceState>,
-    new_state: &VoiceState,
-    data: &Data,
-) {
-    let settings = &data.settings;
-
-    if let Some(old_state) = old_state {
-        update_voice_list(&data.name, context, &data.directory, old_state, settings).await;
-    }
-
-    update_voice_list(&data.name, context, &data.directory, new_state, settings).await;
 }
 
 async fn check_channel(context: &Context<'_>) -> anyhow::Result<bool> {
@@ -227,6 +129,26 @@ async fn autocomplete_obs_name<'a>(
     let hosts: Vec<String> = ctx.data().settings.obs_hosts.keys().cloned().collect();
 
     futures::stream::iter(hosts)
+        .filter(move |name| futures::future::ready(name.starts_with(partial)))
+        .map(|name| name.to_string())
+}
+
+/// Create an autocomplete stream that matches layout names
+async fn autocomplete_custom_fields<'a>(
+    ctx: Context<'_>,
+    partial: &'a str,
+) -> impl Stream<Item = String> + 'a {
+    let custom_fields: Vec<String> = ctx
+        .data()
+        .db
+        .get_custom_fields()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|f| f.0.clone())
+        .collect();
+
+    futures::stream::iter(custom_fields)
         .filter(move |name| futures::future::ready(name.starts_with(partial)))
         .map(|name| name.to_string())
 }
@@ -576,6 +498,26 @@ async fn stop_stream(
     send_success_reply(&context).await
 }
 
+/// Set a custom field
+#[poise::command(prefix_command, slash_command)]
+async fn set_custom_field(
+    context: Context<'_>,
+    #[description = "Custom field key"]
+    #[autocomplete = "autocomplete_custom_fields"]
+    field: String,
+    value: String,
+) -> Result<(), anyhow::Error> {
+    let _ = context.defer().await;
+
+    context
+        .data()
+        .db
+        .add_custom_field(&field, Some(&value))
+        .await?;
+
+    send_success_reply(&context).await
+}
+
 /// Set the audible runner.
 #[poise::command(prefix_command, slash_command)]
 async fn set_audible_runner(
@@ -602,41 +544,8 @@ async fn set_audible_runner(
     send_success_reply(&context).await
 }
 
-pub async fn init_discord(
-    settings: Arc<Settings>,
-    db: Arc<ProjectDb>,
-    directory: Directory,
-) -> Result<(), anyhow::Error> {
-    log::info!("Initializing Discord bot");
-
-    if let Some(channel) = &settings.discord_command_channel {
-        log::info!("Receiving Discord commands on '{}'", channel);
-    } else {
-        log::warn!("No channel specified for 'discord_command_channel' in the settings file, this bot will accept commands on any channel!");
-    }
-
-    let http = Http::new(&settings.discord_token.clone().unwrap());
-    let _owners = match http.get_current_application_info().await {
-        Ok(info) => {
-            let mut owners = HashSet::new();
-            owners.insert(info.owner.unwrap().id);
-            owners
-        }
-        Err(why) => {
-            return Err(Error::Unknown(format!(
-                "Could not access app info: {:?}",
-                why
-            )))?
-        }
-    };
-
-    let songbird_config = Config::default().decode_mode(DecodeMode::Decode);
-
-    let intents = serenity::GatewayIntents::non_privileged()
-        | serenity::GatewayIntents::GUILD_MESSAGES
-        | serenity::GatewayIntents::MESSAGE_CONTENT
-        | serenity::GatewayIntents::GUILD_VOICE_STATES;
-
+/// Define framework options for command functionality
+pub fn define_command_options(options: &mut poise::FrameworkOptions<Data, anyhow::Error>) {
     let commands = vec![
         toggle(),
         set(),
@@ -650,71 +559,22 @@ pub async fn init_discord(
         start_timer(),
         stop_timer(),
         set_audible_runner(),
+        set_custom_field(),
     ];
 
-    let options = poise::FrameworkOptions::<Data, anyhow::Error> {
-        commands,
-        command_check: Some(|ctx| {
-            Box::pin(async move {
-                if !check_channel(&ctx).await? {
-                    Ok(false)
-                } else {
-                    Ok(true)
-                }
-            })
-        }),
-        prefix_options: poise::PrefixFrameworkOptions {
-            prefix: Some("/".into()),
-            edit_tracker: None,
-            ..Default::default()
-        },
-        event_handler: |ctx, event, _framework, data| {
-            Box::pin(async move {
-                if let serenity::FullEvent::VoiceStateUpdate { old, new } = event {
-                    handle_voice_state_event(ctx, old, new, data).await;
-                }
-
-                Ok(())
-            })
-        },
+    options.commands = commands;
+    options.command_check = Some(|ctx| {
+        Box::pin(async move {
+            if !check_channel(&ctx).await? {
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        })
+    });
+    options.prefix_options = poise::PrefixFrameworkOptions {
+        prefix: Some("/".into()),
+        edit_tracker: None,
         ..Default::default()
     };
-
-    let token = settings.discord_token.clone().unwrap();
-    let framework = poise::Framework::<Data, anyhow::Error>::builder()
-        .options(options)
-        .setup(move |ctx, ready, framework| {
-            Box::pin(async move {
-                log::info!("Logged in as {}", ready.user.name);
-                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                for (host_name, host) in &settings.obs_hosts {
-                    if host.enable_voice.unwrap_or(false) {
-                        connect_to_voice(
-                            ctx,
-                            directory.clone(),
-                            db.clone(),
-                            settings.clone(),
-                            host_name,
-                        )
-                        .await?;
-                    }
-                }
-                Ok(Data {
-                    name: ready.user.name.clone(),
-                    db,
-                    settings,
-                    directory,
-                })
-            })
-        })
-        .build();
-
-    let mut client = serenity::Client::builder(token, intents)
-        .framework(framework)
-        .register_songbird_from_config(songbird_config)
-        .await?;
-
-    client.start().await?;
-
-    Ok(())
 }

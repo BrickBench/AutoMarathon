@@ -11,7 +11,7 @@ use crate::{
     },
     integrations::{
         obs::{HostCommand, ObsHostState},
-        therun::Run,
+        therun::{determine_live_win_probability, HeadToHead, Probabilities, Run},
     },
     send_message, ActorRef, Directory, Rto,
 };
@@ -19,14 +19,18 @@ use crate::{
 use super::filters::{with_db, with_directory};
 
 pub enum WebCommand {
-    SendStateUpdate,
-    SendVoiceUpdate(VoiceUpdate),
+    /// Send a project state update.
+    TriggerStateUpdate,
+    /// Send a voice update.
+    SendVoiceState(VoiceState),
+    /// Send a live splits update for the provided runner.
+    SendLiveSplitUpdate(i64),
 }
 
 pub type WebActor = ActorRef<WebCommand>;
 
 /// Struct for the elements project state that are
-/// sent over the main state endpoint
+/// sent over the main state endpoint.
 #[derive(Serialize, Clone, Debug)]
 struct StateUpdate {
     streams: Vec<StreamState>,
@@ -52,7 +56,7 @@ pub struct ParticipantVoiceState {
 
 /// Data for voice data in the last 20ms.
 #[derive(Serialize, Debug, Clone)]
-pub struct VoiceUpdate {
+pub struct VoiceState {
     /// The host this voice channel is associated with
     pub host: String,
     /// Map of Discord ID to voice state
@@ -66,10 +70,23 @@ pub struct EditorClaim {
     editor: Option<String>,
 }
 
+#[derive(Serialize, Debug, Clone)]
+pub struct StreamProbability {
+    win_probabilities: HashMap<i64, f64>,
+    h2h: Vec<HeadToHead>,
+}
+
+/// Struct for live splits information from TheRun.gg
+#[derive(Serialize, Debug, Clone)]
+pub struct LiveSplitUpdate {
+    active_runs: HashMap<i64, Run>,
+    win_probabilities: HashMap<i64, StreamProbability>,
+}
+
 /// Run a voice websocket for a single client
 async fn run_voice_websocket(
     socket: warp::ws::WebSocket,
-    mut voice_rx: broadcast::Receiver<VoiceUpdate>,
+    mut voice_rx: broadcast::Receiver<VoiceState>,
 ) {
     log::debug!("New voice websocket connection opened");
     let (mut tx, _) = socket.split();
@@ -81,6 +98,100 @@ async fn run_voice_websocket(
             }
         } else {
             log::error!("Failed to voice state update");
+            break;
+        }
+    }
+}
+
+fn to_stream_probability(runner_idx: &[i64], probs: Probabilities) -> StreamProbability {
+    let mut win_probs = HashMap::new();
+    for (idx, prob) in runner_idx.iter().zip(probs.probabilities.iter()) {
+        win_probs.insert(*idx, *prob);
+    }
+
+    let mut h2h_vec = vec![];
+    for h2h in probs.h2h.iter() {
+        h2h_vec.push(HeadToHead {
+            run1: *runner_idx.get(h2h.run1 as usize).unwrap_or(&-1),
+            run2: *runner_idx.get(h2h.run2 as usize).unwrap_or(&-1),
+            probability: h2h.probability,
+        });
+    }
+
+    StreamProbability {
+        win_probabilities: win_probs,
+        h2h: h2h_vec,
+    }
+}
+
+async fn assemble_win_probability_map(db: &ProjectDb) -> HashMap<i64, StreamProbability> {
+    let streams = db.get_streamed_events().await.unwrap_or_default();
+    let mut results = HashMap::new();
+
+    for stream in streams {
+        let event = db.get_event(stream).await.unwrap();
+        let mut runs = vec![];
+        for runner in event.runner_state.keys() {
+            if let Ok(run) = db.get_runner_run_data(*runner).await {
+                runs.push((runner, run));
+            }
+        }
+
+        let probs =
+            determine_live_win_probability(&runs.iter().map(|(_, run)| run).collect::<Vec<&Run>>());
+
+        if let Some(probs) = probs {
+            let indices: Vec<i64> = runs.iter().map(|(r, _)| **r).collect();
+            results.insert(event.id, to_stream_probability(&indices, probs));
+        }
+    }
+
+    results
+}
+
+async fn assemble_live_splits_map(db: &ProjectDb) -> HashMap<i64, Run> {
+    let mut runs = HashMap::new();
+    let runners = db.get_runners().await.unwrap();
+
+    for runner in &runners {
+        if let Ok(run) = db.get_runner_run_data(runner.participant).await {
+            runs.insert(runner.participant, run);
+        }
+    }
+
+    runs
+}
+
+async fn run_live_splits_websocket(
+    db: Arc<ProjectDb>,
+    socket: warp::ws::WebSocket,
+    mut state_rx: broadcast::Receiver<LiveSplitUpdate>,
+) {
+    let (mut tx, _) = socket.split();
+    log::debug!("New live splits websocket connection opened");
+
+    // Send initial request
+    if let Err(e) = tx
+        .send(warp::ws::Message::text(
+            serde_json::to_string(&LiveSplitUpdate {
+                active_runs: assemble_live_splits_map(&db).await.clone(),
+                win_probabilities: assemble_win_probability_map(&db).await,
+            })
+            .unwrap(),
+        ))
+        .await
+    {
+        log::error!("Failed to send initial live splits update: {}", e);
+    }
+
+    while let Ok(update) = state_rx.recv().await {
+        if let Err(e) = tx
+            .send(warp::ws::Message::text(
+                serde_json::to_string(&update).unwrap(),
+            ))
+            .await
+        {
+            log::error!("Failed to send live splits update: {}", e);
             break;
         }
     }
@@ -103,6 +214,7 @@ async fn run_state_websocket(
 
     match assemble_state_update(db, &directory).await {
         Ok(update) => {
+            log::debug!("Assembled initial state update");
             if let Err(e) = tx
                 .send(warp::ws::Message::text(
                     serde_json::to_string(&update).unwrap(),
@@ -284,13 +396,13 @@ pub fn websocket_filters(
             },
         );
 
-    let (voice_update_tx, _) = tokio::sync::broadcast::channel::<VoiceUpdate>(256);
+    let (voice_update_tx, _) = tokio::sync::broadcast::channel::<VoiceState>(256);
     let voice_reader_tx = voice_update_tx.clone();
     let voice_socket = warp::path!("ws" / "voice")
         .and(warp::ws())
         .and(warp::any().map(move || voice_update_tx.subscribe()))
         .map(
-            |ws: warp::ws::Ws, state_rx: broadcast::Receiver<VoiceUpdate>| {
+            |ws: warp::ws::Ws, state_rx: broadcast::Receiver<VoiceState>| {
                 ws.on_upgrade(move |socket| run_voice_websocket(socket, state_rx))
             },
         );
@@ -313,10 +425,25 @@ pub fn websocket_filters(
             },
         );
 
+    let (live_runs_update_tx, _) = tokio::sync::broadcast::channel::<LiveSplitUpdate>(256);
+    let runs_reader_tx = live_runs_update_tx.clone();
+    let runs_socket = warp::path!("ws" / "runs")
+        .and(with_db(db.clone()))
+        .and(warp::ws())
+        .and(warp::any().map(move || live_runs_update_tx.subscribe()))
+        .map(
+            |db: Arc<ProjectDb>,
+             ws: warp::ws::Ws,
+             state_rx: broadcast::Receiver<LiveSplitUpdate>| {
+                ws.on_upgrade(move |socket| run_live_splits_websocket(db, socket, state_rx))
+            },
+        );
+
     tokio::spawn(async move {
+        let mut runs = assemble_live_splits_map(&db).await;
         loop {
             match rx.recv().await.unwrap() {
-                WebCommand::SendStateUpdate => {
+                WebCommand::TriggerStateUpdate => {
                     match assemble_state_update(db.clone(), &directory).await {
                         Ok(update) => {
                             let _ = state_reader_tx.send(update);
@@ -326,12 +453,25 @@ pub fn websocket_filters(
                         }
                     }
                 }
-                WebCommand::SendVoiceUpdate(voice_update) => {
+                WebCommand::SendVoiceState(voice_update) => {
                     let _ = voice_reader_tx.send(voice_update);
+                }
+                WebCommand::SendLiveSplitUpdate(request) => {
+                    if let Ok(run) = db.get_runner_run_data(request).await {
+                        runs.insert(request, run);
+                    }
+
+                    let _ = runs_reader_tx.send(LiveSplitUpdate {
+                        active_runs: runs.clone(),
+                        win_probabilities: assemble_win_probability_map(&db).await,
+                    });
                 }
             }
         }
     });
 
-    editor_socket.or(voice_socket).or(state_socket)
+    editor_socket
+        .or(runs_socket)
+        .or(state_socket)
+        .or(voice_socket)
 }

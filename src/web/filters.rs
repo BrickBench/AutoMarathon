@@ -271,14 +271,11 @@ pub fn api_filters(
             },
         );
 
-    let dashboard = warp::path::end().and(warp::fs::dir("web/"));
-
     get_hosts
         .or(set_streaming_state)
         .or(create_field)
         .or(update_field)
         .or(delete_field)
-        .or(dashboard)
         .or(set_discord_volume)
         .or(participant_filters(db.clone()))
         .or(runner_filters(directory.clone()))

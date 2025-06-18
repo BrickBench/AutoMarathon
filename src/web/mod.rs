@@ -1,7 +1,7 @@
 use crate::core::settings::Settings;
 use std::{convert::Infallible, sync::Arc};
 
-use dashboard::{websocket_filters, WebCommand};
+use streams::{websocket_filters, WebCommand};
 use filters::api_filters;
 use tokio::sync::mpsc::UnboundedReceiver;
 use warp::{
@@ -13,7 +13,7 @@ use warp::{
 
 use crate::{core::db::ProjectDb, Directory};
 
-pub mod dashboard;
+pub mod streams;
 pub mod filters;
 pub mod handlers;
 
@@ -31,6 +31,8 @@ async fn handle_rejection(err: Rejection) -> Result<impl warp::Reply, Infallible
     } else if let Some(err) = err.find::<warp::reject::InvalidQuery>() {
         log::error!("Invalid Query: {}", err);
         (warp::http::StatusCode::BAD_REQUEST, err.to_string())
+    } else if err.is_not_found() {
+        (warp::http::StatusCode::NOT_FOUND, "Not Found".to_string())
     } else {
         log::error!("Unhandled Rejection: {:?}", err);
         (
@@ -73,7 +75,17 @@ fn asset_to_filter(path: &str, asset: &vite_rs::ViteFile) -> BoxedFilter<(impl w
     let path_parts = path.split('/').collect::<Vec<_>>();
     assert!(path_parts.len() <= 2);
 
-    if path_parts.len() == 2 {
+    if path == "index.html" {
+        return warp::path::end()
+            .map(move || {
+                Response::builder()
+                    .header("Content-Type", asset.content_type)
+                    .header("Content-Length", asset.content_length)
+                    .body(asset.bytes.clone())
+                    .unwrap()
+            })
+            .boxed();
+    } else if path_parts.len() == 2 {
         warp::path(path_parts[0].to_string())
             .and(warp::path(path_parts[1].to_string()))
             .and(warp::path::end())
@@ -111,23 +123,16 @@ pub async fn run_http_server(
     let assets: Vec<(String, ViteFile)> = Assets::iter()
         .map(|asset| (asset.to_string(), Assets::get(&asset).unwrap()))
         .collect();
-    /*
-    let dashboard_routes = assets
-        .into_iter()
-        .map(|(path, asset)| asset_to_filter(&path, &asset))
-        .fold(warp::any().map(warp::reply).boxed(), |routes, route| {
-            routes.or(route).unify().boxed()
-        }); */
 
     let dashboard_routes = asset_to_filter(assets[0].0.as_str(), &assets[0].1)
         .or(asset_to_filter(assets[1].0.as_str(), &assets[1].1))
         .or(asset_to_filter(assets[2].0.as_str(), &assets[2].1))
         .or(asset_to_filter(assets[3].0.as_str(), &assets[3].1));
+    //.or(warp::path::end().map(|| warp::redirect::permanent(Uri::from_static("/index.html"))));
 
     let routes = api_filters(db.clone(), directory.clone())
         .or(websocket_filters(db, directory, rx))
         .or(dashboard_routes)
-        .or(warp::path::end().map(|| warp::redirect(Uri::from_static("/index.html"))))
         .recover(handle_rejection);
 
     warp::serve(routes.with(get_cors_settings()))

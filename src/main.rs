@@ -5,7 +5,7 @@ use core::{
 use integrations::therun::{run_therun_actor, TheRunActor};
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::{env::consts, fs::read_to_string, path::PathBuf, sync::Arc};
-use web::{dashboard::WebActor, run_http_server};
+use web::{run_http_server, streams::WebActor};
 
 use anyhow::anyhow;
 use clap::Parser;
@@ -145,6 +145,15 @@ struct Args {
     /// The folder containing the project files.
     #[clap(default_value = "/var/home/javst/Documents/AutoMarathonTest/")]
     project_folder: PathBuf,
+
+    /// The Discord bot token for Automarathon. The resolution order of this token is:
+    /// - this command line argument
+    /// - the environment variable AUTOMARATHON_DISCORD_TOKEN
+    /// - the `discord_token` field in the settings.json file
+    ///
+    /// If none of these are provided, the Discord integration will not be enabled.
+    #[clap(long)]
+    discord_token: Option<String>,
 }
 
 #[tokio::main]
@@ -223,15 +232,22 @@ async fn main() -> anyhow::Result<()> {
         web_rx,
     ));
     tasks.spawn(run_runner_actor(directory.clone(), db.clone(), runner_rx));
-    tasks.spawn(run_therun_actor(db.clone(), therun_tx));
+    tasks.spawn(run_therun_actor(db.clone(), directory.clone(), therun_tx));
 
-    // Spawn integrations
-    if settings.discord_token.is_some() {
+    let discord_token = args
+        .discord_token
+        .or_else(|| std::env::var("AUTOMARATHON_DISCORD_TOKEN").ok())
+        .or_else(|| settings.discord_token.clone());
+
+    if let Some(token) = discord_token {
         tasks.spawn(integrations::discord::init_discord(
+            token,
             settings.clone(),
             db.clone(),
             directory.clone(),
         ));
+    } else {
+        log::info!("Discord integration disabled, no token provided.");
     }
 
     log::info!("AutoMarathon initialized");

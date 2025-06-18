@@ -96,51 +96,37 @@ pub async fn run_stream_manager(
                     log::warn!("{}", msg);
                     rto.reply(Err(anyhow!(msg)));
                 } else if !obs_host_data.as_ref().unwrap().contains_key(&host) {
-                    log::warn!(
+                    let msg = format!(
                         "Host '{}' is not a valid OBS host, cannot create stream for event {}.",
-                        host,
-                        event
+                        host, event
                     );
-                    rto.reply(Err(anyhow!(
-                        "Host '{}' is not a valid OBS host, cannot create stream for event {}.",
-                        host,
-                        event
-                    )));
+                    log::warn!("{}", msg);
+                    rto.reply(Err(anyhow!(msg)));
                 } else if !obs_host_data.unwrap().get(&host).unwrap().connected {
-                    log::warn!(
+                    let msg = format!(
                         "Host '{}' is not connected, cannot create stream for event {}.",
-                        host,
-                        event
+                        host, event
                     );
-                    rto.reply(Err(anyhow!(
-                        "Host '{}' is not connected, cannot create stream for event {}.",
-                        host,
-                        event
-                    )));
+                    log::warn!("{}", msg);
+                    rto.reply(Err(anyhow!(msg)));
                 } else if db
                     .is_host_in_use(&host)
                     .await
                     .expect("Failed to get host usage")
                 {
-                    log::warn!(
+                    let msg = format!(
                         "Host '{}' is already in use, cannot create stream for event {}.",
-                        host,
-                        event
+                        host, event
                     );
-                    rto.reply(Err(anyhow!(
-                        "Host '{}' is already in use, cannot create stream for event {}.",
-                        host,
-                        event
-                    )));
+                    log::warn!("{}", msg);
+                    rto.reply(Err(anyhow!(msg)));
                 } else if (db.get_stream(event).await).is_ok() {
-                    log::warn!(
+                    let msg = format!(
                         "Stream for event {} already exists, cannot create a new stream.",
                         event
                     );
-                    rto.reply(Err(anyhow!(
-                        "Stream for event {} already exists, cannot create a new stream.",
-                        event
-                    )));
+                    log::warn!("{}", msg);
+                    rto.reply(Err(anyhow!(msg)));
                 } else {
                     let state = StreamState {
                         event,
