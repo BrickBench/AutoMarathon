@@ -72,8 +72,6 @@ pub struct VlcSourceBounds {
 pub struct ObsScene {
     /// Scene name
     pub name: String,
-    /// Whether the scene is active and visible
-    pub active: bool,
     /// Sources grouped by runner index
     pub sources: HashMap<usize, Vec<VlcSourceBounds>>,
 }
@@ -102,6 +100,10 @@ pub struct ObsHostState {
     pub streaming: bool,
     /// The frame rate of the stream.
     pub stream_frame_rate: u32,
+    /// The current program scene
+    pub program_scene: String,
+    /// The current preview scene, if studio mode is on.
+    pub preview_scene: Option<String>,
     /// The scenes present in the host by name.
     pub scenes: HashMap<String, ObsScene>,
     /// The discord users present in this host's voice channel.
@@ -111,7 +113,7 @@ pub struct ObsHostState {
 
 /// Requests for ObsActor
 pub enum HostCommand {
-    UpdateState(i64, Vec<ModifiedStreamState>, Rto<()>),
+    UpdateState(i64, Vec<ModifiedStreamState>, bool, Rto<()>),
     GetState(Rto<HashMap<String, ObsHostState>>),
     StartStream(String, Rto<()>),
     EndStream(String, Rto<()>),
@@ -144,7 +146,7 @@ pub async fn run_obs(
 
     loop {
         match rx.recv().await.unwrap() {
-            HostCommand::UpdateState(event, modifications, rto) => {
+            HostCommand::UpdateState(event, modifications, transition, rto) => {
                 match db.get_stream(event).await {
                     Ok(stream) => {
                         if let Err(e) =
@@ -155,8 +157,15 @@ pub async fn run_obs(
                         } else {
                             let obs = host_map.get_mut(&stream.obs_host).unwrap();
                             rto.reply(
-                                update_obs_state(&stream, &db, &settings, &modifications, obs)
-                                    .await,
+                                update_obs_state(
+                                    &stream,
+                                    &db,
+                                    &settings,
+                                    &modifications,
+                                    transition,
+                                    obs,
+                                )
+                                .await,
                             );
                         }
                     }
@@ -253,6 +262,8 @@ async fn get_obs_state(
                 ObsHostState {
                     connected: false,
                     streaming: false,
+                    program_scene: String::new(),
+                    preview_scene: None,
                     stream_frame_rate: 0,
                     scenes: HashMap::new(),
                     discord_users: commentary_map.get(host).unwrap().clone(),
@@ -270,6 +281,8 @@ async fn get_obs_client_info(obs: &obws::Client) -> anyhow::Result<ObsHostState>
     let mut state = ObsHostState {
         connected: true,
         streaming: false,
+        program_scene: String::new(),
+        preview_scene: None,
         stream_frame_rate: 30,
         scenes: HashMap::new(),
         discord_users: HashMap::new(),
@@ -281,12 +294,18 @@ async fn get_obs_client_info(obs: &obws::Client) -> anyhow::Result<ObsHostState>
     state.stream_frame_rate = settings.fps_numerator / settings.fps_denominator;
     state.streaming = obs.streaming().status().await?.active;
 
+    state.program_scene = obs.scenes().current_program_scene().await?.id.name;
+    state.preview_scene = obs
+        .scenes()
+        .current_preview_scene()
+        .await
+        .map(|s| s.id.name)
+        .ok();
+
     let scenes = obs.scenes().list().await?.scenes;
-    let current_scene = obs.scenes().current_program_scene().await?;
     for scene in scenes {
         let mut out_scene = ObsScene {
             name: scene.name.clone(),
-            active: scene.name == current_scene.id.name,
             sources: HashMap::new(),
         };
 
@@ -496,6 +515,7 @@ pub async fn update_obs_state(
     db: &ProjectDb,
     settings: &Settings,
     modifications: &[ModifiedStreamState],
+    apply_transition: bool,
     obs: &obws::Client,
 ) -> anyhow::Result<()> {
     log::debug!("Updating OBS: {:?}", modifications);
@@ -772,17 +792,19 @@ pub async fn update_obs_state(
 
             tokio::time::sleep(Duration::from_millis(200)).await;
 
-            let changing_layout = modifications.contains(&ModifiedStreamState::Layout)
-                && scenes.current_program_scene.unwrap().name != layout.name;
+            let changing_layout = scenes.current_program_scene.unwrap().name != layout.name;
 
             if obs.ui().studio_mode_enabled().await? {
                 obs.scenes()
                     .set_current_preview_scene(target_layout_id)
                     .await?;
-                do_transition(obs, settings, changing_layout).await?;
-                obs.scenes()
-                    .set_current_preview_scene(target_layout_id)
-                    .await?;
+
+                if apply_transition {
+                    do_transition(obs, settings, changing_layout).await?;
+                    obs.scenes()
+                        .set_current_preview_scene(target_layout_id)
+                        .await?;
+                }
             } else if changing_layout {
                 log::debug!("Activating new layout: {}", layout.name);
                 obs.scenes()

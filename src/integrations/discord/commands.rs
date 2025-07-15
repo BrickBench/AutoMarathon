@@ -187,7 +187,8 @@ async fn toggle(
         &context.data().directory.stream_actor,
         StreamRequest,
         Update,
-        stream
+        stream,
+        true
     )?;
 
     send_success_reply(&context).await
@@ -271,7 +272,8 @@ async fn swap(
         &context.data().directory.stream_actor,
         StreamRequest,
         Update,
-        stream
+        stream,
+        true
     )?;
 
     send_success_reply(&context).await
@@ -302,7 +304,8 @@ async fn layout(
         &context.data().directory.stream_actor,
         StreamRequest,
         Update,
-        stream
+        stream,
+        true
     )?;
     send_success_reply(&context).await
 }
@@ -348,7 +351,8 @@ async fn set(
         &context.data().directory.stream_actor,
         StreamRequest,
         Update,
-        stream
+        stream,
+        true
     )?;
 
     send_success_reply(&context).await
@@ -539,7 +543,8 @@ async fn set_audible_runner(
         &context.data().directory.stream_actor,
         StreamRequest,
         Update,
-        stream
+        stream,
+        true
     )?;
     send_success_reply(&context).await
 }

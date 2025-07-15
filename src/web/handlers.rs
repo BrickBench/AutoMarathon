@@ -158,6 +158,7 @@ pub async fn refresh_runner(
 }
 pub async fn create_stream(
     stream: StreamState,
+    do_transition: bool,
     directory: Directory,
 ) -> Result<impl warp::Reply, Infallible> {
     let message = send_message!(
@@ -175,7 +176,8 @@ pub async fn create_stream(
             directory.stream_actor,
             StreamRequest,
             Update,
-            stream
+            stream,
+            do_transition
         ))
     }
 }

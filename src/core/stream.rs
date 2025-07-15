@@ -30,7 +30,7 @@ pub struct StreamState {
 pub enum StreamRequest {
     Create(i64, String, Rto<()>),
     Reload(i64, Rto<()>),
-    Update(StreamState, Rto<()>),
+    Update(StreamState, bool, Rto<()>),
     Delete(i64, Rto<()>),
 }
 
@@ -145,44 +145,48 @@ pub async fn run_stream_manager(
                     }
                 }
             }
-            StreamRequest::Update(new_stream, rto) => match db.get_stream(new_stream.event).await {
-                Ok(stream) => {
-                    let _bad_runners = new_stream.trigger_refreshes(&stream, &directory).await;
-                    let diffs = new_stream.determine_modified_state(&stream);
-                    db.save_stream(&new_stream).await?;
+            StreamRequest::Update(new_stream, transition, rto) => {
+                match db.get_stream(new_stream.event).await {
+                    Ok(stream) => {
+                        let _bad_runners = new_stream.trigger_refreshes(&stream, &directory).await;
+                        let diffs = new_stream.determine_modified_state(&stream);
+                        db.save_stream(&new_stream).await?;
 
-                    let worked = send_message!(
-                        directory.obs_actor,
-                        HostCommand,
-                        UpdateState,
-                        new_stream.event,
-                        diffs
-                    );
-
-                    if worked.is_err() {
-                        log::warn!(
-                            "Failed to update OBS state for event {}: {:?}",
+                        let worked = send_message!(
+                            directory.obs_actor,
+                            HostCommand,
+                            UpdateState,
                             new_stream.event,
-                            worked
+                            diffs,
+                            transition
                         );
-                    }
 
-                    rto.reply(worked);
+                        if worked.is_err() {
+                            log::warn!(
+                                "Failed to update OBS state for event {}: {:?}",
+                                new_stream.event,
+                                worked
+                            );
+                        }
+
+                        rto.reply(worked);
+                    }
+                    Err(e) => {
+                        rto.reply(Err(anyhow!(
+                            "No stream found for event '{}': {:?}.",
+                            new_stream.event,
+                            e
+                        )));
+                    }
                 }
-                Err(e) => {
-                    rto.reply(Err(anyhow!(
-                        "No stream found for event '{}': {:?}.",
-                        new_stream.event,
-                        e
-                    )));
-                }
-            },
+            }
             StreamRequest::Reload(stream, rto) => rto.reply(send_message!(
                 directory.obs_actor,
                 HostCommand,
                 UpdateState,
                 stream,
-                Vec::<ModifiedStreamState>::new()
+                Vec::<ModifiedStreamState>::new(),
+                true
             )),
             StreamRequest::Delete(event, rto) => {
                 rto.reply(db.delete_stream(event).await);

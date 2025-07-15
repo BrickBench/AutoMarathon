@@ -1,5 +1,6 @@
 use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
+use serde::Deserialize;
 use warp::{reject::Rejection, Filter};
 
 use crate::{
@@ -18,6 +19,11 @@ use super::handlers::{
     create_stream, get_event, refresh_runner, set_streaming_state, to_http_none_or_error,
     to_http_output, Id, NewField, SetDiscordUserVolume, UpdateField,
 };
+
+#[derive(Deserialize, Debug)]
+pub struct TransitionToggle {
+    transition: Option<bool>,
+}
 
 pub fn with_db(
     db: Arc<ProjectDb>,
@@ -178,22 +184,31 @@ fn stream_filters(
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     let create_stream = warp::path!("stream")
         .and(warp::post())
+        .and(warp::query::<TransitionToggle>())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
-        .and_then(create_stream);
+        .and_then(
+            async |transition: TransitionToggle, stream: StreamState, directory: Directory| {
+                create_stream(stream, transition.transition.unwrap_or(true), directory).await
+            },
+        );
 
     let update_stream = warp::path!("stream")
         .and(warp::put())
+        .and(warp::query::<TransitionToggle>())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
-        .and_then(async |stream: StreamState, directory: Directory| {
-            to_http_none_or_error(send_message!(
-                directory.stream_actor,
-                StreamRequest,
-                Update,
-                stream
-            ))
-        });
+        .and_then(
+            async |transition: TransitionToggle, stream: StreamState, directory: Directory| {
+                to_http_none_or_error(send_message!(
+                    directory.stream_actor,
+                    StreamRequest,
+                    Update,
+                    stream,
+                    transition.transition.unwrap_or(true)
+                ))
+            },
+        );
 
     let delete_stream = warp::path!("stream")
         .and(warp::delete())
