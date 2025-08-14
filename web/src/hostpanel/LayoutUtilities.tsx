@@ -2,8 +2,11 @@ import { formUrl } from "../Api";
 import { Event, StreamEntry, StreamHost, StreamRunnersEntry } from "../websocket";
 
 export function getSelectedLayout(host: StreamHost) {
-  let s = Object.entries(host.scenes).find(([_, scene]) => scene.active);
-  return s ? s[0] : "";
+  if (host.preview_scene) {
+    return host.preview_scene;
+  } 
+
+  return host.program_scene;
 }
 
 export function getStreamForHost(streams: StreamEntry[], selected_host: string) {

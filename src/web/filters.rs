@@ -20,11 +20,6 @@ use super::handlers::{
     to_http_output, Id, NewField, SetDiscordUserVolume, UpdateField,
 };
 
-#[derive(Deserialize, Debug)]
-pub struct TransitionToggle {
-    transition: Option<bool>,
-}
-
 pub fn with_db(
     db: Arc<ProjectDb>,
 ) -> impl Filter<Extract = (Arc<ProjectDb>,), Error = Infallible> + Clone {
@@ -184,31 +179,25 @@ fn stream_filters(
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     let create_stream = warp::path!("stream")
         .and(warp::post())
-        .and(warp::query::<TransitionToggle>())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
-        .and_then(
-            async |transition: TransitionToggle, stream: StreamState, directory: Directory| {
-                create_stream(stream, transition.transition.unwrap_or(true), directory).await
-            },
-        );
+        .and_then(async |stream: StreamState, directory: Directory| {
+            create_stream(stream, false, directory).await
+        });
 
     let update_stream = warp::path!("stream")
         .and(warp::put())
-        .and(warp::query::<TransitionToggle>())
         .and(warp::body::json())
         .and(with_directory(directory.clone()))
-        .and_then(
-            async |transition: TransitionToggle, stream: StreamState, directory: Directory| {
-                to_http_none_or_error(send_message!(
-                    directory.stream_actor,
-                    StreamRequest,
-                    Update,
-                    stream,
-                    transition.transition.unwrap_or(true)
-                ))
-            },
-        );
+        .and_then(async |stream: StreamState, directory: Directory| {
+            to_http_none_or_error(send_message!(
+                directory.stream_actor,
+                StreamRequest,
+                Update,
+                stream,
+                false
+            ))
+        });
 
     let delete_stream = warp::path!("stream")
         .and(warp::delete())

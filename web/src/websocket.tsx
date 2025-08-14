@@ -82,6 +82,8 @@ export interface StreamHost {
     connected: boolean;
     streaming: boolean;
     stream_frame_rate: number;
+    program_scene: string;
+    preview_scene?: string;
     scenes: {
         [key: string]: StreamScene;
     };
