@@ -9,7 +9,11 @@ use crate::{
     error::Error, integrations::therun::TheRunCommand, send_nonblocking, ActorRef, Directory, Rto,
 };
 
-use super::{db::ProjectDb, participant::Participant};
+use super::{
+    db::ProjectDb,
+    participant::Participant,
+    settings::{self, Settings},
+};
 
 pub enum RunnerRequest {
     Create(Runner, Rto<()>),
@@ -21,6 +25,7 @@ pub enum RunnerRequest {
 pub async fn run_runner_actor(
     directory: Directory,
     db: Arc<ProjectDb>,
+    settings: Arc<Settings>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<RunnerRequest>,
 ) -> anyhow::Result<()> {
     // Add all existing runners to TheRun.gg poller.
@@ -99,7 +104,7 @@ pub async fn run_runner_actor(
                 }
             }
             RunnerRequest::RefreshStream(runner, rto) => match db.get_runner(runner).await {
-                Ok(mut runner) => match runner.find_and_save_stream(&db).await {
+                Ok(mut runner) => match runner.find_and_save_stream(&db, &settings).await {
                     Ok(changed) => rto.reply(Ok(changed)),
                     Err(e) => rto.reply(Err(e)),
                 },
@@ -195,8 +200,14 @@ impl Runner {
 
     /// Returns a .m3u8 link corresponding to the current players' stream.
     /// Returns if the link changed.
-    pub fn find_stream(&mut self) -> anyhow::Result<bool> {
-        let output = process::Command::new("streamlink")
+    pub fn find_stream(&mut self, settings: &Settings) -> anyhow::Result<bool> {
+        let mut command = process::Command::new("streamlink");
+
+        if let Some(twitch_key) = &settings.twitch_client_id {
+            command.arg("--twitch-api-header=Authorization=OAuth ".to_owned() + twitch_key);
+        }
+
+        let output = command
             .arg("-j")
             .arg(self.get_stream())
             .output()
@@ -236,8 +247,12 @@ impl Runner {
 
     /// Update the stream link in the database for this player.
     /// Returns if the link changed.
-    async fn find_and_save_stream(&mut self, db: &ProjectDb) -> anyhow::Result<bool> {
-        match self.find_stream() {
+    async fn find_and_save_stream(
+        &mut self,
+        db: &ProjectDb,
+        settings: &Settings,
+    ) -> anyhow::Result<bool> {
+        match self.find_stream(settings) {
             Ok(changed) => {
                 if changed {
                     log::info!("Updating stream url for {}", self.participant_data.name);

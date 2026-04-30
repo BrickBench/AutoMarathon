@@ -191,7 +191,7 @@ async fn run_live_splits_websocket(
             ))
             .await
         {
-            log::error!("Failed to send live splits update: {}", e);
+            // log::error!("Failed to send live splits update: {}", e); // spam
             break;
         }
     }
@@ -232,7 +232,7 @@ async fn run_state_websocket(
     while let Ok(update) = state_rx.recv().await {
         if let Ok(update) = serde_json::to_string(&update) {
             if let Err(e) = tx.send(warp::ws::Message::text(update)).await {
-                log::error!("Failed to send state update: {}", e);
+                // log::error!("Failed to send state update: {}", e); // spam
                 break;
             }
         } else {

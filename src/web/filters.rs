@@ -195,7 +195,7 @@ fn stream_filters(
                 StreamRequest,
                 Update,
                 stream,
-                false
+                true
             ))
         });
 

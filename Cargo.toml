@@ -19,7 +19,7 @@ tokio = { version = "1.21.2", features = ["full"] }
 tokio-tungstenite = { version = "0.26.2", features = ["rustls"]}
 tokio-stream = { version = "0.1.17", features = ["sync"]}
 futures = "0.3.24"
-obws = "0.12.0"
+obws = "0.15.0"
 reqwest = { version = "0.11", features = ["json"]}
 rustls = { version = "0.23.0", default-features = true }
 url = "2.4"

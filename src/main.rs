@@ -231,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
         settings.clone(),
         web_rx,
     ));
-    tasks.spawn(run_runner_actor(directory.clone(), db.clone(), runner_rx));
+    tasks.spawn(run_runner_actor(directory.clone(), db.clone(), settings.clone(), runner_rx));
     tasks.spawn(run_therun_actor(db.clone(), directory.clone(), therun_tx));
 
     let discord_token = args

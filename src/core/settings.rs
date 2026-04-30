@@ -24,6 +24,12 @@ pub struct Settings {
     pub therun_delay: Option<f64>,
     /// Whether to calculate the discrete Fourier transform per-user for display purposes.
     pub transmit_voice_dft: Option<bool>,
+    /// Twitch key for no-ads authentication.
+    pub twitch_client_id: Option<String>,
+    /// Whether to put sources on top or on the bottom of the layout
+    pub put_sources_on_top: Option<bool>,
+    /// Use native OBS media sources instead of VLC sources
+    pub use_obs_media_sources: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
