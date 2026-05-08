@@ -194,6 +194,15 @@ export function SplitsEditorWidget({liveRunState, runners, people, currentEvent}
                     <Button onClick={()=>{
                         setSplitsState(fillOverrideFromLive(selectedPlayerLiveRunData, [...splitsState]));
                     }}>Fill Overrides from Live</Button>
+                    <Button variant={"danger"} onClick={()=>{
+                        var splits = runnerEventData ? runnerEventData.SplitTimes.splits.map((e)=>{
+                            return null;
+                        }) : [];
+                        let confirm = prompt("Are you sure you want to clear? If so, type \"Clear\" into the box and press \"Push Changes\" on the widget.");
+                        if(confirm?.toLowerCase().replace("\"","").replace("'","") == "clear"){
+                            setSplitsState(splits);
+                        }
+                    }}>Clear Data</Button>
                 </ButtonGroup>
             </Row>
             <div style={{ height: '300px', overflowY: 'auto' }}>
