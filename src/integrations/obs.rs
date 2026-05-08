@@ -640,6 +640,11 @@ pub async fn update_obs_state(
 
     match get_layout(event, state, &obs_state) {
         Some(layout) => {
+            let studio_mode_before = obs.ui().studio_mode_enabled().await?;
+            if settings.auto_studio_mode.unwrap_or(false) && !studio_mode_before {
+                obs.ui().set_studio_mode_enabled(true).await?;
+            }
+
             let target_layout_id = SceneId::Name(&layout.name);
 
             if scenes.scenes.iter().all(|s| s.id.name != layout.name) {
@@ -834,6 +839,10 @@ pub async fn update_obs_state(
                 obs.scenes()
                     .set_current_program_scene(target_layout_id)
                     .await?;
+            }
+
+            if settings.auto_studio_mode.unwrap_or(false) && !studio_mode_before {
+                obs.ui().set_studio_mode_enabled(false).await?;
             }
 
             log::debug!("OBS update complete");

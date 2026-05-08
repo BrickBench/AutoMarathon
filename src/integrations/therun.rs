@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 use url::Url;
 
 use crate::{
-    core::{db::ProjectDb, runner::Runner},
+    core::{db::ProjectDb, event::EventResult, runner::Runner},
     web::streams::WebCommand,
     ActorRef, Directory, Rto,
 };
@@ -64,6 +64,87 @@ pub type TheRunActor = ActorRef<TheRunCommand>;
 /// A list of TheRun.gg users who are to be polled
 type LiveRunners = Arc<tokio::sync::Mutex<Vec<i64>>>;
 
+pub async fn process_therun_data(
+    db: &ProjectDb,
+    directory: &Directory,
+    runner_id: i64,
+    data: &Run,
+) -> anyhow::Result<()> {
+    match db.set_runner_run_data(runner_id, data).await {
+        Ok(_) => {}
+        Err(e) => log::error!("Failed to update runner {}'s run data: {}", runner_id, e),
+    };
+
+    directory
+        .web_actor
+        .send(WebCommand::SendLiveSplitUpdate(runner_id));
+
+    let runner = db.get_runner(runner_id).await?;
+    if !runner.use_live_data {
+        return Ok(());
+    }
+
+    let events = db.get_event_ids_for_runner(runner_id).await?;
+    let streams = db.get_streamed_events().await?;
+
+    for event in events {
+        if streams.contains(&event) {
+            let mut event = db.get_event(event).await?;
+
+            if event.timer_start_time.is_none() {
+                continue;
+            }
+
+            let result = event
+                .runner_state
+                .get(&runner_id)
+                .and_then(|state| state.result.as_ref());
+            if let Some(sqlx::types::Json(EventResult::SplitTimes {
+                splits,
+                final_result,
+            })) = result
+            {
+                let mut split_updated = false;
+                let mut new_splits = splits.clone();
+                for (i, split) in data.splits.iter().enumerate() {
+                    if i < new_splits.len() && new_splits[i].is_none() {
+                        split_updated = true;
+                        new_splits[i] = split.split_time;
+                    }
+                }
+
+                if !split_updated {
+                    return Ok(());
+                }
+
+                let new_result = EventResult::SplitTimes {
+                    final_result: final_result.clone(),
+                    splits: new_splits,
+                };
+
+                event.runner_state.insert(
+                    runner_id,
+                    crate::core::event::RunnerEventState {
+                        runner: runner_id,
+                        result: Some(sqlx::types::Json(new_result)),
+                    },
+                );
+
+                db.update_event(&event, true).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn query_therun_state_for_username(username: &str) -> anyhow::Result<Run> {
+    let resp = reqwest::get(format!("https://therun.gg/api/live/{}", username)).await?;
+
+    let run = resp.json::<Run>().await?;
+
+    Ok(run)
+}
 /// Worker to manage TheRun.gg connections
 pub async fn run_therun_actor(
     db: Arc<ProjectDb>,
@@ -125,29 +206,20 @@ async fn create_therun_websocket_monitor(
         therun
     );
 
-    if let Ok(resp) = reqwest::get(format!("https://therun.gg/api/live/{}", therun)).await {
-        match resp.json::<Run>().await {
-            Ok(run) => {
-                match db.set_runner_run_data(runner, &run).await {
-                    Ok(_) => {}
-                    Err(e) => log::error!("Failed to update runner {}'s run data: {}", runner, e),
-                };
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to parse initial state for {} ({}) from TheRun.gg: {}",
-                    runner,
-                    therun,
-                    e
-                );
+    match query_therun_state_for_username(&therun).await {
+        Ok(run) => {
+            if let Err(e) = process_therun_data(&db, &directory, runner, &run).await {
+                log::error!("Failed to process TheRun.gg data for {}: {}", runner, e);
             }
         }
-    } else {
-        log::warn!(
-            "Failed to fetch initial state for {} ({}) from TheRun.gg, will retry later",
-            runner,
-            therun
-        );
+        Err(e) => {
+            log::warn!(
+                "Failed to aquire initial state for {} ({}) from TheRun.gg: {}",
+                runner,
+                therun,
+                e
+            );
+        }
     }
 
     loop {
@@ -239,13 +311,10 @@ async fn run_runner_websocket(
                         ) {
                             Ok(stats) => {
                                 log::debug!("Received TheRun.gg data for {}", runner);
+                                if let Err(e) = process_therun_data(&db, &directory, runner, &stats.run).await {
+                                    log::error!("Failed to process TheRun.gg data for {}: {}", runner, e);
+                                }
 
-                                match db.set_runner_run_data(runner, &stats.run).await {
-                                    Ok(_) => {}
-                                    Err(e) => log::error!("Failed to update runner {}'s run data: {}", runner, e),
-                                };
-
-                                directory.web_actor.send(WebCommand::SendLiveSplitUpdate(runner));
                             }
                             Err(err) => {
                                 log::debug!("Failed to parse {} endpoint: {}", runner, err.to_string());

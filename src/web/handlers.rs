@@ -4,21 +4,24 @@ use serde::{Deserialize, Serialize};
 use warp::reply::WithStatus;
 
 use crate::{
-    core::{
+    Directory, Rto, core::{
         db::ProjectDb,
         event::Event,
         runner::RunnerRequest,
-        settings::Settings,
         stream::{StreamRequest, StreamState},
-    },
-    integrations::obs::HostCommand,
-    send_message, Directory, Rto,
+    }, integrations::{obs::HostCommand, therun::{process_therun_data, query_therun_state_for_username}}, send_message
 };
 
 /// A Json struct to store an event/runner ID
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Id {
     pub id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StreamRedirect {
+    pub host: String,
+    pub slot: i64,
 }
 
 /// A Json struct to store values for a new custom field
@@ -218,13 +221,37 @@ impl warp::Reply for RedirectOrString {
     }
 }
 
-pub async fn get_stream_redirect(
-    host: Id,
-    slot: Id,
+pub async fn request_therun_data(
+    runner_id: Id,
     db: Arc<ProjectDb>,
-    settings: Arc<Settings>,
+    directory: Directory,
 ) -> Result<impl warp::Reply, Infallible> {
-    let stream_id = db.get_event_by_obs_host(&host.id.to_string()).await;
+    let runner = db.get_runner(runner_id.id).await;
+    if runner.is_err() {
+        return to_http_none_or_error(Err(anyhow::anyhow!("Failed to find runner")));
+    }
+
+    let runner = runner.unwrap();
+    let therun_id = runner.get_therun_username();
+    if therun_id.is_none() {
+        return to_http_none_or_error(Err(anyhow::anyhow!(
+            "Runner does not have a therun username"
+        )));
+    }
+
+    let new_data = query_therun_state_for_username(&therun_id.unwrap()).await;
+    if let Ok(new_data) = new_data {
+        to_http_none_or_error(process_therun_data(&db,& directory, runner_id.id, &new_data).await)
+    } else {
+        to_http_none_or_error(Err(anyhow::anyhow!("Failed to get data from therun")))
+    }
+}
+
+pub async fn get_stream_redirect(
+    redirect: StreamRedirect,
+    db: Arc<ProjectDb>,
+) -> Result<impl warp::Reply, Infallible> {
+    let stream_id = db.get_event_by_obs_host(&redirect.host).await;
     if stream_id.is_err() {
         return Ok(RedirectOrString::String(warp::reply::with_status(
             "Failed to find stream for host".to_string(),
@@ -239,8 +266,7 @@ pub async fn get_stream_redirect(
         )));
     }
 
-    let stream = stream.unwrap();
-    let slot = stream.get_runner_in_slot(slot.id);
+    let slot = stream.unwrap().get_runner_in_slot(redirect.slot);
     if slot.is_none() {
         return Ok(RedirectOrString::String(warp::reply::with_status(
             "Failed to find runner in specified slot".to_string(),
@@ -255,8 +281,8 @@ pub async fn get_stream_redirect(
             warp::redirect::temporary(warp::http::Uri::from_maybe_shared(url).unwrap()),
         ))),
         None => Ok(RedirectOrString::String(warp::reply::with_status(
-            "No stream URL".to_owned(),
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to find a valid stream URL for this runner".to_string(),
+            warp::http::StatusCode::BAD_REQUEST,
         ))),
     }
 }

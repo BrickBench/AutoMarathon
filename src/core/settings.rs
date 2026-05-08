@@ -30,6 +30,8 @@ pub struct Settings {
     pub put_sources_on_top: Option<bool>,
     /// Use native OBS media sources instead of VLC sources
     pub use_obs_media_sources: Option<bool>,
+    /// Whether to auto-enable and disable studio mode when applying changes
+    pub auto_studio_mode: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

@@ -1,6 +1,5 @@
 use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
-use serde::Deserialize;
 use warp::{reject::Rejection, Filter};
 
 use crate::{
@@ -12,7 +11,9 @@ use crate::{
         stream::{StreamRequest, StreamState},
     },
     integrations::obs::HostCommand,
-    send_message, Directory, Rto,
+    send_message,
+    web::handlers::{get_stream_redirect, request_therun_data, StreamRedirect},
+    Directory, Rto,
 };
 
 use super::handlers::{
@@ -65,6 +66,7 @@ fn participant_filters(
 }
 
 fn runner_filters(
+    db: Arc<ProjectDb>,
     directory: Directory,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     let create_runner = warp::path!("runner")
@@ -112,10 +114,18 @@ fn runner_filters(
             ))
         });
 
+    let refresh_runner_live = warp::path!("runner" / "splits" / "refresh")
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and(with_directory(directory.clone()))
+        .and_then(request_therun_data);
+
     create_runner
         .or(update_runner)
         .or(refresh_runner)
         .or(delete_runner)
+        .or(refresh_runner_live)
 }
 
 fn event_filters(
@@ -175,6 +185,7 @@ fn event_filters(
 }
 
 fn stream_filters(
+    db: Arc<ProjectDb>,
     directory: Directory,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     let create_stream = warp::path!("stream")
@@ -212,7 +223,18 @@ fn stream_filters(
             ))
         });
 
-    create_stream.or(update_stream).or(delete_stream)
+    let get_stream_url = warp::path!("stream" / "url")
+        .and(warp::get())
+        .and(warp::query::<StreamRedirect>())
+        .and(with_db(db.clone()))
+        .and_then(async |redirect: StreamRedirect, db: Arc<ProjectDb>| {
+            get_stream_redirect(redirect, db).await
+        });
+
+    create_stream
+        .or(update_stream)
+        .or(delete_stream)
+        .or(get_stream_url)
 }
 
 pub fn api_filters(
@@ -282,7 +304,7 @@ pub fn api_filters(
         .or(delete_field)
         .or(set_discord_volume)
         .or(participant_filters(db.clone()))
-        .or(runner_filters(directory.clone()))
+        .or(runner_filters(db.clone(), directory.clone()))
         .or(event_filters(db.clone(), directory.clone()))
-        .or(stream_filters(directory))
+        .or(stream_filters(db.clone(), directory))
 }

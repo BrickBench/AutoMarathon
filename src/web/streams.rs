@@ -21,6 +21,8 @@ use super::filters::{with_db, with_directory};
 pub enum WebCommand {
     /// Send a project state update.
     TriggerStateUpdate,
+    /// Send a project state update, but only to clients that have requested high rate updates.
+    TriggerFastStateUpdate,
     /// Send a voice update.
     SendVoiceState(VoiceState),
     /// Send a live splits update for the provided runner.
@@ -81,6 +83,12 @@ pub struct StreamProbability {
 pub struct LiveSplitUpdate {
     active_runs: HashMap<i64, Run>,
     win_probabilities: HashMap<i64, StreamProbability>,
+}
+
+/// Struct for live splits information from TheRun.gg
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FastRate {
+    high_rate: Option<bool>,
 }
 
 /// Run a voice websocket for a single client
@@ -185,11 +193,12 @@ async fn run_live_splits_websocket(
     }
 
     while let Ok(update) = state_rx.recv().await {
-        if let Err(e) = tx
+        if tx
             .send(warp::ws::Message::text(
                 serde_json::to_string(&update).unwrap(),
             ))
             .await
+            .is_err()
         {
             // log::error!("Failed to send live splits update: {}", e); // spam
             break;
@@ -202,8 +211,9 @@ async fn run_state_websocket(
     db: Arc<ProjectDb>,
     directory: Directory,
     socket: warp::ws::WebSocket,
-    mut state_rx: broadcast::Receiver<StateUpdate>,
+    mut state_rx: broadcast::Receiver<(StateUpdate, bool)>,
     address: Option<SocketAddr>,
+    high_rate: bool,
 ) {
     match address {
         Some(addr) => log::debug!("New state websocket connection opened from {}", addr.ip()),
@@ -229,9 +239,13 @@ async fn run_state_websocket(
         }
     }
 
-    while let Ok(update) = state_rx.recv().await {
+    while let Ok((update, fast)) = state_rx.recv().await {
+        if fast && !high_rate {
+            continue;
+        }
+
         if let Ok(update) = serde_json::to_string(&update) {
-            if let Err(e) = tx.send(warp::ws::Message::text(update)).await {
+            if tx.send(warp::ws::Message::text(update)).await.is_err() {
                 // log::error!("Failed to send state update: {}", e); // spam
                 break;
             }
@@ -376,22 +390,31 @@ pub fn websocket_filters(
     directory: Directory,
     mut rx: UnboundedReceiver<WebCommand>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
-    let (state_update_tx, _) = tokio::sync::broadcast::channel::<StateUpdate>(256);
+    let (state_update_tx, _) = tokio::sync::broadcast::channel::<(StateUpdate, bool)>(256);
     let state_reader_tx = state_update_tx.clone();
     let state_socket = warp::path!("ws")
         .and(warp::ws())
+        .and(warp::query::<FastRate>())
         .and(with_db(db.clone()))
         .and(with_directory(directory.clone()))
         .and(warp::any().map(move || state_update_tx.subscribe()))
         .and(warp::filters::addr::remote())
         .map(
             |ws: warp::ws::Ws,
+             fast_rate: FastRate,
              db: Arc<ProjectDb>,
              directory: Directory,
-             state_rx: broadcast::Receiver<StateUpdate>,
+             state_rx: broadcast::Receiver<(StateUpdate, bool)>,
              address: Option<SocketAddr>| {
                 ws.on_upgrade(move |socket| {
-                    run_state_websocket(db, directory, socket, state_rx, address)
+                    run_state_websocket(
+                        db,
+                        directory,
+                        socket,
+                        state_rx,
+                        address,
+                        fast_rate.high_rate.unwrap_or(false),
+                    )
                 })
             },
         );
@@ -446,7 +469,17 @@ pub fn websocket_filters(
                 WebCommand::TriggerStateUpdate => {
                     match assemble_state_update(db.clone(), &directory).await {
                         Ok(update) => {
-                            let _ = state_reader_tx.send(update);
+                            let _ = state_reader_tx.send((update, false));
+                        }
+                        Err(e) => {
+                            log::error!("Failed to assemble state update: {}", e);
+                        }
+                    }
+                }
+                WebCommand::TriggerFastStateUpdate => {
+                    match assemble_state_update(db.clone(), &directory).await {
+                        Ok(update) => {
+                            let _ = state_reader_tx.send((update, true));
                         }
                         Err(e) => {
                             log::error!("Failed to assemble state update: {}", e);

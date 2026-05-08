@@ -15,8 +15,16 @@ use super::{db::ProjectDb, stream::StreamRequest};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum EventResult {
-    SingleScore { score: String },
-    MultiScores { scores: HashMap<String, String> },
+    SingleScore {
+        score: String,
+    },
+    MultiScores {
+        scores: HashMap<String, String>,
+    },
+    SplitTimes {
+        final_result: String,
+        splits: Vec<Option<f64>>,
+    },
 }
 
 /// State of a runner in an event
@@ -112,7 +120,7 @@ pub async fn run_event_actor(
                 rto.reply(db.add_event(&mut event).await)
             }
             EventRequest::Update(event, rto) => {
-                let update = db.update_event(&event).await;
+                let update = db.update_event(&event, false).await;
                 if let Err(e) = &update {
                     log::error!("Error updating event: {:?}", e);
                 }
@@ -133,10 +141,13 @@ pub async fn run_event_actor(
                             runner,
                             RunnerEventState {
                                 runner,
-                                result: None,
+                                result: Some(sqlx::types::Json(EventResult::SplitTimes {
+                                    final_result: String::new(),
+                                    splits: [None; 36].to_vec(),
+                                })),
                             },
                         );
-                        rto.reply(db.update_event(&event).await);
+                        rto.reply(db.update_event(&event, false).await);
                     }
                 }
                 Err(e) => rto.reply(Err(e)),
@@ -147,14 +158,14 @@ pub async fn run_event_actor(
                         rto.reply(Ok(()));
                     } else {
                         event.runner_state.remove(&id);
-                        rto.reply(db.update_event(&event).await);
+                        rto.reply(db.update_event(&event, false).await);
                     }
                 }
                 Err(e) => rto.reply(Err(e)),
             },
             EventRequest::Delete(id, rto) => match db.get_streamed_events().await {
                 Ok(ev) => {
-                    if ev.iter().any(|e| *e == id) {
+                    if ev.contains(&id) {
                         match send_message!(directory.stream_actor, StreamRequest, Delete, id) {
                             Ok(_) => {
                                 log::info!("Deleting event with ID {}", id);

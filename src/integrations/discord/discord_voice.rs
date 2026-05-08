@@ -203,32 +203,14 @@ impl songbird::EventHandler for Receiver {
     }
 }
 
-const USE_JACK: bool = false;
 async fn create_audio_device() -> anyhow::Result<Device> {
     log::info!("Initializing audio device");
 
-    if USE_JACK {
-        log::info!("Using JACK audio host");
-        let host =  cpal::host_from_id(cpal::available_hosts()
-        .into_iter()
-        .find(|id| *id == cpal::HostId::Jack)
-        .expect(
-            "make sure --features jack is specified. only works on OSes where jack is available",
-        ))?;
-
-        host.output_devices()?.for_each(|device| {
-            println!("Output device: {:?} ", device.name());
-        });
-
-        host.default_output_device()
-            .ok_or(anyhow::anyhow!("No default output device found."))
-    } else {
-        let host = cpal::default_host();
-        host.output_devices()?
-            .find(|d| d.name().unwrap_or_default().contains("pipewire"))
-            .or_else(|| host.default_output_device())
-            .ok_or(anyhow::anyhow!("No default output device found."))
-    }
+    let host = cpal::default_host();
+    host.output_devices()?
+        .find(|d| d.name().unwrap_or_default().contains("pipewire"))
+        .or_else(|| host.default_output_device())
+        .ok_or(anyhow::anyhow!("No default output device found."))
 }
 
 pub async fn connect_to_voice(

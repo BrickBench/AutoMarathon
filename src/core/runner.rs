@@ -159,6 +159,12 @@ pub struct Runner {
     ///
     /// This is assumed to be the same as the name if None
     pub therun: Option<String>,
+   
+    /// Whether or not to use live data for this runner.
+    ///
+    /// If false, live split data will be sourced from the SplitTimes
+    /// results field if possible.
+    pub use_live_data: bool,
 
     /// A value to manually specify a .m3u8 link in case Streamlink
     /// fails to acquire it
