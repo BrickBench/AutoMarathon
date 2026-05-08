@@ -9,9 +9,7 @@ use sqlx::prelude::FromRow;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
-    core::{db::ProjectDb, runner::RunnerRequest},
-    integrations::obs::HostCommand,
-    send_message, ActorRef, Directory, Rto,
+    ActorRef, Directory, Rto, core::{db::ProjectDb, runner::{ParticipantId, RunnerRequest}}, integrations::obs::HostCommand, send_message
 };
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, FromRow)]
@@ -23,7 +21,7 @@ pub struct StreamState {
 
     #[sqlx(skip)]
     /// Map of view IDs to runner IDs
-    pub stream_runners: HashMap<i64, i64>,
+    pub stream_runners: HashMap<i64, ParticipantId>,
 }
 
 /// Requests that can be sent to a StateActor
@@ -203,8 +201,8 @@ impl StreamState {
     ///
     /// Return the runners which failed to get streams.
     pub async fn trigger_refreshes(&self, old: &StreamState, directory: &Directory) -> Vec<i64> {
-        let old_runners = HashSet::<i64>::from_iter(old.stream_runners.values().cloned());
-        let new_runners = HashSet::<i64>::from_iter(self.stream_runners.values().cloned());
+        let old_runners = HashSet::<ParticipantId>::from_iter(old.stream_runners.values().cloned());
+        let new_runners = HashSet::<ParticipantId>::from_iter(self.stream_runners.values().cloned());
         let added_runners = new_runners.difference(&old_runners);
 
         let mut bad_runners = vec![];
@@ -250,10 +248,15 @@ impl StreamState {
     }
 
     /// Determine the stream slot for the given runner.
-    pub fn get_runner_slot(&self, runner: i64) -> Option<i64> {
+    pub fn get_runner_slot(&self, runner: ParticipantId) -> Option<i64> {
         self.stream_runners
             .iter()
             .find_map(|(k, v)| if *v == runner { Some(*k) } else { None })
+    }
+
+    /// Get the runner assigned to the given stream slot.
+    pub fn get_runner_in_slot(&self, slot: i64) -> Option<ParticipantId> {
+        self.stream_runners.get(&slot).cloned()
     }
 
     /// Find the slot not currently assigned to a runner.

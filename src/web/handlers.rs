@@ -8,6 +8,7 @@ use crate::{
         db::ProjectDb,
         event::Event,
         runner::RunnerRequest,
+        settings::Settings,
         stream::{StreamRequest, StreamState},
     },
     integrations::obs::HostCommand,
@@ -200,5 +201,62 @@ pub async fn set_streaming_state(
             EndStream,
             streaming.host
         ))
+    }
+}
+
+pub enum RedirectOrString {
+    Redirect(Box<dyn warp::Reply>),
+    String(WithStatus<String>),
+}
+
+impl warp::Reply for RedirectOrString {
+    fn into_response(self) -> warp::reply::Response {
+        match self {
+            RedirectOrString::Redirect(r) => r.into_response(),
+            RedirectOrString::String(s) => s.into_response(),
+        }
+    }
+}
+
+pub async fn get_stream_redirect(
+    host: Id,
+    slot: Id,
+    db: Arc<ProjectDb>,
+    settings: Arc<Settings>,
+) -> Result<impl warp::Reply, Infallible> {
+    let stream_id = db.get_event_by_obs_host(&host.id.to_string()).await;
+    if stream_id.is_err() {
+        return Ok(RedirectOrString::String(warp::reply::with_status(
+            "Failed to find stream for host".to_string(),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+    let stream = db.get_stream(stream_id.unwrap()).await;
+    if stream.is_err() {
+        return Ok(RedirectOrString::String(warp::reply::with_status(
+            "Failed to find stream".to_string(),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+
+    let stream = stream.unwrap();
+    let slot = stream.get_runner_in_slot(slot.id);
+    if slot.is_none() {
+        return Ok(RedirectOrString::String(warp::reply::with_status(
+            "Failed to find runner in specified slot".to_string(),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+
+    let runner = db.get_runner(slot.unwrap()).await.unwrap();
+    let best_url = runner.calculate_best_url(1080, 30);
+    match best_url {
+        Some((url, _)) => Ok(RedirectOrString::Redirect(Box::new(
+            warp::redirect::temporary(warp::http::Uri::from_maybe_shared(url).unwrap()),
+        ))),
+        None => Ok(RedirectOrString::String(warp::reply::with_status(
+            "No stream URL".to_owned(),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ))),
     }
 }

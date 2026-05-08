@@ -119,6 +119,26 @@ impl ProjectDb {
         .await?;
 
         query!(
+            "create table manual_runs(
+                    runner integer primary key not null,
+                    current_split_index integer,
+                    foreign key(runner) references runners(participant) on delete cascade
+            );"
+        )
+        .execute(&self.db)
+        .await?;
+
+        query!(
+            "create table manual_splits(
+                run integer not null,
+                split_time real,
+                foreign key(run) references runs(runner) on delete cascade
+            );"
+        )
+        .execute(&self.db)
+        .await?;
+
+        query!(
             "create table tournaments(
                         id integer primary key not null,
                         name text not null collate nocase,

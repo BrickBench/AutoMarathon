@@ -474,57 +474,6 @@ fn get_layout<'a>(
         .find(|l| l.sources.len() == state.stream_runners.len())
 }
 
-/// Determine the correct streamlink URL for the given
-/// element width and desired FPS.
-fn calculate_best_url(
-    width: u32,
-    stream_fps: u32,
-    urls: &HashMap<String, String>,
-) -> Option<(String, u32)> {
-    if urls.is_empty() {
-        return None;
-    }
-
-    let desire_60fps = stream_fps >= 30;
-
-    let mut closest_title = "best";
-    let mut closest_url = urls["best"].clone();
-    let mut closest_width = 1080;
-    let mut closest_diff = u32::MAX;
-
-    for (res, url) in urls {
-        let elements: Vec<&str> = res.split('p').collect();
-        let res_width = elements[0].parse::<u32>();
-
-        if let Ok(stream_width) = res_width {
-            let stream_fps = if elements.len() > 1 && elements[1].contains("60") {
-                60
-            } else {
-                30
-            };
-
-            let stream_diff = (stream_width as i32 - width as i32).unsigned_abs();
-            if stream_width >= width && stream_diff <= closest_diff {
-                if stream_diff == closest_diff {
-                    if (desire_60fps && stream_fps == 60) || (!desire_60fps && stream_fps == 30) {
-                        closest_title = res;
-                        closest_url.clone_from(url);
-                    }
-                } else {
-                    closest_title = res;
-                    closest_url.clone_from(url);
-                    closest_width = stream_width;
-                    closest_diff = stream_width - width;
-                }
-            }
-        }
-    }
-
-    log::debug!("Selected stream URL {} for width {}", closest_title, width);
-
-    Some((closest_url, closest_width))
-}
-
 /// Set the input URL for a given player, creating the input if it does not exist.
 /// Returns if an update to the player views should be done.
 async fn set_input_url(
@@ -722,19 +671,7 @@ pub async fn update_obs_state(
                         .max()
                         .unwrap_or(1920);
 
-                    if let Some(ref stream) = runner.override_stream_url {
-                        if !stream.trim().is_empty() {
-                            good_url = Some((stream.clone(), 1080));
-                        }
-                    }
-
-                    if good_url.is_none() {
-                        good_url = calculate_best_url(
-                            max_width,
-                            obs_state.stream_frame_rate,
-                            &runner.stream_urls,
-                        );
-                    }
+                    good_url = runner.calculate_best_url(max_width, obs_state.stream_frame_rate);
                 }
 
                 let just_created = set_input_url(

@@ -9,11 +9,9 @@ use crate::{
     error::Error, integrations::therun::TheRunCommand, send_nonblocking, ActorRef, Directory, Rto,
 };
 
-use super::{
-    db::ProjectDb,
-    participant::Participant,
-    settings::{self, Settings},
-};
+use super::{db::ProjectDb, participant::Participant, settings::Settings};
+
+pub type ParticipantId = i64;
 
 pub enum RunnerRequest {
     Create(Runner, Rto<()>),
@@ -147,7 +145,7 @@ pub type RunnerActor = ActorRef<RunnerRequest>;
 #[derive(PartialEq, Eq, Debug, FromRow, Clone, Serialize, Deserialize)]
 pub struct Runner {
     /// The participant this runner information relates to
-    pub participant: i64,
+    pub participant: ParticipantId,
 
     /// Player's stream link
     /// If the link is an https:// address,
@@ -184,7 +182,7 @@ impl Runner {
         self.therun.clone()
     }
 
-    /// Determine the stream linkk for this player.
+    /// Determine the stream link for this player.
     pub fn get_stream(&self) -> String {
         match &self.stream {
             Some(stream) => {
@@ -275,5 +273,61 @@ impl Runner {
                 Err(e)?
             }
         }
+    }
+
+    /// Determine the correct streamlink URL for the given
+    /// element width and desired FPS.
+    pub fn calculate_best_url(&self, width: u32, stream_fps: u32) -> Option<(String, u32)> {
+        if let Some(ref stream) = self.override_stream_url {
+            let stream = stream.trim().to_string();
+            let url = warp::http::Uri::from_maybe_shared(stream.clone());
+            if url.is_ok() {
+                return Some((stream.to_owned(), 1080));
+            }
+        }
+
+        if self.stream_urls.is_empty() {
+            return None;
+        }
+
+        let desire_60fps = stream_fps >= 30;
+
+        let mut closest_title = "best";
+        let mut closest_url = self.stream_urls["best"].clone();
+        let mut closest_width = 1080;
+        let mut closest_diff = u32::MAX;
+
+        for (res, url) in self.stream_urls.iter() {
+            let elements: Vec<&str> = res.split('p').collect();
+            let res_width = elements[0].parse::<u32>();
+
+            if let Ok(stream_width) = res_width {
+                let stream_fps = if elements.len() > 1 && elements[1].contains("60") {
+                    60
+                } else {
+                    30
+                };
+
+                let stream_diff = (stream_width as i32 - width as i32).unsigned_abs();
+                if stream_width >= width && stream_diff <= closest_diff {
+                    if stream_diff == closest_diff {
+                        if (desire_60fps && stream_fps == 60) || (!desire_60fps && stream_fps == 30)
+                        {
+                            closest_title = res;
+                            closest_url.clone_from(url);
+                        }
+                    } else {
+                        closest_title = res;
+                        closest_url.clone_from(url);
+                        closest_width = stream_width;
+                        closest_diff = stream_width - width;
+                    }
+                }
+            }
+        }
+
+        log::debug!("Selected stream URL {} for width {}", closest_title, width);
+
+        Some((closest_url, closest_width))
     }
 }
