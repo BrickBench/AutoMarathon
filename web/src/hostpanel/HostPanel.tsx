@@ -3,17 +3,18 @@ import { StreamStateContext, WebUIStateContext } from "../Context";
 import { useContext, useEffect, useState } from "react";
 import { HostEventSelector, LayoutSelector, PlayerSelector, TransitionSelector } from "./SidePanel";
 import { StreamPanel } from "./StreamPanel";
-import { StreamEntry, StreamHost, Event, Person, Runner, CustomFields } from "../websocket";
+import { StreamEntry, StreamHost, Event, Person, Runner, CustomFields, RunSocketState } from "../websocket";
 import { getSelectedLayout, getStreamForHost, updateStreamRequest } from "./LayoutUtilities";
 import { ToastNotifStateContext } from "../AMNotification";
 import { TimerWidget } from "../dashboard/TimerWidget";
 import { doPost } from "../Api";
 import { CommentatorWidget } from "./CommentatorWidget";
 import { CustomFieldWidget } from "./CustomFieldWidget";
+import { SplitsEditorWidget } from "../theruneditor/SplitsEditor";
 
-export function HostPanel({ host, events, people, streams, runners, customFields }: {
+export function HostPanel({ host, events, people, streams, runners, customFields, liveRunState }: {
   host: StreamHost, events: Event[], people: Map<number, Person>, streams: StreamEntry[],
-  runners: Map<number, Runner>, customFields : CustomFields
+  runners: Map<number, Runner>, customFields : CustomFields, liveRunState: RunSocketState
 }) {
   const { webuistate, setWebUIState } = useContext(WebUIStateContext);
   const [selectedLayoutState, setSelectedLayoutState] = useState<string>(getSelectedLayout(host));
@@ -140,6 +141,11 @@ export function HostPanel({ host, events, people, streams, runners, customFields
         </Col>
         <Col lg={6}>
           <CustomFieldWidget customFields={customFields}></CustomFieldWidget>
+        </Col>
+      </Row>
+      <Row className="border-top pt-3">
+        <Col lg={6}>
+          <SplitsEditorWidget liveRunState={liveRunState} runners={runners} people={people} currentEvent={streamEvent}></SplitsEditorWidget>
         </Col>
       </Row>
     </StreamStateContext.Provider>);

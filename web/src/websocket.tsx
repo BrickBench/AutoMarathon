@@ -76,6 +76,7 @@ export interface Runner {
         [key: string]: string;
     };
     stream_volume_percent: number;
+    use_live_data: boolean;
 }
 
 export interface StreamHost {
@@ -176,5 +177,31 @@ export function diffAMState(newData: AMState, people: Map<number, Person>, setPe
     setCustomFields(newCustomField);
 
     //var peopleChanges = mapsAreEqual(newPeopleMap, people);
+}
+
+/* TheRun Socket State */
+
+export class RunnerRunSplit{
+    name: string = "";
+    bestPossible: number | null = 0;
+    pbSplitTime: number | null = 0;
+    splitTime: number | null = null;
+}
+
+export class RunnerRunState{
+    bestPossible: number = 0;
+    currentSplitIndex: number = -1;
+    currentSplitName: string = "";
+    splits : RunnerRunSplit[] = Array.from({ length: 36 }, (element, index) => {
+        var split = new RunnerRunSplit();
+        split.name = index.toString();
+        return split;
+    });
+}
+
+export class RunSocketState{
+    active_runs : {
+        [key: string]: RunnerRunState;
+    } = {};
 }
 

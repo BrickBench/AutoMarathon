@@ -107,7 +107,11 @@ import { doPost } from './Api'
               if(entry.value in eventState.runner_state){
                   temp_runners[entry.value] = eventState.runner_state[entry.value];
               }else{
-                  temp_runners[entry.value] = {"runner": parseInt(entry.value),"result":null};
+                  temp_runners[entry.value] = {"runner": parseInt(entry.value), "result": {
+                    "SplitTimes": {final_result: "", splits: Array.from({ length: 36 }, (element, index) => {
+                            return null;
+                      })}
+                  }};
               }
           }
   

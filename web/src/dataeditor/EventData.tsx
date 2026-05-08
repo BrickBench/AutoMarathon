@@ -41,11 +41,20 @@ function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,
 }
 
 function EventRunnerData({runnerID, event, setEventState, data, people}:{runnerID: number, event:Event, setEventState:any,data:any, people: Map<number, Person>}){
-    const [eventRunnerState,setEventRunnerStateTemp] = useState(data ? data : {"SingleScore":{score: ""}});
+    const [eventRunnerState,setEventRunnerStateTemp] = useState(data ? data : {
+                "SplitTimes": {final_result: "", splits: Array.from({ length: 36 }, (element, index) => {
+                    return null;
+        })}});
     useEffect(() => {
         setEventRunnerStateTemp(data ? data : 
-            {"SingleScore":{score: ""}});
+            {
+                "SplitTimes": {final_result: "", splits: Array.from({ length: 36 }, (element, index) => {
+                    return null;
+            })}
+        });
     }, [data])
+
+    const resultType = "SplitTimes";
 
     return (
     <Row className="pt-2">
@@ -53,10 +62,12 @@ function EventRunnerData({runnerID, event, setEventState, data, people}:{runnerI
             {people.get(runnerID)!.name}
         </Col>
         <Col lg={10}>
-            {eventRunnerState["SingleScore"] &&
+            {eventRunnerState[resultType] &&
             <Row>
-                {Object.entries(eventRunnerState['SingleScore'])
-                .map(([key,val])=>{return <EventDataFieldInput key={key} typename={"SingleScore"} runner={runnerID} horizontal={true} customTemp={eventRunnerState['SingleScore']} event={event} setEventTemp={setEventState} key2={key} setCustomTemp={setEventRunnerStateTemp}></EventDataFieldInput>})}
+                {Object.entries(eventRunnerState[resultType])
+                .filter(([key,val])=>{
+                    return key == "final_result";
+                }).map(([key,val])=>{return <EventDataFieldInput key={key} typename={resultType} runner={runnerID} horizontal={true} customTemp={eventRunnerState[resultType]} event={event} setEventTemp={setEventState} key2={key} setCustomTemp={setEventRunnerStateTemp}></EventDataFieldInput>})}
             </Row>
             }
         </Col>

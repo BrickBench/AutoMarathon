@@ -1,8 +1,8 @@
 import { useState, useEffect, createContext, useContext, useRef } from 'react'
 import { Container, Row, Col, Button, Accordion, ListGroup } from 'react-bootstrap';
-import { AMState, Person, Runner, Event, StreamHost, WebUIState, diffAMState, LockState, AuthState, StreamEntry, EventTab, CustomFields } from './websocket';
+import { AMState, Person, Runner, Event, StreamHost, WebUIState, diffAMState, LockState, AuthState, StreamEntry, EventTab, CustomFields, RunSocketState } from './websocket';
 import { Sidebar } from './Sidebar'
-import { AuthStateContext, WebUIStateContext } from './Context';
+import { AuthStateContext, FastDataContext, WebUIStateContext } from './Context';
 import { EditPerson } from './EditPerson';
 import { EditEvent } from './EditEvent';
 import { LoginPage } from './Login';
@@ -29,6 +29,12 @@ function AMApp() {
   const [webSocket, setWebSocket] = useState<WebSocket | undefined>(createWebSocket("/ws", webSocketCreated));
   const [editorWebSocketCreated, setEditorWebSocketCreated] = useState<boolean>(false);
   const [editorWebSocket, setEditorWebSocket] = useState<WebSocket | undefined>(createWebSocket("/ws/dashboard-editor", editorWebSocketCreated));
+  const [runWebSocketCreated, setRunWebSocketCreated] = useState<boolean>(false);
+  const [runWebSocket, setRunWebSocket] = useState<WebSocket | undefined>(createWebSocket("/ws/runs", runWebSocketCreated));
+
+  const [highWebSocketCreated, setHighWebSocketCreated] = useState<boolean>(false);
+  const [highWebSocket, setHighWebSocket] = useState<WebSocket | undefined>(createWebSocket("/ws?high_rate=true", highWebSocketCreated));
+
 
   const [lockOwner, setLockOwner] = useState<LockState>();
 
@@ -38,6 +44,10 @@ function AMApp() {
   const [streams, setStreams] = useState<StreamEntry[]>([]);
   const [hosts, setHosts] = useState<Map<string, StreamHost>>(new Map());
   const [customFields, setCustomFields] = useState<CustomFields>({});
+  
+  const [fastEvents, setFastEvents] = useState<Event[]>([]);
+
+  const [liveRunState, setLiveRunState] = useState<RunSocketState>();
 
   const [webuistate, setWebUIState] = useState<WebUIState>(new WebUIState());
 
@@ -83,6 +93,30 @@ function AMApp() {
   }, [webSocket]);
 
   useEffect(() => {
+    if(highWebSocket){
+      highWebSocket.onopen = (event) => {
+        setHighWebSocketCreated(true);
+      };
+
+      highWebSocket.onmessage = (event) => {
+        var state: AMState = JSON.parse(event.data);
+        setFastEvents(state.events);
+      };
+
+      highWebSocket.onclose = function(event) {
+        setHighWebSocketCreated(false);
+      };
+
+      highWebSocket.onerror = function(err) {
+        setHighWebSocketCreated(false);
+      };
+    }
+
+    return () => {
+    };
+  }, [highWebSocket]);
+
+  useEffect(() => {
     if(editorWebSocket){
       editorWebSocket.onopen = (event) => {
         setEditorWebSocketCreated(true);
@@ -99,6 +133,30 @@ function AMApp() {
 
       editorWebSocket.onerror = function(err) {
         setEditorWebSocketCreated(false);
+      };
+    }
+
+    return () => {
+    };
+  }, [editorWebSocket]);
+
+  useEffect(() => {
+    if(runWebSocket){
+      runWebSocket.onopen = (event) => {
+        setRunWebSocketCreated(true);
+      };
+
+      runWebSocket.onmessage = function(event) {
+        var state : RunSocketState = JSON.parse(event.data);
+        setLiveRunState(state);
+      };
+
+      runWebSocket.onclose = function(event) {
+        setRunWebSocketCreated(false);
+      };
+
+      runWebSocket.onerror = function(err) {
+        setRunWebSocketCreated(false);
       };
     }
 
@@ -136,7 +194,11 @@ function AMApp() {
                 }
                 {webuistate.eventSubmenu == EventTab.Stream ?
                   (lockOwner && lockOwner.editor == authState.username ?
-                    <HostPanel host={hosts.get(webuistate.selectedHost)!} events={events} people={people} streams={streams} runners={runners} customFields={customFields}></HostPanel> :
+                    (highWebSocket && highWebSocket.readyState == WebSocket.OPEN ? <FastDataContext.Provider value={{fastData: fastEvents, setFastDataState: setFastEvents}}>
+                      <HostPanel host={hosts.get(webuistate.selectedHost)!} events={events} people={people} streams={streams} runners={runners} customFields={customFields} liveRunState={liveRunState}></HostPanel>
+                    </FastDataContext.Provider> : 
+                    <HostPanel host={hosts.get(webuistate.selectedHost)!} events={events} people={people} streams={streams} runners={runners} customFields={customFields} liveRunState={liveRunState}></HostPanel>
+                  ) :
                     <HostPanelLock authState={authState} lockState={lockOwner} lockSocket={editorWebSocket}></HostPanelLock>) :
                   <></>
                 }

@@ -1,5 +1,5 @@
 import {createContext} from 'react'
-import { AuthState, StreamEntry, StreamRunnersEntry, WebUIState } from './websocket';
+import { AuthState, StreamEntry, StreamRunnersEntry, WebUIState, Event } from './websocket';
 
 export type WebUIStateContext = {
     webuistate: WebUIState
@@ -22,3 +22,12 @@ export type StreamStateContext = {
 }
 
 export const StreamStateContext = createContext<StreamStateContext>({streamContext: [new StreamEntry(), (_:StreamEntry)=>{}], selectedLayoutContext: ["", (_:string)=>{}]});
+
+export type FastDataContext = {
+    fastData: Event[];
+    setFastDataState:(c: Event[]) => void
+}
+
+export const FastDataContext = createContext<FastDataContext>({
+    fastData: [], setFastDataState: (_:StreamEntry)=>{}
+});
