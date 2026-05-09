@@ -14,7 +14,7 @@ function timeToMillis(editTimerString){
         return null;
     }
 
-    let regex =  /^(\d+\:)?\d+\:\d+\.\d+$/;
+    let regex =  /^(\d+\:)?\d+\:\d+(\.\d+)?$/;
     let time = editTimerString;
     if(!time.match(regex)){
         alert("Invalid time format (" + editTimerString + "). Please input the new time in the format HH:MM:SS.xxx.")
@@ -24,13 +24,23 @@ function timeToMillis(editTimerString){
         var timeSepCount = tokens.length - 1;
         let hours = timeSepCount >= 2 ? parseInt(tokens[0]) : 0;
         let minutes = timeSepCount >= 2 ? parseInt(tokens[1]) : parseInt(tokens[0]);
-        let secmillis = (timeSepCount >= 2 ? tokens[2] : tokens[1]).split(".");
-        let seconds = parseInt(secmillis[0]);
-        let millis = parseInt(secmillis[1]);
 
-        let submillissplitindex = Math.min(3, secmillis[1].length);
-        let millisPart = secmillis[1].substring(0, submillissplitindex).padEnd(3,"0");
-        let subMillisPart = "0." + secmillis[1].substring(submillissplitindex);
+
+        let secmillis = (timeSepCount >= 2 ? tokens[2] : tokens[1]).split(".");
+
+       // 
+        let seconds = parseInt(secmillis[0]);
+
+        let millisPart = "0";
+        let subMillisPart = "0";
+
+        if(secmillis.length > 1)
+        {
+            let submillissplitindex = Math.min(3, secmillis[1].length);
+            millisPart = secmillis[1].substring(0, submillissplitindex).padEnd(3,"0");
+            subMillisPart = "0." + secmillis[1].substring(submillissplitindex);
+        }
+       
 
         let setstarttime;
         let setendtime;
@@ -138,6 +148,30 @@ export function SplitsEditorWidget({liveRunState, runners, people, currentEvent}
         }
       }, [selectedPlayerState, selectedDataState, fastData])
 
+    useEffect(() => {
+        let runner = selectedPlayerState ? runners.get(selectedPlayerState.value) : undefined;
+        setSelectedDataState(runner ? (liveDataSourceOptions[runner.use_live_data ? 0 : 1])
+        : liveDataSourceOptions[0]);
+    }, [selectedPlayerState]);
+
+    useEffect(() => {
+        let streamEvent = fastData ? fastData.find(element => element.id == currentEvent.id) : undefined;
+        let runnerEventData = streamEvent ? streamEvent.runner_state[selectedPlayerState.value].result : undefined;
+        if(runnerEventData && runnerEventData.SplitTimes){
+            setSplitsState(runnerEventData.SplitTimes.splits.map((e)=>{
+                return millisToTime(e);
+            }));
+        }
+    }, [selectedPlayerState, selectedDataState, currentEvent])  
+
+    let splitHeader = ["1-1","1-2","1-3","1-4","1-5","1-6",
+                        "2-1","2-2","2-3","2-4","2-5","2-6",
+                        "4-1","4-2","4-3","4-4","4-5","4-6",
+                        "6-1","6-2","6-3","6-4","6-5","6-6",
+                        "3-1","3-2","3-3","3-4","3-5","3-6",
+                        "5-1","5-2","5-3","5-4","5-5","5-6",
+                        ]
+
     let selectedPlayerLiveRunData = selectedPlayerState && liveRunState && liveRunState.active_runs ? liveRunState.active_runs[selectedPlayerState.value] : undefined;
 
     return <Card>
@@ -218,7 +252,7 @@ export function SplitsEditorWidget({liveRunState, runners, people, currentEvent}
                 {manualOverrideState ? 
                     manualOverrideState.splits.map((split, index)=>{
                         return <tr key={index}>
-                            <td>{(Math.floor(index/6)+1) + "-" + (Math.floor(index%6)+1)}</td>
+                            <td>{splitHeader[index]}</td>
                             <td>{
                                 selectedPlayerLiveRunData ?
                                     ((index < selectedPlayerLiveRunData.splits.length) ? 

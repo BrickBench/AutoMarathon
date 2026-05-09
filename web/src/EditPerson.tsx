@@ -131,7 +131,7 @@ export function EditPerson({ person, runner, events }: { person: Person | undefi
                 }
               }
               if (runnerEditState === undefined && e.target.checked) {
-                setRunnerEditState({ participant: person.id, stream_volume_percent: 100 });
+                setRunnerEditState({ participant: person.id, stream_volume_percent: 100, use_live_data: true });
               }
               setRunnerEnabledState(e.target.checked);
             }} />
