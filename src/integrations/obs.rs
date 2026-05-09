@@ -842,6 +842,10 @@ pub async fn update_obs_state(
             }
 
             if settings.auto_studio_mode.unwrap_or(false) && !studio_mode_before {
+                if changing_layout {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    // disabling studio mode
+                }
                 obs.ui().set_studio_mode_enabled(false).await?;
             }
 
