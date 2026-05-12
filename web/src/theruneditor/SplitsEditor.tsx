@@ -129,7 +129,7 @@ export function SplitsEditorWidget({liveRunState, runners, people, currentEvent}
         : liveDataSourceOptions[0]);
 
     let streamEvent = fastData ? fastData.find(element => element.id == currentEvent.id) : undefined;
-    let runnerEventData = streamEvent ? streamEvent.runner_state[selectedPlayerState.value].result : undefined;
+    let runnerEventData = (streamEvent && streamEvent.runner_state[selectedPlayerState.value]) ? streamEvent.runner_state[selectedPlayerState.value].result : undefined;
 
     const [manualOverrideState, setManualOverrideState] = useState<RunnerRunState>(new RunnerRunState());
     const [splitsState, setSplitsState] = useState<string[]>(runnerEventData ? runnerEventData.SplitTimes.splits.map((e)=>{
@@ -137,9 +137,21 @@ export function SplitsEditorWidget({liveRunState, runners, people, currentEvent}
     }) : []);
 
     useEffect(() => {
+        let runnerSelectOptions = currentEvent ? Array.from(Object.entries(currentEvent.runner_state)
+        , ([key, value]) => ({ value: parseInt(key), label: people.get(runners.get(parseInt(key))?.participant)!.name })) : [];
+        var old = selectedPlayerState?.value;
+        
+        if(old && runnerSelectOptions.find(element => element.value == old)){
+            setSelectedPlayerState(selectedPlayerState);
+        }else if(runnerSelectOptions.length > 0){
+            setSelectedPlayerState(runnerSelectOptions[0]);
+        }
+    }, [currentEvent]);
+
+    useEffect(() => {
         if(selectedDataState.value == 1){
             let streamEvent = fastData ? fastData.find(element => element.id == currentEvent.id) : undefined;
-            let runnerEventData = streamEvent ? streamEvent.runner_state[selectedPlayerState.value].result : undefined;
+            let runnerEventData = (streamEvent && streamEvent.runner_state[selectedPlayerState.value]) ? streamEvent.runner_state[selectedPlayerState.value].result : undefined;
             if(runnerEventData && runnerEventData.SplitTimes){
                 setSplitsState(runnerEventData.SplitTimes.splits.map((e)=>{
                     return millisToTime(e);
@@ -156,7 +168,7 @@ export function SplitsEditorWidget({liveRunState, runners, people, currentEvent}
 
     useEffect(() => {
         let streamEvent = fastData ? fastData.find(element => element.id == currentEvent.id) : undefined;
-        let runnerEventData = streamEvent ? streamEvent.runner_state[selectedPlayerState.value].result : undefined;
+        let runnerEventData = (streamEvent && streamEvent.runner_state[selectedPlayerState.value]) ? streamEvent.runner_state[selectedPlayerState.value].result : undefined;
         if(runnerEventData && runnerEventData.SplitTimes){
             setSplitsState(runnerEventData.SplitTimes.splits.map((e)=>{
                 return millisToTime(e);
