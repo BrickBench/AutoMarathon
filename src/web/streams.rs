@@ -11,7 +11,7 @@ use crate::{
     },
     integrations::{
         obs::{HostCommand, ObsHostState},
-        therun::{determine_live_win_probability, HeadToHead, Probabilities, Run},
+        therun::Run,
     },
     send_message, ActorRef, Directory, Rto,
 };
@@ -72,17 +72,10 @@ pub struct EditorClaim {
     editor: Option<String>,
 }
 
-#[derive(Serialize, Debug, Clone)]
-pub struct StreamProbability {
-    win_probabilities: HashMap<i64, f64>,
-    h2h: Vec<HeadToHead>,
-}
-
 /// Struct for live splits information from TheRun.gg
 #[derive(Serialize, Debug, Clone)]
 pub struct LiveSplitUpdate {
     active_runs: HashMap<i64, Run>,
-    win_probabilities: HashMap<i64, StreamProbability>,
 }
 
 /// Struct for live splits information from TheRun.gg
@@ -111,52 +104,6 @@ async fn run_voice_websocket(
     }
 }
 
-fn to_stream_probability(runner_idx: &[i64], probs: Probabilities) -> StreamProbability {
-    let mut win_probs = HashMap::new();
-    for (idx, prob) in runner_idx.iter().zip(probs.probabilities.iter()) {
-        win_probs.insert(*idx, *prob);
-    }
-
-    let mut h2h_vec = vec![];
-    for h2h in probs.h2h.iter() {
-        h2h_vec.push(HeadToHead {
-            run1: *runner_idx.get(h2h.run1 as usize).unwrap_or(&-1),
-            run2: *runner_idx.get(h2h.run2 as usize).unwrap_or(&-1),
-            probability: h2h.probability,
-        });
-    }
-
-    StreamProbability {
-        win_probabilities: win_probs,
-        h2h: h2h_vec,
-    }
-}
-
-async fn assemble_win_probability_map(db: &ProjectDb) -> HashMap<i64, StreamProbability> {
-    let streams = db.get_streamed_events().await.unwrap_or_default();
-    let mut results = HashMap::new();
-
-    for stream in streams {
-        let event = db.get_event(stream).await.unwrap();
-        let mut runs = vec![];
-        for runner in event.runner_state.keys() {
-            if let Ok(run) = db.get_runner_run_data(*runner).await {
-                runs.push((runner, run));
-            }
-        }
-
-        let probs =
-            determine_live_win_probability(&runs.iter().map(|(_, run)| run).collect::<Vec<&Run>>());
-
-        if let Some(probs) = probs {
-            let indices: Vec<i64> = runs.iter().map(|(r, _)| **r).collect();
-            results.insert(event.id, to_stream_probability(&indices, probs));
-        }
-    }
-
-    results
-}
-
 async fn assemble_live_splits_map(db: &ProjectDb) -> HashMap<i64, Run> {
     let mut runs = HashMap::new();
     let runners = db.get_runners().await.unwrap();
@@ -183,7 +130,6 @@ async fn run_live_splits_websocket(
         .send(warp::ws::Message::text(
             serde_json::to_string(&LiveSplitUpdate {
                 active_runs: assemble_live_splits_map(&db).await.clone(),
-                win_probabilities: assemble_win_probability_map(&db).await,
             })
             .unwrap(),
         ))
@@ -287,7 +233,7 @@ async fn run_dash_editor_websocket(
                     }
                 }
             } else {
-                log::error!("Failed to convert message to string, socket may be in binary mode?");
+                // log::error!("Failed to convert message to string, socket may be in binary mode?"); // spam
             }
         }
     });
@@ -496,7 +442,6 @@ pub fn websocket_filters(
 
                     let _ = runs_reader_tx.send(LiveSplitUpdate {
                         active_runs: runs.clone(),
-                        win_probabilities: assemble_win_probability_map(&db).await,
                     });
                 }
             }

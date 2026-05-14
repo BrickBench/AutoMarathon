@@ -12,8 +12,8 @@ serde = { version = "1.0", features = ["derive"] }
 poise = "0.6.1"
 songbird = { version = "0.5.0", default-features = true, features = ["receive"] }
 cpal = { version = "0.15.3"}
-ringbuf = "0.4.8"
-async-ringbuf = "0.3.4"
+ringbuf = "0.5.0"
+async-ringbuf = "0.3.6"
 clap = { version = "4.0.15", features = ["derive"] }
 tokio = { version = "1.21.2", features = ["full"] }
 tokio-tungstenite = { version = "0.26.2", features = ["rustls"]}
