@@ -13,7 +13,7 @@ export function PlayerSelector({ host, people, event }: { host: StreamHost, peop
     const [streamState, setStreamState] = streamContext;
     const [selectedLayout, setSelectedLayout] = selectedLayoutContext;
 
-    if (!streamState) {
+    if (!streamState || !host.scenes[selectedLayout]) {
         return;
     }
 
