@@ -60,7 +60,7 @@ export function HostPanel({ host, events, people, streams, runners, customFields
                   let prompt = false;
                   let hasAudible = false;
 
-                  let numOnScreen = Object.keys(host.scenes[selectedLayoutState].sources).length;
+                  let numOnScreen = host.scenes[selectedLayoutState] ? Object.keys(host.scenes[selectedLayoutState].sources).length : 1000;
                   let found = new Set<number>();
                   for (let [key, val] of Object.entries(streamState.stream_runners)) {
                     if ((parseInt(key) < numOnScreen + 1) && val == streamState.audible_runner) {
@@ -140,7 +140,7 @@ export function HostPanel({ host, events, people, streams, runners, customFields
           <CommentatorWidget host={host}></CommentatorWidget>
         </Col>
         <Col lg={6}>
-          <CustomFieldWidget customFields={customFields}></CustomFieldWidget>
+          <CustomFieldWidget customFields={customFields} people={people}></CustomFieldWidget>
         </Col>
       </Row>
       <Row className="border-top pt-3">

@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { doPost } from "../Api";
 import { Event, Person } from "../websocket";
 import { Button, Col, Container, FormControl, FormLabel, InputGroup, Row } from "react-bootstrap";
 import InputGroupText from "react-bootstrap/esm/InputGroupText";
+import { FastDataContext } from "../Context";
 
 function EventDataFieldInput({typename,customTemp,key2,setCustomTemp,horizontal,runner,event,setEventTemp}: {typename:any,customTemp: any,key2:any,setCustomTemp:any,horizontal:boolean,event:any,runner:any,setEventTemp:any}){
   const [inputState,setInputState]  = useState(customTemp[key2]);
@@ -76,9 +77,10 @@ function EventRunnerData({runnerID, event, setEventState, data, people}:{runnerI
 }
 
 export function EditEventData({event, people}: {event: Event, people: Map<number, Person>}){
-  const [eventState, setEventState] = useState({...event});
+  const { fastData, setFastDataState } = useContext(FastDataContext);
+  const [eventState, setEventState] = useState(structuredClone(event));
   useEffect(() => {
-    setEventState(event)
+    setEventState(structuredClone(event))
   }, [event]);
   return <Container>
         <Row className="pt-2">
@@ -87,7 +89,20 @@ export function EditEventData({event, people}: {event: Event, people: Map<number
             </Col>
             <Col className="align-items-center me-auto">
                 <Button variant="primary" onClick={() => {
-                    doPost('event','PUT', eventState);
+                    let eventCopy = structuredClone(eventState);
+                    
+                    let realTimeEvent = fastData.find((e)=>{e.id == event.id});
+                    if(realTimeEvent){
+                        let editedRunnerState = structuredClone(eventCopy.runner_state);
+                        eventCopy.runner_state = realTimeEvent.runner_state;
+                        for(let entry in Object.entries(eventCopy.runner_state)){
+                            if(eventCopy.runner_state[entry[0]]){
+                                eventCopy.runner_state[entry[0]].result["SplitTimes"]['final_result'] = entry[1].result["SplitTimes"]['final_result'];
+                            } 
+                        }
+                    }
+                    
+                    doPost('event','PUT', eventCopy);
                 }}>Save Changes</Button>
             </Col>
         </Row>

@@ -184,6 +184,16 @@ export function StreamPanel({ host, runners, people, events }: { host: StreamHos
 
   let selectedScene: StreamScene = host.scenes[selectedLayout];
 
+  if(!selectedScene || !selectedLayout){
+    return <Ratio aspectRatio="16x9" className="bg-body-tertiary" style={panelStyle}>
+        <Row className="h-100 justify-content-center align-items-center">
+          <Col md={12} className="d-flex justify-content-center">
+            <h1>No Layouts Found {selectedLayout}</h1>
+          </Col>
+        </Row>
+    </Ratio>;
+  }
+
   let hostSources = Object.entries(selectedScene.sources);
 
   let selectedEvent = streamState ? events.find(element => element.id == streamState.event) : undefined;
