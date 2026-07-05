@@ -9,7 +9,10 @@ use crate::{
         event::Event,
         runner::RunnerRequest,
         stream::{StreamRequest, StreamState},
-    }, integrations::{obs::HostCommand, therun::{process_therun_data, query_therun_state_for_username}}, send_message
+    }, integrations::{
+        obs::HostCommand,
+        therun::{Run, Split, process_therun_data, query_therun_state_for_username},
+    }, send_message
 };
 
 /// A Json struct to store an event/runner ID
@@ -49,6 +52,17 @@ pub struct SetStreamingState {
 pub struct SetDiscordUserVolume {
     pub user: String,
     pub volume: u32,
+}
+
+/// Json struct for manual live Livesplit data
+#[allow(non_snake_case)]
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectRun {
+    pub start_time: String,
+    pub current_split_name: String,
+    pub current_split_index: i64,
+    pub runData: Vec<Split>,
 }
 
 async fn get_event_by_args(
@@ -241,10 +255,30 @@ pub async fn request_therun_data(
 
     let new_data = query_therun_state_for_username(&therun_id.unwrap()).await;
     if let Ok(new_data) = new_data {
-        to_http_none_or_error(process_therun_data(&db,& directory, runner_id.id, &new_data).await)
+        to_http_none_or_error(process_therun_data(&db, &directory, runner_id.id, &new_data).await)
     } else {
         to_http_none_or_error(Err(anyhow::anyhow!("Failed to get data from therun")))
     }
+}
+
+pub async fn set_manual_livesplit_data(
+    runner_id: Id,
+    direct_run: DirectRun,
+    db: Arc<ProjectDb>,
+    directory: Directory,
+) -> Result<impl warp::Reply, Infallible> {
+    let run = Run {
+        pb: None,
+        sob: None,
+        best_possible: None,
+        delta: None,
+        started_at: direct_run.start_time.clone(),
+        current_comparison: "Personal Best".to_owned(),
+        current_split_name: direct_run.current_split_name.clone(),
+        current_split_index: direct_run.current_split_index as i64,
+        splits: direct_run.runData.clone(),
+    };
+    to_http_none_or_error(process_therun_data(&db, &directory, runner_id.id, &run).await)
 }
 
 pub async fn get_stream_redirect(

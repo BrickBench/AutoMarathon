@@ -3,17 +3,13 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use warp::{reject::Rejection, Filter};
 
 use crate::{
-    core::{
+    Directory, Rto, core::{
         db::ProjectDb,
         event::{Event, EventRequest},
         participant::Participant,
         runner::{Runner, RunnerRequest},
         stream::{StreamRequest, StreamState},
-    },
-    integrations::obs::HostCommand,
-    send_message,
-    web::handlers::{get_stream_redirect, request_therun_data, StreamRedirect},
-    Directory, Rto,
+    }, integrations::obs::HostCommand, send_message, web::handlers::{StreamRedirect, get_stream_redirect, request_therun_data, set_manual_livesplit_data}
 };
 
 use super::handlers::{
@@ -121,11 +117,20 @@ fn runner_filters(
         .and(with_directory(directory.clone()))
         .and_then(request_therun_data);
 
+    let set_runner_live = warp::path!("runner" / "splits" / "set")
+        .and(warp::post())
+        .and(warp::query::<Id>())
+        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and(with_directory(directory.clone()))
+        .and_then(set_manual_livesplit_data);
+
     create_runner
         .or(update_runner)
         .or(refresh_runner)
         .or(delete_runner)
         .or(refresh_runner_live)
+        .or(set_runner_live)
 }
 
 fn event_filters(

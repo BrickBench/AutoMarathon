@@ -1,9 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use rand::distributions::Distribution;
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
-use statrs::distribution::Exp;
 use tokio::{
     sync::broadcast,
     time::{self, sleep},
@@ -78,6 +76,10 @@ pub async fn process_therun_data(
     directory
         .web_actor
         .send(WebCommand::SendLiveSplitUpdate(runner_id));
+
+    if runner_id == 1 {
+        println!("run {:?}", data);
+    }
 
     let runner = db.get_runner(runner_id).await?;
     if !runner.use_live_data {
@@ -328,34 +330,3 @@ async fn run_runner_websocket(
         }
     }
 }
-
-// 28
-fn float_cmp(a: f64, b: f64) -> std::cmp::Ordering {
-    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SingleSplit {
-    split_time: Option<f64>,
-    gold_split: f64,
-}
-
-impl SingleSplit {
-    fn from_run(run: &Run) -> Vec<Self> {
-        let mut splits = Vec::with_capacity(run.splits.len());
-        let mut last_time = 0.0;
-        for split in &run.splits {
-            splits.push(SingleSplit {
-                split_time: split.split_time.map(|t| t - last_time).map(|t| t / 1000.0),
-                gold_split: split.best_possible.unwrap_or(0.0) / 1000.0,
-            });
-
-            if let Some(split_time) = split.split_time {
-                last_time = split_time;
-            }
-        }
-
-        splits
-    }
-}
-
