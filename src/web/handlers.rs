@@ -4,15 +4,17 @@ use serde::{Deserialize, Serialize};
 use warp::reply::WithStatus;
 
 use crate::{
-    Directory, Rto, core::{
+    core::{
         db::ProjectDb,
         event::Event,
         runner::RunnerRequest,
         stream::{StreamRequest, StreamState},
-    }, integrations::{
+    },
+    integrations::{
         obs::HostCommand,
-        therun::{Run, Split, process_therun_data, query_therun_state_for_username},
-    }, send_message
+        therun::{process_therun_data, query_therun_state_for_username, Run, Split},
+    },
+    send_message, Directory, Rto,
 };
 
 /// A Json struct to store an event/runner ID
@@ -267,18 +269,37 @@ pub async fn set_manual_livesplit_data(
     db: Arc<ProjectDb>,
     directory: Directory,
 ) -> Result<impl warp::Reply, Infallible> {
-    let run = Run {
-        pb: None,
-        sob: None,
-        best_possible: None,
-        delta: None,
-        started_at: direct_run.start_time.clone(),
-        current_comparison: "Personal Best".to_owned(),
-        current_split_name: direct_run.current_split_name.clone(),
-        current_split_index: direct_run.current_split_index as i64,
-        splits: direct_run.runData.clone(),
-    };
-    to_http_none_or_error(process_therun_data(&db, &directory, runner_id.id, &run).await)
+    let event = db.get_event_by_obs_host("main").await;
+    if event.is_err() {
+        return to_http_none_or_error(Err(anyhow::anyhow!(
+            "Failed to find event for main host"
+        )));
+    }
+
+    let event = event.unwrap();
+    let stream = db.get_stream(event).await;
+    if stream.is_err() {
+        return to_http_none_or_error(Err(anyhow::anyhow!("Failed to find stream for event")));
+    }
+
+    let stream = stream.unwrap();
+
+    if let Some(runner) = stream.get_runner_in_slot(runner_id.id) {
+        let run = Run {
+            pb: None,
+            sob: None,
+            best_possible: None,
+            delta: None,
+            started_at: direct_run.start_time.clone(),
+            current_comparison: "Personal Best".to_owned(),
+            current_split_name: direct_run.current_split_name.clone(),
+            current_split_index: direct_run.current_split_index as i64,
+            splits: direct_run.runData.clone(),
+        };
+        to_http_none_or_error(process_therun_data(&db, &directory, runner, &run).await)
+    } else {
+        return to_http_none_or_error(Err(anyhow::anyhow!("No runner in the provided slot")));
+    }
 }
 
 pub async fn get_stream_redirect(

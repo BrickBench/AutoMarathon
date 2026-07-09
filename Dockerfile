@@ -9,6 +9,7 @@ COPY test.db test.db
 COPY src/ src/
 COPY web/ web/
 
+RUN cd web && npm install
 RUN DATABASE_URL=sqlite://test.db cargo install -j 4 --path .
 
 FROM ubuntu:26.04
