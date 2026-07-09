@@ -140,7 +140,7 @@ export function HostPanel({ host, events, people, streams, runners, customFields
           <CommentatorWidget host={host}></CommentatorWidget>
         </Col>
         <Col lg={6}>
-          <CustomFieldWidget customFields={customFields}></CustomFieldWidget>
+          <CustomFieldWidget customFields={customFields} people={people}></CustomFieldWidget>
         </Col>
       </Row>
       <Row className="border-top pt-3">
