@@ -3,18 +3,24 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use warp::{reject::Rejection, Filter};
 
 use crate::{
-    Directory, Rto, core::{
+    core::{
         db::ProjectDb,
         event::{Event, EventRequest},
         participant::Participant,
         runner::{Runner, RunnerRequest},
         stream::{StreamRequest, StreamState},
-    }, integrations::obs::HostCommand, send_message, web::handlers::{StreamRedirect, get_stream_redirect, request_therun_data, set_manual_livesplit_data}
+    },
+    integrations::obs::HostCommand,
+    send_message,
+    web::handlers::{
+        get_stream_redirect, request_therun_data, set_manual_livesplit_data, StreamRedirect,
+    },
+    Directory, Rto,
 };
 
 use super::handlers::{
     create_stream, get_event, refresh_runner, set_streaming_state, to_http_none_or_error,
-    to_http_output, Id, NewField, SetDiscordUserVolume, UpdateField,
+    to_http_output, Id, NewField, SetDiscordUserVolume, UpdateField, UpdateFields,
 };
 
 pub fn with_db(
@@ -267,7 +273,7 @@ pub fn api_filters(
             to_http_none_or_error(db.add_custom_field(&field.key, None).await)
         });
 
-    let update_field = warp::path!("custom-field")
+    let update_field = warp::path!("custom-fields")
         .and(warp::put())
         .and(warp::body::json())
         .and(with_db(db.clone()))
@@ -276,6 +282,14 @@ pub fn api_filters(
                 db.add_custom_field(&field.key, field.value.as_deref())
                     .await,
             )
+        });
+
+    let update_fields = warp::path!("custom-fields" / "multiple")
+        .and(warp::put())
+        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and_then(async |field: UpdateFields, db: Arc<ProjectDb>| {
+            to_http_none_or_error(db.add_custom_fields(field.fields).await)
         });
 
     let delete_field = warp::path!("custom-field")
@@ -306,6 +320,7 @@ pub fn api_filters(
         .or(set_streaming_state)
         .or(create_field)
         .or(update_field)
+        .or(update_fields)
         .or(delete_field)
         .or(set_discord_volume)
         .or(participant_filters(db.clone()))

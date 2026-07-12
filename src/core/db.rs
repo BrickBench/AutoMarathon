@@ -880,6 +880,17 @@ impl ProjectDb {
         Ok(())
     }
 
+    pub async fn add_custom_fields(&self, keys: HashMap<String, Option<String>>) -> anyhow::Result<()> {
+        // insert list of fields
+        let mut builder = sqlx::QueryBuilder::new("insert or replace into custom_fields(fkey, value)");
+        builder.push_values(keys.iter(), |mut b, (key, value)| {
+            b.push_bind(key).push_bind(value);
+        });
+        builder.build().execute(&self.db).await?;
+        self.trigger_update();
+        Ok(())
+    }
+
     pub async fn clear_custom_field(&self, key: &str) -> anyhow::Result<()> {
         sqlx::query("delete from custom_fields where fkey = ?")
             .bind(key)

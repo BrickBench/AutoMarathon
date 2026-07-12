@@ -77,10 +77,6 @@ pub async fn process_therun_data(
         .web_actor
         .send(WebCommand::SendLiveSplitUpdate(runner_id));
 
-    if runner_id == 1 {
-        println!("run {:?}", data);
-    }
-
     let runner = db.get_runner(runner_id).await?;
     if !runner.use_live_data {
         return Ok(());
