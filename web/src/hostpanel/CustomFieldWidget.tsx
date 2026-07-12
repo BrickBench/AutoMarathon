@@ -38,7 +38,6 @@ function CustomFieldInput({customTemp,key2,setCustomTemp, people}: {customTemp: 
         let commentatorOptions =  [...people.entries()].map(([key, value]) => ({value: parseInt(value.id), label: value.name}));
         inputElement = <Select styles={customStyles} value={commentatorOptions.find((e)=> e.value == parseInt(inputState))}
         onChange={selectedOptions => {
-                    console.log("ghgh",selectedOptions);
           setInputState(String(selectedOptions.value));
           let temp = customTemp;
           temp[key2] = String(selectedOptions.value);
@@ -119,7 +118,8 @@ export function CustomFieldWidget({customFields, people} : {customFields : Custo
             </li>
         </ul>
         <button className="btn btn-primary" onClick={() => {
-            Object.entries(customTemp).forEach(([key,val])=>{doPost('custom-field','PUT',{key:key,value:val});});
+            doPost('custom-fields/multiple', 'PUT', {'fields': customTemp});
+            //Object.entries(customTemp).forEach(([key,val])=>{doPost('custom-field','PUT',{key:key,value:val});});
       }}>Save Changes</button>
       </div>
     </div>
